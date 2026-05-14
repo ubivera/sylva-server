@@ -1,0 +1,26 @@
+[package]
+name = "identity"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sylva Hearth identity module — user accounts, profiles, devices, recovery (currently: skeleton + core user record)"
+
+[lib]
+name = "identity"
+path = "src/lib.rs"
+
+[dependencies]
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

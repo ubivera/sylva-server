@@ -68,7 +68,8 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
     db::run_migrations(&pool).await?;
     tracing::info!("migrations up to date");
 
-    let router = app::router(started_at, pool.clone());
+    let users = identity::UserRepository::new(pool.clone());
+    let router = app::router(started_at, pool.clone(), users);
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
