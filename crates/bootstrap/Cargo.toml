@@ -1,0 +1,19 @@
+[package]
+name = "bootstrap"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only one-time bootstrap: download, trim, and initialize the bundled Postgres for Hearth"
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+# Intentionally no [dependencies]. Pure std + OS-provided utilities (curl.exe,
+# tar.exe, certutil.exe) invoked via std::process::Command.
+
+[lints]
+workspace = true

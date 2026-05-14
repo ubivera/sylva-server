@@ -1,0 +1,16 @@
+[package]
+name = "clean"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only: reset Hearth's local state to a fresh baseline (drops + recreates database)"
+
+[[bin]]
+name = "clean"
+path = "src/main.rs"
+
+[lints]
+workspace = true
