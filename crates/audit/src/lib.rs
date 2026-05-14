@@ -1,0 +1,277 @@
+use chrono::{DateTime, Utc};
+use identity::UserId;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum AuditError {
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+
+    #[error("canonical serialization failed")]
+    Serialize(#[from] serde_json::Error),
+}
+
+pub type Result<T> = std::result::Result<T, AuditError>;
+
+/// Postgres advisory lock key reserved for the audit appender. Acquired
+/// for the lifetime of each append transaction so the (seqno, hash) chain
+/// stays race-free without needing SERIALIZABLE isolation.
+const AUDIT_ADVISORY_LOCK_KEY: i64 = 0x1234_5678_9abc_def0_u64 as i64;
+
+/// Returns `sha256(b"hearth-audit-genesis")` — the `prev_hash` for the
+/// first row in the chain.
+pub fn genesis_hash() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hearth-audit-genesis");
+    hasher.finalize().into()
+}
+
+/// Who performed the audited action. `display_name` is captured as a
+/// snapshot at emission time so audit entries survive later renames
+/// or account deletion (which sets `actor_user_id` to NULL on cascade).
+#[derive(Debug, Clone)]
+pub struct Actor {
+    pub user_id: UserId,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct AuditEvent {
+    pub seqno: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub actor_user_id: Option<Uuid>,
+    pub actor_display_name: Option<String>,
+    pub app_id: Option<String>,
+    pub event_type: String,
+    pub event_data: serde_json::Value,
+    pub prev_hash: Vec<u8>,
+    pub hash: Vec<u8>,
+}
+
+/// Same fields that go into the hash, in alphabetical order. This is
+/// what we serialize to compute `canonical_bytes`. Hash and redaction
+/// columns are intentionally excluded (they're derived/mutable).
+#[derive(Serialize)]
+struct Canonical<'a> {
+    actor_display_name: &'a Option<String>,
+    actor_user_id: &'a Option<Uuid>,
+    app_id: &'a Option<String>,
+    event_data: &'a serde_json::Value,
+    event_type: &'a str,
+    occurred_at: &'a DateTime<Utc>,
+    seqno: i64,
+}
+
+/// `sha256(prev_hash || canonical_bytes)`. Pure function — tested
+/// without a DB.
+pub fn compute_hash(prev_hash: &[u8], canonical_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash);
+    hasher.update(canonical_bytes);
+    hasher.finalize().into()
+}
+
+/// Count events in the chain. Pool-only — no transaction needed.
+pub async fn count(pool: &PgPool) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit.events")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// Append a new event to the chain within the caller's transaction.
+///
+/// The caller controls the transaction lifecycle — this lets the audit
+/// emission be atomic with the action that prompted it (e.g., a user
+/// insert and its `user_created` audit row commit together, satisfying
+/// the design's "audit emission is synchronous; if audit fails, the
+/// originating action fails" requirement).
+///
+/// Internally acquires `pg_advisory_xact_lock(AUDIT_ADVISORY_LOCK_KEY)`
+/// so concurrent appenders are serialized and the hash chain stays
+/// linearizable. The lock is released when the caller's transaction
+/// commits or rolls back.
+pub async fn append(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: Option<&Actor>,
+    app_id: Option<&str>,
+    event_type: &str,
+    event_data: serde_json::Value,
+) -> Result<AuditEvent> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUDIT_ADVISORY_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+
+    let seqno: i64 = sqlx::query_scalar("SELECT nextval('audit.events_seqno_seq')")
+        .fetch_one(&mut **tx)
+        .await?;
+
+    let prev_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT hash FROM audit.events ORDER BY seqno DESC LIMIT 1")
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or_else(|| genesis_hash().to_vec());
+
+    let occurred_at = Utc::now();
+    let actor_user_id = actor.map(|a| a.user_id.0);
+    let actor_display_name = actor.map(|a| a.display_name.clone());
+    let app_id_owned = app_id.map(str::to_string);
+
+    let canonical_bytes = serde_json::to_vec(&Canonical {
+        actor_display_name: &actor_display_name,
+        actor_user_id: &actor_user_id,
+        app_id: &app_id_owned,
+        event_data: &event_data,
+        event_type,
+        occurred_at: &occurred_at,
+        seqno,
+    })?;
+
+    let hash = compute_hash(&prev_hash, &canonical_bytes);
+
+    let inserted: AuditEvent = sqlx::query_as(
+        "INSERT INTO audit.events
+             (seqno, occurred_at, actor_user_id, actor_display_name, app_id,
+              event_type, event_data, prev_hash, hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING seqno, occurred_at, actor_user_id, actor_display_name, app_id,
+                   event_type, event_data, prev_hash, hash",
+    )
+    .bind(seqno)
+    .bind(occurred_at)
+    .bind(actor_user_id)
+    .bind(&actor_display_name)
+    .bind(&app_id_owned)
+    .bind(event_type)
+    .bind(&event_data)
+    .bind(&prev_hash)
+    .bind(&hash[..])
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(inserted)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn genesis_hash_is_sha256_of_literal() {
+        let mut h = Sha256::new();
+        h.update(b"hearth-audit-genesis");
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(genesis_hash(), expected);
+    }
+
+    #[test]
+    fn compute_hash_matches_manual_sha256() {
+        let prev = [0u8; 32];
+        let bytes = b"some canonical bytes";
+        let got = compute_hash(&prev, bytes);
+
+        let mut h = Sha256::new();
+        h.update(prev);
+        h.update(bytes);
+        let want: [u8; 32] = h.finalize().into();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn canonical_serialization_is_deterministic() {
+        let occurred_at = DateTime::<Utc>::from_naive_utc_and_offset(
+            chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap()
+                .naive_utc(),
+            Utc,
+        );
+        let event_data = serde_json::json!({"z": 1, "a": 2, "m": 3});
+        let event = Canonical {
+            actor_display_name: &Some("Joe".to_string()),
+            actor_user_id: &Some(Uuid::nil()),
+            app_id: &None,
+            event_data: &event_data,
+            event_type: "test",
+            occurred_at: &occurred_at,
+            seqno: 1,
+        };
+        let a = serde_json::to_vec(&event).unwrap();
+        let b = serde_json::to_vec(&event).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn canonical_struct_fields_serialize_in_alphabetical_order() {
+        let event = Canonical {
+            actor_display_name: &Some("J".to_string()),
+            actor_user_id: &None,
+            app_id: &None,
+            event_data: &serde_json::json!({}),
+            event_type: "test",
+            occurred_at: &DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            seqno: 1,
+        };
+        let s = serde_json::to_string(&event).unwrap();
+        let order = ["actor_display_name", "actor_user_id", "app_id", "event_data", "event_type", "occurred_at", "seqno"];
+        let mut last = 0;
+        for key in order {
+            let pos = s.find(&format!("\"{key}\":")).unwrap_or_else(|| {
+                panic!("missing key {key} in {s}")
+            });
+            assert!(pos >= last, "key {key} out of order");
+            last = pos;
+        }
+    }
+
+    #[test]
+    fn nested_event_data_object_keys_serialize_sorted() {
+        let event_data = serde_json::json!({"z": 1, "a": 2, "m": 3});
+        let s = serde_json::to_string(&event_data).unwrap();
+        assert_eq!(s, r#"{"a":2,"m":3,"z":1}"#);
+    }
+
+    #[test]
+    fn two_events_chain_correctly() {
+        let occurred_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        let canon1 = serde_json::to_vec(&Canonical {
+            actor_display_name: &None,
+            actor_user_id: &None,
+            app_id: &None,
+            event_data: &serde_json::json!({}),
+            event_type: "first",
+            occurred_at: &occurred_at,
+            seqno: 1,
+        })
+        .unwrap();
+        let hash1 = compute_hash(&genesis_hash(), &canon1);
+
+        let canon2 = serde_json::to_vec(&Canonical {
+            actor_display_name: &None,
+            actor_user_id: &None,
+            app_id: &None,
+            event_data: &serde_json::json!({}),
+            event_type: "second",
+            occurred_at: &occurred_at,
+            seqno: 2,
+        })
+        .unwrap();
+        let hash2 = compute_hash(&hash1, &canon2);
+
+        assert_ne!(hex(&hash1), hex(&genesis_hash()));
+        assert_ne!(hex(&hash2), hex(&hash1));
+
+        let hash1_again = compute_hash(&genesis_hash(), &canon1);
+        assert_eq!(hash1, hash1_again);
+    }
+}

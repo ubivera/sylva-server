@@ -1,0 +1,29 @@
+[package]
+name = "audit"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sylva Hearth audit module — hash-chained, append-only event log"
+
+[lib]
+name = "audit"
+path = "src/lib.rs"
+
+[dependencies]
+identity = { path = "../identity" }
+
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

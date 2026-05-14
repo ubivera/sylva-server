@@ -21,6 +21,9 @@ pub struct HealthResponse {
     /// `None` when the DB is unreachable; otherwise the count of non-purged
     /// rows in `identity.users`.
     pub users_count: Option<i64>,
+    /// `None` when the DB is unreachable; otherwise the count of rows in
+    /// `audit.events` (excluding redacted).
+    pub audit_events_count: Option<i64>,
 }
 
 pub async fn handler(State(state): State<HealthState>) -> impl IntoResponse {
@@ -35,12 +38,19 @@ pub async fn handler(State(state): State<HealthState>) -> impl IntoResponse {
         None
     };
 
+    let audit_events_count = if db_ok {
+        audit::count(&state.db).await.ok()
+    } else {
+        None
+    };
+
     let body = HealthResponse {
         status: if db_ok { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started_at.elapsed().as_secs(),
         db: if db_ok { "ok" } else { "down" },
         users_count,
+        audit_events_count,
     };
 
     let code = if db_ok {

@@ -1,0 +1,30 @@
+[package]
+name = "provision"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only: provision the first Owner user. Replaced by the web install wizard."
+
+[[bin]]
+name = "provision"
+path = "src/main.rs"
+
+[dependencies]
+hearth = { path = "../hearth" }
+auth = { path = "../auth" }
+audit = { path = "../audit" }
+identity = { path = "../identity" }
+
+tokio = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
