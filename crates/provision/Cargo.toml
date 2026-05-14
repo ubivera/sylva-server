@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Dev-only: provision the first Owner user. Replaced by the web install wizard."
+description = "Dev-only: provision the first Owner user for local testing"
 
 [[bin]]
 name = "provision"

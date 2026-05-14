@@ -89,6 +89,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "authz"
+version = "0.0.1"
+dependencies = [
+ "identity",
+ "thiserror",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -555,6 +563,7 @@ dependencies = [
  "anyhow",
  "audit",
  "auth",
+ "authz",
  "axum",
  "chrono",
  "identity",

@@ -119,6 +119,22 @@ impl UserRepository {
         .await?;
         Ok(user)
     }
+
+    /// List all non-purged users, oldest first. Intended for admin
+    /// surfaces (e.g., `GET /admin/users`). Excludes `hard_deleted`
+    /// rows because those have been redacted.
+    pub async fn list_all(&self) -> Result<Vec<User>> {
+        let users = sqlx::query_as::<_, User>(
+            "SELECT id, email, display_name, lifecycle, instance_role, \
+                    locale, created_at, updated_at \
+             FROM identity.users \
+             WHERE lifecycle <> 'hard_deleted' \
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(users)
+    }
 }
 
 #[cfg(test)]
