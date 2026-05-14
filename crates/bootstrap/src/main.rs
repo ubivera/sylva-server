@@ -14,7 +14,7 @@ const POSTGRES_VERSION: &str = "18.3";
 
 /// Pin the expected SHA256 here once you've verified a download.
 /// Empty string means "compute and display, do not enforce".
-const EXPECTED_SHA256: &str = "";
+const EXPECTED_SHA256: &str = "d5e16a9317216731c0e564ab63fca7c049fd7e2f727a28628cb649207748129c";
 
 const DEFAULT_PORT: u16 = 15432;
 const DEFAULT_SUPERUSER: &str = "hearth";
@@ -120,7 +120,6 @@ fn run() -> SetupResult<()> {
     fs::create_dir_all(&extract_dir)?;
     extract_zip(&zip_path, &extract_dir)?;
 
-    // EDB Windows ZIPs unwrap to a top-level "pgsql" directory.
     let extracted_pgsql = extract_dir.join("pgsql");
     if !extracted_pgsql.exists() {
         return Err(format!(
@@ -205,10 +204,7 @@ fn compute_sha256(path: &Path) -> SetupResult<String> {
         )
         .into());
     }
-    // certutil output:
-    //   SHA256 hash of file.zip:
-    //   abc123def456...
-    //   CertUtil: -hashfile command completed successfully.
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let hash_line = stdout
         .lines()
@@ -233,7 +229,6 @@ fn compute_sha256(path: &Path) -> SetupResult<String> {
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> SetupResult<()> {
-    // Windows 10+ ships tar.exe (libarchive-based) which extracts ZIP via -xf.
     let status = Command::new("tar.exe")
         .args(["-xf"])
         .arg(zip_path)
@@ -248,7 +243,6 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> SetupResult<()> {
 }
 
 fn trim_distribution(pg_dir: &Path) -> SetupResult<()> {
-    // Drop big subdirectories we never use.
     for relative in REMOVE_SUBDIRS {
         let path = pg_dir.join(relative);
         if path.exists() {
@@ -257,8 +251,6 @@ fn trim_distribution(pg_dir: &Path) -> SetupResult<()> {
         }
     }
 
-    // bin/: keep only the three executables we need; drop wxWidgets DLLs
-    // (pgAdmin GUI deps, ~14 MB) since the GUI itself was just removed.
     let bin = pg_dir.join("bin");
     if bin.is_dir() {
         for entry in fs::read_dir(&bin)? {
@@ -281,8 +273,6 @@ fn trim_distribution(pg_dir: &Path) -> SetupResult<()> {
         }
     }
 
-    // lib/: drop static archive / Windows-static / PDB files (build artifacts),
-    // and any wx*.dll leftover. Keep extension .dll files (plpgsql.dll, etc.).
     let lib = pg_dir.join("lib");
     if lib.is_dir() {
         for entry in fs::read_dir(&lib)? {
@@ -368,9 +358,6 @@ fn configure_postgres(data_dir: &Path) -> SetupResult<()> {
 }
 
 fn create_database(pg_dir: &Path, data_dir: &Path, db_name: &str) -> SetupResult<()> {
-    // postgres --single runs without networking; it reads SQL from stdin.
-    // This lets us create the application database without first booting
-    // the server (which would race the configure step above).
     let postgres_exe = pg_dir.join("bin").join("postgres.exe");
     let mut child = Command::new(&postgres_exe)
         .arg("--single")
@@ -433,7 +420,6 @@ struct TempDirGuard(PathBuf);
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        // Best-effort cleanup; ignore errors so we don't mask the real failure.
         let _ = fs::remove_dir_all(&self.0);
     }
 }
