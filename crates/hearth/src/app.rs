@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use auth::SessionRepository;
 use axum::{Router, routing::{get, post}};
-use identity::UserRepository;
+use identity::{InvitationRepository, UserRepository};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
@@ -16,6 +16,7 @@ pub struct AppState {
     pub db: PgPool,
     pub users: UserRepository,
     pub sessions: SessionRepository,
+    pub invitations: InvitationRepository,
 }
 
 pub fn router(
@@ -23,20 +24,24 @@ pub fn router(
     db: PgPool,
     users: UserRepository,
     sessions: SessionRepository,
+    invitations: InvitationRepository,
 ) -> Router {
     let state = AppState {
         started_at,
         db,
         users,
         sessions,
+        invitations,
     };
 
     Router::new()
         .route("/health", get(health::handler))
         .route("/auth/login", post(auth_routes::login))
         .route("/auth/logout", post(auth_routes::logout))
+        .route("/auth/accept-invite", post(auth_routes::accept_invite))
         .route("/me", get(auth_routes::me))
         .route("/admin/users", get(admin_routes::list_users))
+        .route("/admin/invites", post(admin_routes::create_invite))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

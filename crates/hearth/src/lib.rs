@@ -72,7 +72,8 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
 
     let users = identity::UserRepository::new(pool.clone());
     let sessions = auth::SessionRepository::new(pool.clone());
-    let router = app::router(started_at, pool.clone(), users, sessions);
+    let invitations = identity::InvitationRepository::new(pool.clone());
+    let router = app::router(started_at, pool.clone(), users, sessions, invitations);
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
