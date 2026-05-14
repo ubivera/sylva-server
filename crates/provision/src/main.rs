@@ -7,7 +7,9 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
+use audit::Actor;
 use hearth::{config::Config, db, postgres::PostgresProcess};
+use identity::UserId;
 use uuid::Uuid;
 
 struct Args {
@@ -102,6 +104,23 @@ async fn provision_owner(config: &Config, args: &Args) -> Result<()> {
     .execute(&mut *tx)
     .await
     .context("inserting credentials")?;
+
+    let actor = Actor {
+        user_id: UserId::new(user_id),
+        display_name: args.display_name.clone(),
+    };
+    audit::append(
+        &mut tx,
+        Some(&actor),
+        None,
+        "owner_provisioned",
+        serde_json::json!({
+            "email": args.email,
+            "display_name": args.display_name,
+        }),
+    )
+    .await
+    .context("emitting owner_provisioned audit event")?;
 
     tx.commit().await.context("committing transaction")?;
     pool.close().await;
