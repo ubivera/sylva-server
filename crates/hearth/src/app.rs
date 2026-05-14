@@ -6,7 +6,7 @@ use identity::UserRepository;
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
-use crate::{auth_routes, health};
+use crate::{admin_routes, auth_routes, health};
 
 /// Shared state for every Hearth HTTP handler. Cloning is cheap - every
 /// field is itself a handle (Pool, Repository wrappers, Instant).
@@ -36,6 +36,7 @@ pub fn router(
         .route("/auth/login", post(auth_routes::login))
         .route("/auth/logout", post(auth_routes::logout))
         .route("/me", get(auth_routes::me))
+        .route("/admin/users", get(admin_routes::list_users))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

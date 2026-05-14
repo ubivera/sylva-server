@@ -1,28 +1,19 @@
 [package]
-name = "auth"
+name = "authz"
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth auth module"
+description = "Sylva Hearth authorization module"
 
 [lib]
-name = "auth"
+name = "authz"
 path = "src/lib.rs"
 
 [dependencies]
 identity = { path = "../identity" }
-
-argon2 = { workspace = true }
-sha2 = { workspace = true }
-rand = { workspace = true }
-
-sqlx = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
-use identity::{User, UserId};
+use identity::{InstanceRole, User, UserId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -31,13 +31,13 @@ pub struct ErrorResponse {
     pub error: &'static str,
 }
 
-/// `POST /auth/login` - exchange `{email, password}` for a session token.
+/// `POST /auth/login` — exchange `{email, password}` for a session token.
 ///
 /// On success: 200 + `{token, expires_at, user_id}`. The token is bearer
 /// material; the client should treat it as a credential.
 ///
 /// On failure (unknown email or wrong password): 401 + a generic error.
-/// We deliberately don't tell the client which failure mode hit - the
+/// We deliberately don't tell the client which failure mode hit — the
 /// distinction is recorded in the audit log only.
 pub async fn login(
     State(state): State<AppState>,
@@ -141,18 +141,26 @@ async fn audit_signin_failure(
     Ok(())
 }
 
-/// Axum extractor that requires a valid Bearer session token.
+/// Axum extractor that requires a valid Bearer session token. Eager-loads
+/// the full `User` record so handlers (and downstream extractors like
+/// `AdminUser`) don't pay for a second DB query.
 ///
-/// Use as a handler parameter:
-/// ```ignore
-/// async fn handler(user: AuthenticatedUser) -> ... { ... }
-/// ```
-///
-/// 401 on missing, malformed, expired, or revoked tokens.
-#[derive(Debug, Clone, Copy)]
+/// 401 on missing, malformed, expired, or revoked tokens. 401 if the
+/// associated user vanished between session creation and now (shouldn't
+/// happen given FK CASCADE, but defensive).
+#[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
-    pub user_id: UserId,
     pub session_id: Uuid,
+    pub user: User,
+}
+
+impl AuthenticatedUser {
+    pub fn actor(&self) -> Actor {
+        Actor {
+            user_id: self.user.id,
+            display_name: self.user.display_name.clone(),
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for AuthenticatedUser {
@@ -182,17 +190,55 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             .await
             .map_err(|err| {
                 tracing::error!(?err, "session lookup failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: "internal" }),
-                )
+                internal_error()
             })?
             .ok_or_else(|| unauthorized("invalid_session"))?;
 
+        let user = state
+            .users
+            .find_by_id(UserId::new(session.user_id))
+            .await
+            .map_err(|err| {
+                tracing::error!(?err, "user lookup failed");
+                internal_error()
+            })?
+            .ok_or_else(|| unauthorized("user_not_found"))?;
+
         Ok(AuthenticatedUser {
-            user_id: UserId::new(session.user_id),
             session_id: session.id,
+            user,
         })
+    }
+}
+
+/// Axum extractor that requires an authenticated user *and* at least the
+/// `Admin` instance role. Wraps `AuthenticatedUser`; rejects with 403 if
+/// the user is below Admin (per `authz::satisfies`).
+#[derive(Debug, Clone)]
+pub struct AdminUser(pub AuthenticatedUser);
+
+impl AdminUser {
+    pub fn actor(&self) -> Actor {
+        self.0.actor()
+    }
+}
+
+impl FromRequestParts<AppState> for AdminUser {
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let authed = AuthenticatedUser::from_request_parts(parts, state).await?;
+        if authz::satisfies(authed.user.instance_role, InstanceRole::Admin) {
+            Ok(AdminUser(authed))
+        } else {
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse { error: "forbidden" }),
+            ))
+        }
     }
 }
 
@@ -200,32 +246,31 @@ fn unauthorized(reason: &'static str) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: reason }))
 }
 
-/// `POST /auth/logout` - revoke the session token in the Authorization
+fn internal_error() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: "internal" }),
+    )
+}
+
+/// `POST /auth/logout` — revoke the session token in the Authorization
 /// header. Idempotent.
 pub async fn logout(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> impl IntoResponse {
-    let actor = state
-        .users
-        .find_by_id(user.user_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| Actor {
-            user_id: u.id,
-            display_name: u.display_name,
-        });
+    let actor = user.actor();
+    let session_id = user.session_id;
 
     let result: anyhow::Result<()> = async {
         let mut tx = state.db.begin().await?;
-        SessionRepository::revoke(&mut tx, user.session_id).await?;
+        SessionRepository::revoke(&mut tx, session_id).await?;
         audit::append(
             &mut tx,
-            actor.as_ref(),
+            Some(&actor),
             None,
             "signout",
-            serde_json::json!({ "session_id": user.session_id }),
+            serde_json::json!({ "session_id": session_id }),
         )
         .await?;
         tx.commit().await?;
@@ -237,11 +282,7 @@ pub async fn logout(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             tracing::error!(?err, "logout");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: "internal" }),
-            )
-                .into_response()
+            internal_error().into_response()
         }
     }
 }
@@ -251,34 +292,19 @@ pub struct MeResponse {
     pub id: Uuid,
     pub email: String,
     pub display_name: String,
-    pub instance_role: identity::InstanceRole,
+    pub instance_role: InstanceRole,
 }
 
-/// `GET /me` - return the current authenticated user.
-pub async fn me(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-) -> impl IntoResponse {
-    match state.users.find_by_id(user.user_id).await {
-        Ok(Some(u)) => (
-            StatusCode::OK,
-            Json(MeResponse {
-                id: u.id.0,
-                email: u.email,
-                display_name: u.display_name,
-                instance_role: u.instance_role,
-            }),
-        )
-            .into_response(),
-        Ok(None) => unauthorized("user_not_found").into_response(),
-        Err(err) => {
-            tracing::error!(?err, "loading user for /me");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: "internal" }),
-            )
-                .into_response()
-        }
-    }
+/// `GET /me` — return the current authenticated user.
+pub async fn me(user: AuthenticatedUser) -> impl IntoResponse {
+    let AuthenticatedUser { user, .. } = user;
+    (
+        StatusCode::OK,
+        Json(MeResponse {
+            id: user.id.0,
+            email: user.email,
+            display_name: user.display_name,
+            instance_role: user.instance_role,
+        }),
+    )
 }
-

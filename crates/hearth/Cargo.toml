@@ -34,6 +34,7 @@ uuid = { workspace = true }
 identity = { path = "../identity" }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
+authz = { path = "../authz" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
