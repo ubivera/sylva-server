@@ -78,7 +78,14 @@ name = "auth"
 version = "0.0.1"
 dependencies = [
  "argon2",
+ "chrono",
+ "identity",
+ "rand",
+ "serde",
+ "sha2",
+ "sqlx",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -547,7 +554,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "audit",
+ "auth",
  "axum",
+ "chrono",
  "identity",
  "serde",
  "serde_json",
@@ -558,6 +567,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

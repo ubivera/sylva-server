@@ -22,7 +22,7 @@ pub type Result<T> = std::result::Result<T, AuditError>;
 /// stays race-free without needing SERIALIZABLE isolation.
 const AUDIT_ADVISORY_LOCK_KEY: i64 = 0x1234_5678_9abc_def0_u64 as i64;
 
-/// Returns `sha256(b"hearth-audit-genesis")` — the `prev_hash` for the
+/// Returns `sha256(b"hearth-audit-genesis")` - the `prev_hash` for the
 /// first row in the chain.
 pub fn genesis_hash() -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -66,7 +66,7 @@ struct Canonical<'a> {
     seqno: i64,
 }
 
-/// `sha256(prev_hash || canonical_bytes)`. Pure function — tested
+/// `sha256(prev_hash || canonical_bytes)`. Pure function - tested
 /// without a DB.
 pub fn compute_hash(prev_hash: &[u8], canonical_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -75,7 +75,7 @@ pub fn compute_hash(prev_hash: &[u8], canonical_bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Count events in the chain. Pool-only — no transaction needed.
+/// Count events in the chain. Pool-only - no transaction needed.
 pub async fn count(pool: &PgPool) -> Result<i64> {
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit.events")
         .fetch_one(pool)
@@ -85,7 +85,7 @@ pub async fn count(pool: &PgPool) -> Result<i64> {
 
 /// Append a new event to the chain within the caller's transaction.
 ///
-/// The caller controls the transaction lifecycle — this lets the audit
+/// The caller controls the transaction lifecycle - this lets the audit
 /// emission be atomic with the action that prompted it (e.g., a user
 /// insert and its `user_created` audit row commit together, satisfying
 /// the design's "audit emission is synchronous; if audit fails, the

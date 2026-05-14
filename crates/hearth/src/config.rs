@@ -30,7 +30,7 @@ impl Config {
         Self::from_env_lookup(|key| env::var(key).ok())
     }
 
-    /// Same as `from_env` but takes any lookup function — used by tests to
+    /// Same as `from_env` but takes any lookup function - used by tests to
     /// avoid mutating real process environment (which is shared across tests).
     pub fn from_env_lookup<F>(get: F) -> anyhow::Result<Self>
     where

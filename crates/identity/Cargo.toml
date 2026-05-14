@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth identity module — user accounts, profiles, devices, recovery (currently: skeleton + core user record)"
+description = "Sylva Hearth identity module - user accounts, profiles, devices, recovery (currently: skeleton + core user record)"
 
 [lib]
 name = "identity"

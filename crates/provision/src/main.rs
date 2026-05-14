@@ -74,7 +74,7 @@ async fn provision_owner(config: &Config, args: &Args) -> Result<()> {
         pool.close().await;
         bail!(
             "identity.users already has {existing} row(s).\n\
-             provision is for the first Owner only — use the eventual web admin to create more users.\n\
+             provision is for the first Owner only - use the eventual web admin to create more users.\n\
              To start over, run `cargo run --bin clean`."
         );
     }
@@ -240,7 +240,7 @@ fn print_help() {
     eprintln!("Password source priority:");
     eprintln!("  1. --password argument (warning: appears in shell history)");
     eprintln!("  2. HEARTH_PROVISION_PASSWORD env var");
-    eprintln!("  3. stdin (echoes on interactive terminals — pipe or use env var to avoid)");
+    eprintln!("  3. stdin (echoes on interactive terminals - pipe or use env var to avoid)");
 }
 
 fn init_tracing() {
