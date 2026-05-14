@@ -1,3 +1,4 @@
+pub mod account_routes;
 pub mod admin_routes;
 pub mod app;
 pub mod auth_routes;
@@ -9,6 +10,7 @@ pub mod job_object;
 pub mod postgres;
 pub mod shutdown;
 pub mod telemetry;
+pub mod views;
 
 use anyhow::Context;
 

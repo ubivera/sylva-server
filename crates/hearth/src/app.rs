@@ -6,7 +6,7 @@ use identity::{InvitationRepository, UserRepository};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
-use crate::{admin_routes, auth_routes, health};
+use crate::{account_routes, admin_routes, auth_routes, health};
 
 /// Shared state for every Hearth HTTP handler. Cloning is cheap - every
 /// field is itself a handle (Pool, Repository wrappers, Instant).
@@ -40,8 +40,20 @@ pub fn router(
         .route("/auth/logout", post(auth_routes::logout))
         .route("/auth/accept-invite", post(auth_routes::accept_invite))
         .route("/me", get(auth_routes::me))
+        .route("/account/activity", get(account_routes::activity))
+        .route("/account/sessions", get(account_routes::list_sessions))
+        .route(
+            "/account/sessions/{id}/revoke",
+            post(account_routes::revoke_session),
+        )
         .route("/admin/users", get(admin_routes::list_users))
         .route("/admin/invites", post(admin_routes::create_invite))
+        .route("/admin/audit", get(admin_routes::list_audit))
+        .route("/admin/sessions", get(admin_routes::list_sessions))
+        .route(
+            "/admin/sessions/{id}/revoke",
+            post(admin_routes::revoke_session),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

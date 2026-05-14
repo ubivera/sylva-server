@@ -1,4 +1,11 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use audit::ListFilter;
+use auth::SessionRepository;
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use chrono::{DateTime, Utc};
 use identity::{
     DEFAULT_INVITATION_TTL, InstanceRole, InvitationRepository, UserLifecycle,
@@ -6,7 +13,11 @@ use identity::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{app::AppState, auth_routes::AdminUser};
+use crate::{
+    app::AppState,
+    auth_routes::AdminUser,
+    views::{AuditEventView, PaginatedAudit, SessionView},
+};
 
 #[derive(Serialize)]
 pub struct AdminUserView {
@@ -167,6 +178,121 @@ pub async fn create_invite(
             tracing::error!(?err_, "creating invite");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AuditQuery {
+    pub limit: Option<u32>,
+    pub cursor: Option<i64>,
+    pub since: Option<DateTime<Utc>>,
+    pub actor: Option<Uuid>,
+}
+
+/// `GET /admin/audit` — paginated audit log across all users.
+/// Newest first. Optional `?actor=<uuid>` / `?since=<rfc3339>` filters.
+pub async fn list_audit(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Query(q): Query<AuditQuery>,
+) -> impl IntoResponse {
+    let filter = ListFilter {
+        actor: q.actor,
+        since: q.since,
+        before_seqno: q.cursor,
+        limit: q.limit,
+    };
+
+    match audit::list(&state.db, &filter).await {
+        Ok(events) => {
+            let next_cursor = next_audit_cursor(&events, q.limit);
+            let items: Vec<AuditEventView> = events.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(PaginatedAudit { items, next_cursor })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(?e, "listing audit");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `GET /admin/sessions` — every active session across all users.
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> impl IntoResponse {
+    match state.sessions.list_all_active().await {
+        Ok(sessions) => {
+            let current = admin.0.session_id;
+            let views: Vec<SessionView> = sessions
+                .into_iter()
+                .map(|s| SessionView::from_with_current(s, current))
+                .collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(?e, "listing all sessions");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/sessions/{id}/revoke` — admin revokes any session. Emits
+/// a `session_revoked_by_admin` audit event with both the admin (as
+/// actor) and the affected user_id in `event_data`.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(session_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let session = match state.sessions.find_by_id(session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "session_not_found").into_response(),
+        Err(e) => {
+            tracing::error!(?e, "lookup session");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+
+    let actor = admin.actor();
+    let target_user_id = session.user_id;
+
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        SessionRepository::revoke(&mut tx, session_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "session_revoked_by_admin",
+            serde_json::json!({
+                "session_id": session_id,
+                "target_user_id": target_user_id,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(?e, "revoking session as admin");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+fn next_audit_cursor(events: &[audit::AuditEvent], requested_limit: Option<u32>) -> Option<i64> {
+    let limit = requested_limit
+        .unwrap_or(audit::DEFAULT_PAGE_SIZE)
+        .clamp(1, audit::MAX_PAGE_SIZE) as usize;
+    if events.len() < limit {
+        None
+    } else {
+        events.last().map(|e| e.seqno)
     }
 }
 

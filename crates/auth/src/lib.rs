@@ -260,6 +260,51 @@ impl SessionRepository {
         .await?;
         Ok(count)
     }
+
+    /// List a user's sessions (active and historical), newest first.
+    /// Includes revoked + expired so `/account/sessions` can show "this
+    /// session was revoked" entries; the caller filters as needed.
+    pub async fn list_for_user(&self, user_id: UserId) -> Result<Vec<Session>> {
+        let sessions: Vec<Session> = sqlx::query_as(
+            "SELECT id, user_id, created_at, expires_at, revoked_at
+             FROM auth.sessions
+             WHERE user_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
+    /// List every active session across all users, newest first.
+    /// Intended for `/admin/sessions`.
+    pub async fn list_all_active(&self) -> Result<Vec<Session>> {
+        let sessions: Vec<Session> = sqlx::query_as(
+            "SELECT id, user_id, created_at, expires_at, revoked_at
+             FROM auth.sessions
+             WHERE revoked_at IS NULL AND expires_at > now()
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
+    /// Look up a single session row by id (no token-hash check). Returns
+    /// the session regardless of revoked/expired state so callers can
+    /// produce specific error messages.
+    pub async fn find_by_id(&self, session_id: Uuid) -> Result<Option<Session>> {
+        let session: Option<Session> = sqlx::query_as(
+            "SELECT id, user_id, created_at, expires_at, revoked_at
+             FROM auth.sessions
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(session)
+    }
 }
 
 #[cfg(test)]
