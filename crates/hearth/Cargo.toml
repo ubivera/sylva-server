@@ -28,9 +28,12 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 
 identity = { path = "../identity" }
 audit = { path = "../audit" }
+auth = { path = "../auth" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

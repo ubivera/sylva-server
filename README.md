@@ -1,6 +1,6 @@
 # Sylva Hearth
 
-The server for the Sylva ecosystem — a self-hosted, privacy-first, E2E-encrypted Rust modular monolith.
+The server for the Sylva ecosystem - a self-hosted, privacy-first, E2E-encrypted Rust modular monolith.
 
 ## Build Prerequisites
 

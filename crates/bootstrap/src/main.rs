@@ -22,7 +22,7 @@ const DEFAULT_DATABASE: &str = "hearth";
 
 /// Dedicated schema for hearth-internal infrastructure tables (notably
 /// sqlx's `_sqlx_migrations`). Created at bootstrap time so the schema
-/// always exists by the time hearth makes its first connection — sqlx
+/// always exists by the time hearth makes its first connection - sqlx
 /// can't create it via a migration without a chicken-and-egg problem.
 const META_SCHEMA: &str = "hearth_meta";
 
@@ -30,7 +30,7 @@ const KEEP_EXECUTABLES: &[&str] = &["postgres.exe", "initdb.exe", "pg_ctl.exe"];
 
 /// Wholesale-deletable top-level/known directories from the EDB distribution.
 /// pgAdmin 4 (GUI tool) and StackBuilder (extension installer) dominate the
-/// untrimmed install — removing them and the other entries here drops the
+/// untrimmed install - removing them and the other entries here drops the
 /// install size by roughly an order of magnitude.
 const REMOVE_SUBDIRS: &[&str] = &[
     "doc",
