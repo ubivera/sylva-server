@@ -2,6 +2,8 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod health;
+#[cfg(windows)]
+pub mod job_object;
 pub mod postgres;
 pub mod shutdown;
 pub mod telemetry;
@@ -27,12 +29,27 @@ async fn run_async() -> anyhow::Result<()> {
         "starting hearth"
     );
 
+    #[cfg(windows)]
+    match job_object::JobObject::assign_current_process_for_kill_on_close() {
+        Ok(job) => {
+            std::mem::forget(job);
+            tracing::info!("installed Windows job-object safety net for child cleanup");
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "could not install Windows job-object safety net; \
+                 hard-kill cleanup of bundled postgres may leave orphan workers"
+            );
+        }
+    }
+
     let started_at = std::time::Instant::now();
 
     let postgres = postgres::PostgresProcess::start(
         config.pg_bin_dir(),
         config.pg_data_dir(),
-        config.postgres_port,
+        config.postgres_port(),
     )
     .await
     .context("starting bundled postgres")?;

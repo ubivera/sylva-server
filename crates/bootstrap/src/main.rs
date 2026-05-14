@@ -23,8 +23,9 @@ const DEFAULT_DATABASE: &str = "hearth";
 const KEEP_EXECUTABLES: &[&str] = &["postgres.exe", "initdb.exe", "pg_ctl.exe"];
 
 /// Wholesale-deletable top-level/known directories from the EDB distribution.
-/// pgAdmin 4 (666 MB GUI tool) and StackBuilder (extension installer) dominate;
-/// without these, the install drops from ~770 MB to <100 MB.
+/// pgAdmin 4 (GUI tool) and StackBuilder (extension installer) dominate the
+/// untrimmed install — removing them and the other entries here drops the
+/// install size by roughly an order of magnitude.
 const REMOVE_SUBDIRS: &[&str] = &[
     "doc",
     "include",
@@ -424,3 +425,43 @@ impl Drop for TempDirGuard {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{directory_size, quote_ident};
+    use std::fs;
+
+    #[test]
+    fn quote_ident_wraps_simple_name() {
+        assert_eq!(quote_ident("hearth"), "\"hearth\"");
+    }
+
+    #[test]
+    fn quote_ident_escapes_embedded_double_quotes() {
+        assert_eq!(quote_ident("ev\"il"), "\"ev\"\"il\"");
+    }
+
+    #[test]
+    fn quote_ident_handles_empty() {
+        assert_eq!(quote_ident(""), "\"\"");
+    }
+
+    #[test]
+    fn quote_ident_preserves_non_ascii() {
+        assert_eq!(quote_ident("café"), "\"café\"");
+    }
+
+    #[test]
+    fn directory_size_counts_nested_files() {
+        let tmp = std::env::temp_dir()
+            .join(format!("hearth-bootstrap-test-dirsize-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("nested")).unwrap();
+        fs::write(tmp.join("a.txt"), b"1234567890").unwrap();
+        fs::write(tmp.join("nested").join("b.txt"), b"abc").unwrap();
+
+        let total = directory_size(&tmp).unwrap();
+        fs::remove_dir_all(&tmp).ok();
+        assert_eq!(total, 13);
+    }
+}

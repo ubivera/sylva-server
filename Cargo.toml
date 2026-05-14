@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hearth", "crates/bootstrap", "crates/clean"]
+members = ["crates/bootstrap", "crates/clean", "crates/hearth"]
 
 [workspace.package]
 edition = "2024"
@@ -26,9 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "migrate", "macros"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

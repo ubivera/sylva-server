@@ -175,3 +175,50 @@ fn quote_ident(s: &str) -> String {
     out.push('"');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{quote_ident, read_postmaster_pid};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hearth-clean-test-{}-{label}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn quote_ident_wraps_and_escapes() {
+        assert_eq!(quote_ident("hearth"), "\"hearth\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote_ident(""), "\"\"");
+    }
+
+    #[test]
+    fn read_postmaster_pid_parses_first_line() {
+        let path = temp_path("good-pid");
+        fs::write(&path, "12345\n/some/path\n1700000000\n5432\n").unwrap();
+        let pid = read_postmaster_pid(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(pid, Some(12345));
+    }
+
+    #[test]
+    fn read_postmaster_pid_returns_none_for_garbage() {
+        let path = temp_path("bad-pid");
+        fs::write(&path, "not-a-number\n").unwrap();
+        let pid = read_postmaster_pid(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn read_postmaster_pid_returns_none_for_missing_file() {
+        let path = temp_path("missing-pid");
+        let _ = fs::remove_file(&path);
+        assert_eq!(read_postmaster_pid(&path), None);
+    }
+}
