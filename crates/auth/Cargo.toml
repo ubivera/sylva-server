@@ -1,0 +1,20 @@
+[package]
+name = "auth"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sylva Hearth auth module — password hashing, sessions, MFA"
+
+[lib]
+name = "auth"
+path = "src/lib.rs"
+
+[dependencies]
+argon2 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

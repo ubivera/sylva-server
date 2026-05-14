@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bootstrap", "crates/clean", "crates/hearth", "crates/identity"]
+members = ["crates/auth", "crates/bootstrap", "crates/clean", "crates/hearth", "crates/identity", "crates/provision"]
 
 [workspace.package]
 edition = "2024"
@@ -29,6 +29,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 
 uuid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+argon2 = "0.5"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [workspace.lints.rust]

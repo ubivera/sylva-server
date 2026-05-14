@@ -20,6 +20,12 @@ const DEFAULT_PORT: u16 = 15432;
 const DEFAULT_SUPERUSER: &str = "hearth";
 const DEFAULT_DATABASE: &str = "hearth";
 
+/// Dedicated schema for hearth-internal infrastructure tables (notably
+/// sqlx's `_sqlx_migrations`). Created at bootstrap time so the schema
+/// always exists by the time hearth makes its first connection — sqlx
+/// can't create it via a migration without a chicken-and-egg problem.
+const META_SCHEMA: &str = "hearth_meta";
+
 const KEEP_EXECUTABLES: &[&str] = &["postgres.exe", "initdb.exe", "pg_ctl.exe"];
 
 /// Wholesale-deletable top-level/known directories from the EDB distribution.
@@ -90,7 +96,7 @@ fn run() -> SetupResult<()> {
     let zip_path = temp_dir.join("postgres.zip");
 
     eprintln!();
-    eprintln!("[1/6] Downloading Postgres {POSTGRES_VERSION} binaries...");
+    eprintln!("[1/7] Downloading Postgres {POSTGRES_VERSION} binaries...");
     download(POSTGRES_DOWNLOAD_URL, &zip_path)?;
     let download_size = fs::metadata(&zip_path)
         .map(|m| m.len())
@@ -98,7 +104,7 @@ fn run() -> SetupResult<()> {
     eprintln!("      Downloaded {} MB.", download_size / (1024 * 1024));
 
     eprintln!();
-    eprintln!("[2/6] Computing SHA256...");
+    eprintln!("[2/7] Computing SHA256...");
     let hash = compute_sha256(&zip_path)?;
     eprintln!("      sha256: {hash}");
     if EXPECTED_SHA256.is_empty() {
@@ -116,7 +122,7 @@ fn run() -> SetupResult<()> {
     }
 
     eprintln!();
-    eprintln!("[3/6] Extracting...");
+    eprintln!("[3/7] Extracting...");
     let extract_dir = temp_dir.join("extracted");
     fs::create_dir_all(&extract_dir)?;
     extract_zip(&zip_path, &extract_dir)?;
@@ -131,7 +137,7 @@ fn run() -> SetupResult<()> {
     }
 
     eprintln!();
-    eprintln!("[4/6] Moving to {} and trimming...", pg_dir.display());
+    eprintln!("[4/7] Moving to {} and trimming...", pg_dir.display());
     fs::rename(&extracted_pgsql, &pg_dir).map_err(|e| {
         format!(
             "renaming {} -> {}: {e}",
@@ -144,13 +150,17 @@ fn run() -> SetupResult<()> {
     eprintln!("      Trimmed install size: {} MB.", kept_size / (1024 * 1024));
 
     eprintln!();
-    eprintln!("[5/6] Initializing cluster at {}...", pg_data_dir.display());
+    eprintln!("[5/7] Initializing cluster at {}...", pg_data_dir.display());
     initdb(&pg_dir, &pg_data_dir)?;
     configure_postgres(&pg_data_dir)?;
 
     eprintln!();
-    eprintln!("[6/6] Creating database '{DEFAULT_DATABASE}'...");
+    eprintln!("[6/7] Creating database '{DEFAULT_DATABASE}'...");
     create_database(&pg_dir, &pg_data_dir, DEFAULT_DATABASE)?;
+
+    eprintln!();
+    eprintln!("[7/7] Creating meta schema '{META_SCHEMA}' in '{DEFAULT_DATABASE}'...");
+    create_meta_schema(&pg_dir, &pg_data_dir, DEFAULT_DATABASE, META_SCHEMA)?;
 
     eprintln!();
     eprintln!("Setup complete.");
@@ -159,6 +169,7 @@ fn run() -> SetupResult<()> {
     eprintln!("  Listen address:    127.0.0.1:{DEFAULT_PORT}");
     eprintln!("  Superuser:         {DEFAULT_SUPERUSER}");
     eprintln!("  Database:          {DEFAULT_DATABASE}");
+    eprintln!("  Meta schema:       {META_SCHEMA}");
     eprintln!();
     eprintln!("Run `cargo run --bin hearth` to start the server.");
 
@@ -359,12 +370,45 @@ fn configure_postgres(data_dir: &Path) -> SetupResult<()> {
 }
 
 fn create_database(pg_dir: &Path, data_dir: &Path, db_name: &str) -> SetupResult<()> {
+    run_single_user_sql(
+        pg_dir,
+        data_dir,
+        "postgres",
+        &format!("CREATE DATABASE {};", quote_ident(db_name)),
+    )
+}
+
+/// Creates the dedicated meta schema inside the application database. Runs
+/// in single-user mode against the just-created `hearth` database (not
+/// `postgres`), so the schema lives in the right place.
+fn create_meta_schema(
+    pg_dir: &Path,
+    data_dir: &Path,
+    db_name: &str,
+    schema_name: &str,
+) -> SetupResult<()> {
+    run_single_user_sql(
+        pg_dir,
+        data_dir,
+        db_name,
+        &format!("CREATE SCHEMA {};", quote_ident(schema_name)),
+    )
+}
+
+/// Spawn `postgres --single -D <data_dir> <database>` and pipe a single SQL
+/// statement (or batch) into its stdin.
+fn run_single_user_sql(
+    pg_dir: &Path,
+    data_dir: &Path,
+    database: &str,
+    sql: &str,
+) -> SetupResult<()> {
     let postgres_exe = pg_dir.join("bin").join("postgres.exe");
     let mut child = Command::new(&postgres_exe)
         .arg("--single")
         .arg("-D")
         .arg(data_dir)
-        .arg("postgres")
+        .arg(database)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -376,8 +420,7 @@ fn create_database(pg_dir: &Path, data_dir: &Path, db_name: &str) -> SetupResult
             .stdin
             .as_mut()
             .ok_or("postgres --single stdin not piped")?;
-        writeln!(stdin, "CREATE DATABASE {};", quote_ident(db_name))
-            .map_err(|e| format!("writing to postgres stdin: {e}"))?;
+        writeln!(stdin, "{sql}").map_err(|e| format!("writing to postgres stdin: {e}"))?;
     }
     drop(child.stdin.take());
 
