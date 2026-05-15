@@ -117,18 +117,27 @@ async fn unauthenticated_admin_routes_return_401() {
 // ---- /admin/users ----
 
 #[tokio::test]
-async fn list_users_returns_all_non_purged() {
+async fn list_users_shows_active_and_deactivated_hides_deleted() {
     let (app, owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
-    // Add a soft-deleted user that should still appear.
+    // Deactivated user - still in the directory.
     let ghost = app
         .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
         .await;
-    sqlx::query("UPDATE identity.users SET lifecycle = 'soft_deleted' WHERE id = $1")
+    sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
         .bind(ghost.id)
         .execute(&app.pool)
         .await
         .unwrap();
-    // And a hard-deleted user that should NOT appear.
+    // Soft-deleted user - hidden.
+    let gone = app
+        .seed_user("gone@test.local", "Gone", "pw", InstanceRole::User)
+        .await;
+    sqlx::query("UPDATE identity.users SET lifecycle = 'soft_deleted' WHERE id = $1")
+        .bind(gone.id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    // Hard-deleted user - hidden.
     let purged = app
         .seed_user("purged@test.local", "Purged", "pw", InstanceRole::User)
         .await;
@@ -146,15 +155,17 @@ async fn list_users_returns_all_non_purged() {
     assert!(emails.contains(&admin.email.as_str()));
     assert!(emails.contains(&"ghost@test.local"));
     assert!(
+        !emails.contains(&"gone@test.local"),
+        "soft_deleted must be hidden: {emails:?}"
+    );
+    assert!(
         !emails.contains(&"purged@test.local"),
         "hard_deleted must be hidden: {emails:?}"
     );
 
     let ghost_view = users.iter().find(|u| u.email == "ghost@test.local").unwrap();
-    assert_eq!(ghost_view.lifecycle, "soft_deleted");
+    assert_eq!(ghost_view.lifecycle, "deactivated");
 }
-
-// ---- /admin/invites: create ----
 
 #[tokio::test]
 async fn create_invite_emits_token_and_audit() {
@@ -565,4 +576,445 @@ async fn admin_revoke_nonexistent_session_returns_404() {
         .await;
     resp.assert_status(StatusCode::NOT_FOUND)
         .assert_error("session_not_found");
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /admin/users/{id}/lifecycle tests
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct LifecycleBody {
+    id: Uuid,
+    email: String,
+    display_name: String,
+    lifecycle: String,
+    instance_role: InstanceRole,
+    updated_at: DateTime<Utc>,
+}
+
+async fn seed_user_token(
+    app: &TestApp,
+    email: &str,
+    name: &str,
+    pw: &str,
+    role: InstanceRole,
+) -> (Uuid, String) {
+    let user = app.seed_user(email, name, pw, role).await;
+    let token = app.login(email, pw).await;
+    (user.id.0, token)
+}
+
+#[tokio::test]
+async fn deactivate_then_reactivate_cycle() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, user_tok) =
+        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
+
+    // Deactivate.
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/deactivate"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: LifecycleBody = resp.json();
+    assert_eq!(body.lifecycle, "deactivated");
+
+    // User's session is dead.
+    app.get("/me", Some(&user_tok))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    // Login attempt: invalid_credentials (deactivated reads as unknown).
+    app.post(
+        "/auth/login",
+        None,
+        Some(json!({ "email": "u@test.local", "password": "upw" })),
+    )
+    .await
+    .assert_status(StatusCode::UNAUTHORIZED)
+    .assert_error("invalid_credentials");
+
+    // Reactivate.
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/reactivate"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: LifecycleBody = resp.json();
+    assert_eq!(body.lifecycle, "active");
+
+    // Same password works again — credentials were preserved.
+    app.post(
+        "/auth/login",
+        None,
+        Some(json!({ "email": "u@test.local", "password": "upw" })),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn deactivate_already_deactivated_returns_409() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, _tok) =
+        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
+
+    app.post(
+        &format!("/admin/users/{user_id}/deactivate"),
+        Some(&owner_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::OK);
+
+    let again = app
+        .post(
+            &format!("/admin/users/{user_id}/deactivate"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    again
+        .assert_status(StatusCode::CONFLICT)
+        .assert_error("already_deactivated");
+}
+
+#[tokio::test]
+async fn reactivate_already_active_returns_409() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, _tok) =
+        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/reactivate"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::CONFLICT)
+        .assert_error("already_active");
+}
+
+#[tokio::test]
+async fn cannot_target_self_for_any_lifecycle_action() {
+    let (app, owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    for action in ["deactivate", "reactivate", "delete", "purge"] {
+        let resp = app
+            .post(
+                &format!("/admin/users/{}/{action}", owner.id.0),
+                Some(&owner_tok),
+                None,
+            )
+            .await;
+        assert_eq!(
+            resp.status,
+            StatusCode::FORBIDDEN,
+            "self-{action} should be 403, got {}: {}",
+            resp.status,
+            resp.body_as_text()
+        );
+        assert_eq!(resp.error_code(), "cannot_target_self");
+    }
+}
+
+#[tokio::test]
+async fn admin_cannot_act_on_peer_admin() {
+    // Admin1 cannot deactivate Admin2 (peer-on-peer). Only Owner can.
+    let app = TestApp::new().await;
+    let admin1 = app
+        .seed_user("a1@test.local", "A1", "pw1", InstanceRole::Admin)
+        .await;
+    let admin2 = app
+        .seed_user("a2@test.local", "A2", "pw2", InstanceRole::Admin)
+        .await;
+    let tok1 = app.login(&admin1.email, "pw1").await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/deactivate", admin2.id.0),
+            Some(&tok1),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::FORBIDDEN)
+        .assert_error("cannot_target_peer_or_higher");
+}
+
+#[tokio::test]
+async fn admin_cannot_act_on_owner() {
+    let (app, owner, _owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/deactivate", owner.id.0),
+            Some(&admin_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::FORBIDDEN)
+        .assert_error("cannot_target_peer_or_higher");
+}
+
+#[tokio::test]
+async fn owner_can_deactivate_admin() {
+    let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/deactivate", admin.id.0),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn lifecycle_action_on_unknown_user_returns_404() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let bogus = Uuid::new_v4();
+    for action in ["deactivate", "reactivate", "delete", "purge"] {
+        let resp = app
+            .post(
+                &format!("/admin/users/{bogus}/{action}"),
+                Some(&owner_tok),
+                None,
+            )
+            .await;
+        assert_eq!(
+            resp.status,
+            StatusCode::NOT_FOUND,
+            "{action} on unknown id should be 404"
+        );
+        assert_eq!(resp.error_code(), "user_not_found");
+    }
+}
+
+#[tokio::test]
+async fn delete_redacts_pii_and_frees_email() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, user_tok) =
+        seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::User).await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/delete"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::NO_CONTENT);
+
+    // Session is dead.
+    app.get("/me", Some(&user_tok))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    // Row exists with redacted PII + soft_deleted lifecycle.
+    let (email, display, lifecycle): (String, String, String) = sqlx::query_as(
+        "SELECT email, display_name, lifecycle::text FROM identity.users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(display, "[deleted user]");
+    assert!(
+        email.starts_with("deleted+") && email.ends_with("@purged.invalid"),
+        "email should be redacted, got: {email}"
+    );
+
+    // Credentials row gone.
+    let creds_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth.credentials WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(creds_count, 0, "credentials should be wiped");
+
+    // Original email is freed for re-invitation.
+    let invite_resp = app
+        .post(
+            "/admin/invites",
+            Some(&owner_tok),
+            Some(json!({ "email": "victim@test.local" })),
+        )
+        .await;
+    invite_resp.assert_status(StatusCode::CREATED);
+
+    // Audit event recorded the original email.
+    let (event_data,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT event_data FROM audit.events
+         WHERE event_type = 'user_deleted'
+         ORDER BY seqno DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        event_data["redacted_from_email"].as_str(),
+        Some("victim@test.local")
+    );
+}
+
+#[tokio::test]
+async fn purge_can_target_already_soft_deleted_user() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, _tok) =
+        seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::User).await;
+
+    // Soft-delete first.
+    app.post(
+        &format!("/admin/users/{user_id}/delete"),
+        Some(&owner_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    // Purge a soft-deleted user.
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/purge"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::NO_CONTENT);
+
+    let lifecycle: String =
+        sqlx::query_scalar("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "hard_deleted");
+
+    // Audit recorded the prior lifecycle.
+    let (event_data,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT event_data FROM audit.events
+         WHERE event_type = 'user_purged'
+         ORDER BY seqno DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(event_data["prior_lifecycle"].as_str(), Some("soft_deleted"));
+}
+
+#[tokio::test]
+async fn purge_directly_from_active_works() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, _tok) =
+        seed_user_token(&app, "v@test.local", "V", "pw", InstanceRole::User).await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/purge"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::NO_CONTENT);
+
+    let lifecycle: String =
+        sqlx::query_scalar("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "hard_deleted");
+}
+
+#[tokio::test]
+async fn deleted_user_is_invisible_to_admin_list() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, _tok) =
+        seed_user_token(&app, "vanish@test.local", "Vanish", "pw", InstanceRole::User).await;
+
+    app.post(
+        &format!("/admin/users/{user_id}/delete"),
+        Some(&owner_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    let list: Vec<AdminUserView> = app
+        .get("/admin/users", Some(&owner_tok))
+        .await
+        .json();
+    assert!(
+        list.iter().all(|u| u.email != "vanish@test.local"),
+        "soft-deleted user should be hidden from /admin/users"
+    );
+}
+
+#[tokio::test]
+async fn reactivate_only_works_from_deactivated_state() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let (user_id, _tok) =
+        seed_user_token(&app, "u@test.local", "U", "pw", InstanceRole::User).await;
+
+    // Soft-delete then attempt reactivate → 404 (account is gone).
+    app.post(
+        &format!("/admin/users/{user_id}/delete"),
+        Some(&owner_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{user_id}/reactivate"),
+            Some(&owner_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::NOT_FOUND)
+        .assert_error("user_not_found");
+}
+
+#[tokio::test]
+async fn deactivate_revokes_all_sessions() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let user = app
+        .seed_user("multi@test.local", "Multi", "pw", InstanceRole::User)
+        .await;
+    let t1 = app.login(&user.email, "pw").await;
+    let t2 = app.login(&user.email, "pw").await;
+    let t3 = app.login(&user.email, "pw").await;
+
+    app.post(
+        &format!("/admin/users/{}/deactivate", user.id.0),
+        Some(&owner_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::OK);
+
+    for tok in [&t1, &t2, &t3] {
+        app.get("/me", Some(tok))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    let (event_data,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT event_data FROM audit.events
+         WHERE event_type = 'user_deactivated'
+         ORDER BY seqno DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(event_data["sessions_revoked"].as_u64(), Some(3));
 }

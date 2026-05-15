@@ -50,6 +50,16 @@ pub fn router(
         )
         .route("/admin/users", get(admin_routes::list_users))
         .route(
+            "/admin/users/{id}/deactivate",
+            post(admin_routes::deactivate_user),
+        )
+        .route(
+            "/admin/users/{id}/reactivate",
+            post(admin_routes::reactivate_user),
+        )
+        .route("/admin/users/{id}/delete", post(admin_routes::delete_user))
+        .route("/admin/users/{id}/purge", post(admin_routes::purge_user))
+        .route(
             "/admin/invites",
             get(admin_routes::list_invites).post(admin_routes::create_invite),
         )

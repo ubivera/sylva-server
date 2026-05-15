@@ -3,6 +3,7 @@ CREATE SCHEMA IF NOT EXISTS identity;
 CREATE TYPE identity.user_lifecycle AS ENUM (
     'pending_invite',
     'active',
+    'deactivated',
     'soft_deleted',
     'hard_deleted'
 );

@@ -71,14 +71,12 @@ async fn login_unknown_email_returns_same_generic_401() {
 }
 
 #[tokio::test]
-async fn login_suspended_user_treated_as_unknown() {
-    // verify_credentials filters on `lifecycle = 'active'`, so a soft-deleted
-    // user looks identical to an unknown email at the API.
+async fn login_deactivated_user_treated_as_unknown() {
     let app = TestApp::new().await;
     let user = app
         .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
         .await;
-    sqlx::query("UPDATE identity.users SET lifecycle = 'soft_deleted' WHERE id = $1")
+    sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
         .bind(user.id)
         .execute(&app.pool)
         .await
