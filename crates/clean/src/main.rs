@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 type CleanResult<T> = Result<T, Box<dyn Error>>;
 
 const DEFAULT_DATABASE: &str = "hearth";
+const META_SCHEMA: &str = "hearth_meta";
 
 fn main() {
     if let Err(err) = run() {
@@ -109,11 +110,37 @@ fn reset_database(pg_dir: &Path, data_dir: &Path, db_name: &str) -> CleanResult<
         return Err(format!("postgres.exe not found at {}", postgres_exe.display()).into());
     }
 
-    let mut child = Command::new(&postgres_exe)
+    let quoted = quote_ident(db_name);
+    run_single_user_sql(
+        &postgres_exe,
+        data_dir,
+        "postgres",
+        &[
+            &format!("DROP DATABASE IF EXISTS {quoted};"),
+            &format!("CREATE DATABASE {quoted};"),
+        ],
+    )?;
+
+    run_single_user_sql(
+        &postgres_exe,
+        data_dir,
+        db_name,
+        &[&format!("CREATE SCHEMA {};", quote_ident(META_SCHEMA))],
+    )?;
+    Ok(())
+}
+
+fn run_single_user_sql(
+    postgres_exe: &Path,
+    data_dir: &Path,
+    database: &str,
+    statements: &[&str],
+) -> CleanResult<()> {
+    let mut child = Command::new(postgres_exe)
         .arg("--single")
         .arg("-D")
         .arg(data_dir)
-        .arg("postgres")
+        .arg(database)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -125,11 +152,10 @@ fn reset_database(pg_dir: &Path, data_dir: &Path, db_name: &str) -> CleanResult<
             .stdin
             .as_mut()
             .ok_or("postgres --single stdin not piped")?;
-        let quoted = quote_ident(db_name);
-        writeln!(stdin, "DROP DATABASE IF EXISTS {quoted};")
-            .map_err(|e| format!("writing DROP to postgres stdin: {e}"))?;
-        writeln!(stdin, "CREATE DATABASE {quoted};")
-            .map_err(|e| format!("writing CREATE to postgres stdin: {e}"))?;
+        for stmt in statements {
+            writeln!(stdin, "{stmt}")
+                .map_err(|e| format!("writing to postgres stdin: {e}"))?;
+        }
     }
     drop(child.stdin.take());
 

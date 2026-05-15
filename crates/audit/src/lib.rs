@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use identity::UserId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -68,6 +68,13 @@ struct Canonical<'a> {
 
 /// `sha256(prev_hash || canonical_bytes)`. Pure function - tested
 /// without a DB.
+/// Drop the sub-microsecond fraction of `ts` so the value matches what
+/// Postgres will round-trip back to us. See the call site in [`append`].
+fn truncate_to_micros(ts: DateTime<Utc>) -> DateTime<Utc> {
+    let micros = ts.nanosecond() / 1_000;
+    ts.with_nanosecond(micros * 1_000).unwrap_or(ts)
+}
+
 pub fn compute_hash(prev_hash: &[u8], canonical_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(prev_hash);
@@ -164,7 +171,12 @@ pub async fn append(
             .await?
             .unwrap_or_else(|| genesis_hash().to_vec());
 
-    let occurred_at = Utc::now();
+    // Postgres `timestamptz` has microsecond precision; chrono's `Utc::now()`
+    // captures nanoseconds. We hash over what we store, so truncate the
+    // sub-microsecond bits here — otherwise a verifier reading the row back
+    // and re-canonicalising it would compute a different hash than the one
+    // committed alongside it.
+    let occurred_at = truncate_to_micros(Utc::now());
     let actor_user_id = actor.map(|a| a.user_id.0);
     let actor_display_name = actor.map(|a| a.display_name.clone());
     let app_id_owned = app_id.map(str::to_string);
@@ -219,6 +231,19 @@ mod tests {
         h.update(b"hearth-audit-genesis");
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(genesis_hash(), expected);
+    }
+
+    #[test]
+    fn truncate_to_micros_drops_sub_microsecond_bits() {
+        let with_nanos = DateTime::<Utc>::from_timestamp_micros(1_700_000_000_123_456)
+            .unwrap()
+            .with_nanosecond(123_456_789)
+            .unwrap();
+        let truncated = super::truncate_to_micros(with_nanos);
+        assert_eq!(truncated.nanosecond() % 1_000, 0);
+        assert_eq!(truncated.nanosecond(), 123_456_000);
+        // Idempotent.
+        assert_eq!(super::truncate_to_micros(truncated), truncated);
     }
 
     #[test]

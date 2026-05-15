@@ -39,5 +39,12 @@ authz = { path = "../authz" }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+[dev-dependencies]
+uuid = { workspace = true, features = ["v4"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
 [lints]
 workspace = true

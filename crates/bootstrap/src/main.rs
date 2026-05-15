@@ -342,8 +342,8 @@ fn configure_postgres(data_dir: &Path) -> SetupResult<()> {
          port = {DEFAULT_PORT}\n\
          listen_addresses = '127.0.0.1'\n\
          unix_socket_directories = ''\n\
-         max_connections = 50\n\
-         shared_buffers = 64MB\n\
+         max_connections = 400\n\
+         shared_buffers = 128MB\n\
          dynamic_shared_memory_type = windows\n\
          log_destination = 'stderr'\n\
          logging_collector = off\n\
