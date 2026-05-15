@@ -234,6 +234,19 @@ mod tests {
     }
 
     #[test]
+    fn truncate_to_micros_drops_sub_microsecond_bits() {
+        let with_nanos = DateTime::<Utc>::from_timestamp_micros(1_700_000_000_123_456)
+            .unwrap()
+            .with_nanosecond(123_456_789)
+            .unwrap();
+        let truncated = super::truncate_to_micros(with_nanos);
+        assert_eq!(truncated.nanosecond() % 1_000, 0);
+        assert_eq!(truncated.nanosecond(), 123_456_000);
+        // Idempotent.
+        assert_eq!(super::truncate_to_micros(truncated), truncated);
+    }
+
+    #[test]
     fn compute_hash_matches_manual_sha256() {
         let prev = [0u8; 32];
         let bytes = b"some canonical bytes";

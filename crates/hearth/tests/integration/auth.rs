@@ -125,27 +125,18 @@ async fn me_with_garbage_token_is_unauthorized() {
 }
 
 #[tokio::test]
-async fn me_with_malformed_header_is_unauthorized() {
-    let app = TestApp::new().await;
-    // No "Bearer " prefix.
-    let resp = app
-        .request(
-            axum::http::Method::GET,
-            "/me",
-            None,
-            None,
-        )
-        .await;
-    let _ = resp; // baseline: missing header
-    // Now exercise a malformed header explicitly.
+async fn me_with_non_bearer_scheme_is_unauthorized() {
     use axum::http::header::AUTHORIZATION;
+    let app = TestApp::new().await;
     let req = axum::http::Request::builder()
         .method(axum::http::Method::GET)
         .uri("/me")
         .header(AUTHORIZATION, "Basic abc123")
         .body(axum::body::Body::empty())
         .unwrap();
-    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req)
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -162,8 +153,6 @@ async fn logout_revokes_the_session() {
     me.assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("invalid_session");
 }
-
-// ---- /auth/accept-invite ----
 
 async fn seed_pending_invite(
     pool: &PgPool,
