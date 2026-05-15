@@ -18,6 +18,9 @@ pub struct HealthResponse {
     /// `None` when the DB is unreachable; otherwise the count of active
     /// (non-revoked, non-expired) rows in `auth.sessions`.
     pub active_sessions_count: Option<i64>,
+    /// `None` when the DB is unreachable; otherwise the count of pending
+    /// invitations (not accepted, not revoked, not expired).
+    pub pending_invitations_count: Option<i64>,
 }
 
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -26,15 +29,17 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
         .await
         .is_ok();
 
-    let (users_count, audit_events_count, active_sessions_count) = if db_ok {
-        (
-            state.users.count().await.ok(),
-            audit::count(&state.db).await.ok(),
-            state.sessions.count_active().await.ok(),
-        )
-    } else {
-        (None, None, None)
-    };
+    let (users_count, audit_events_count, active_sessions_count, pending_invitations_count) =
+        if db_ok {
+            (
+                state.users.count().await.ok(),
+                audit::count(&state.db).await.ok(),
+                state.sessions.count_active().await.ok(),
+                state.invitations.count_pending().await.ok(),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     let body = HealthResponse {
         status: if db_ok { "ok" } else { "degraded" },
@@ -44,6 +49,7 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
         users_count,
         audit_events_count,
         active_sessions_count,
+        pending_invitations_count,
     };
 
     let code = if db_ok {

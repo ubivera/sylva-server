@@ -31,13 +31,13 @@ pub struct ErrorResponse {
     pub error: &'static str,
 }
 
-/// `POST /auth/login` — exchange `{email, password}` for a session token.
+/// `POST /auth/login` - exchange `{email, password}` for a session token.
 ///
 /// On success: 200 + `{token, expires_at, user_id}`. The token is bearer
 /// material; the client should treat it as a credential.
 ///
 /// On failure (unknown email or wrong password): 401 + a generic error.
-/// We deliberately don't tell the client which failure mode hit — the
+/// We deliberately don't tell the client which failure mode hit - the
 /// distinction is recorded in the audit log only.
 pub async fn login(
     State(state): State<AppState>,
@@ -253,7 +253,7 @@ fn internal_error() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-/// `POST /auth/logout` — revoke the session token in the Authorization
+/// `POST /auth/logout` - revoke the session token in the Authorization
 /// header. Idempotent.
 pub async fn logout(
     State(state): State<AppState>,
@@ -295,7 +295,7 @@ pub struct MeResponse {
     pub instance_role: InstanceRole,
 }
 
-/// `GET /me` — return the current authenticated user.
+/// `GET /me` - return the current authenticated user.
 pub async fn me(user: AuthenticatedUser) -> impl IntoResponse {
     let AuthenticatedUser { user, .. } = user;
     (
@@ -307,4 +307,138 @@ pub async fn me(user: AuthenticatedUser) -> impl IntoResponse {
             instance_role: user.instance_role,
         }),
     )
+}
+
+#[derive(Deserialize)]
+pub struct AcceptInviteRequest {
+    pub token: String,
+    pub display_name: String,
+    pub password: String,
+}
+
+/// `POST /auth/accept-invite` - public endpoint. Given a valid one-time
+/// invitation token plus a display name and password, creates the user,
+/// stores their password hash, marks the invitation accepted, and issues
+/// a session in a single transaction. Returns the same shape as `/auth/login`
+/// so the client can drop the response straight into its auth state.
+pub async fn accept_invite(
+    State(state): State<AppState>,
+    Json(req): Json<AcceptInviteRequest>,
+) -> impl IntoResponse {
+    if req.display_name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "display_name_required",
+            }),
+        )
+            .into_response();
+    }
+    if req.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "password_required",
+            }),
+        )
+            .into_response();
+    }
+
+    let invitation = match state.invitations.find_active(&req.token).await {
+        Ok(Some(inv)) => inv,
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid_or_expired_token",
+                }),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(?err, "looking up invitation");
+            return internal_error().into_response();
+        }
+    };
+
+    let password_hash = match auth::hash_password(&req.password) {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::error!(?err, "hashing password");
+            return internal_error().into_response();
+        }
+    };
+
+    let result: anyhow::Result<LoginResponse> = async {
+        let mut tx = state.db.begin().await?;
+
+        // Create the user with the role embedded in the invitation.
+        let new_user_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO identity.users (email, display_name, lifecycle, instance_role)
+             VALUES ($1, $2, 'active', $3)
+             RETURNING id",
+        )
+        .bind(&invitation.email)
+        .bind(req.display_name.trim())
+        .bind(invitation.instance_role)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO auth.credentials (user_id, password_hash) VALUES ($1, $2)",
+        )
+        .bind(new_user_id)
+        .bind(&password_hash)
+        .execute(&mut *tx)
+        .await?;
+
+        identity::InvitationRepository::mark_accepted(
+            &mut tx,
+            invitation.id,
+            UserId::new(new_user_id),
+        )
+        .await?;
+
+        let (session, raw_token) = SessionRepository::create(
+            &mut tx,
+            UserId::new(new_user_id),
+            auth::DEFAULT_SESSION_TTL,
+        )
+        .await?;
+
+        let actor = Actor {
+            user_id: UserId::new(new_user_id),
+            display_name: req.display_name.trim().to_string(),
+        };
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "invite_accepted",
+            serde_json::json!({
+                "invitation_id": invitation.id.0,
+                "email": invitation.email,
+                "instance_role": invitation.instance_role,
+                "session_id": session.id,
+            }),
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(LoginResponse {
+            token: raw_token,
+            expires_at: session.expires_at,
+            user_id: new_user_id,
+        })
+    }
+    .await;
+
+    match result {
+        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
+        Err(err) => {
+            tracing::error!(?err, "accepting invitation");
+            internal_error().into_response()
+        }
+    }
 }

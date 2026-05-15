@@ -1,5 +1,7 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
@@ -134,6 +136,266 @@ impl UserRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(users)
+    }
+
+    /// Partial profile update within the caller's transaction. Each `Some`
+    /// field is written; `None` leaves the existing value alone (treated
+    /// as "no change", not "set to NULL"). Returns the post-update row.
+    /// `updated_at` is bumped to now.
+    pub async fn update_profile(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+        display_name: Option<&str>,
+        locale: Option<&str>,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET display_name = COALESCE($2, display_name),
+                 locale       = COALESCE($3, locale),
+                 updated_at   = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(display_name)
+        .bind(locale)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
+    }
+
+    /// True when at least one non-soft/hard-deleted user already has
+    /// `email_lower = lower(email)`. Cheaper than fetching the full row
+    /// for an existence check.
+    pub async fn email_in_use(&self, email: &str) -> Result<bool> {
+        let exists: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM identity.users \
+             WHERE email_lower = lower($1) \
+               AND lifecycle <> 'hard_deleted' \
+             LIMIT 1",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(exists.is_some())
+    }
+}
+
+/// Strongly-typed invitation identifier.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize,
+)]
+#[sqlx(transparent)]
+pub struct InvitationId(pub Uuid);
+
+impl InvitationId {
+    pub fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+    pub fn into_inner(self) -> Uuid {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct Invitation {
+    pub id: InvitationId,
+    pub email: String,
+    pub invited_by_user_id: UserId,
+    pub instance_role: InstanceRole,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub accepted_user_id: Option<UserId>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Default time an invitation stays valid. Design spec calls for 7 days
+/// (configurable); we hardcode for now.
+pub const DEFAULT_INVITATION_TTL: Duration = Duration::days(7);
+
+/// Generate a 32-byte random invitation token (64-char hex). Mirrors the
+/// session-token approach in the auth crate; sha256(token) is what's
+/// stored server-side.
+pub fn generate_invite_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// SHA-256 of an invitation token - what goes into `token_hash`.
+pub fn hash_invite_token(token: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.finalize().into()
+}
+
+#[derive(Clone)]
+pub struct InvitationRepository {
+    pool: PgPool,
+}
+
+impl InvitationRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Create a new invitation within the caller's transaction. Returns
+    /// `(invitation_row, raw_token)`. The raw token is what to embed in
+    /// the acceptance URL; only its SHA-256 hash goes into the DB.
+    pub async fn create(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invited_by: UserId,
+        email: &str,
+        instance_role: InstanceRole,
+        ttl: Duration,
+    ) -> Result<(Invitation, String)> {
+        let token = generate_invite_token();
+        let token_hash = hash_invite_token(&token);
+        let expires_at = Utc::now() + ttl;
+
+        let invitation: Invitation = sqlx::query_as(
+            "INSERT INTO identity.invitations
+                 (email, token_hash, invited_by_user_id, instance_role, expires_at)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, email, invited_by_user_id, instance_role,
+                       created_at, expires_at, accepted_at, accepted_user_id, revoked_at",
+        )
+        .bind(email)
+        .bind(&token_hash[..])
+        .bind(invited_by)
+        .bind(instance_role)
+        .bind(expires_at)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        Ok((invitation, token))
+    }
+
+    /// Look up an invitation by raw token. Returns `Ok(None)` if no
+    /// matching invitation exists, the invitation is revoked, expired,
+    /// or already accepted.
+    pub async fn find_active(&self, token: &str) -> Result<Option<Invitation>> {
+        let token_hash = hash_invite_token(token);
+        let invitation: Option<Invitation> = sqlx::query_as(
+            "SELECT id, email, invited_by_user_id, instance_role,
+                    created_at, expires_at, accepted_at, accepted_user_id, revoked_at
+             FROM identity.invitations
+             WHERE token_hash = $1
+               AND accepted_at IS NULL
+               AND revoked_at IS NULL
+               AND expires_at > now()",
+        )
+        .bind(&token_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(invitation)
+    }
+
+    /// True when an active invitation (non-accepted, non-revoked,
+    /// non-expired) exists for the given email (case-insensitive).
+    pub async fn email_has_active_invite(&self, email: &str) -> Result<bool> {
+        let exists: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM identity.invitations
+             WHERE email_lower = lower($1)
+               AND accepted_at IS NULL
+               AND revoked_at IS NULL
+               AND expires_at > now()
+             LIMIT 1",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(exists.is_some())
+    }
+
+    /// Mark an invitation accepted within the caller's transaction. Sets
+    /// `accepted_at` to now and links to the newly-created user.
+    pub async fn mark_accepted(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invitation_id: InvitationId,
+        accepted_user: UserId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE identity.invitations
+             SET accepted_at = now(), accepted_user_id = $2
+             WHERE id = $1",
+        )
+        .bind(invitation_id)
+        .bind(accepted_user)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Count pending invitations (non-accepted, non-revoked, non-expired).
+    /// Used by `/health`.
+    pub async fn count_pending(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM identity.invitations
+             WHERE accepted_at IS NULL
+               AND revoked_at IS NULL
+               AND expires_at > now()",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// List pending invitations (non-accepted, non-revoked, non-expired),
+    /// newest first. Intended for `GET /admin/invites`.
+    pub async fn list_pending(&self) -> Result<Vec<Invitation>> {
+        let invitations: Vec<Invitation> = sqlx::query_as(
+            "SELECT id, email, invited_by_user_id, instance_role,
+                    created_at, expires_at, accepted_at, accepted_user_id, revoked_at
+             FROM identity.invitations
+             WHERE accepted_at IS NULL
+               AND revoked_at IS NULL
+               AND expires_at > now()
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(invitations)
+    }
+
+    /// Look up an invitation by id (regardless of status). Returns the
+    /// row in any state so callers can produce specific error messages.
+    pub async fn find_by_id(&self, id: InvitationId) -> Result<Option<Invitation>> {
+        let invitation: Option<Invitation> = sqlx::query_as(
+            "SELECT id, email, invited_by_user_id, instance_role,
+                    created_at, expires_at, accepted_at, accepted_user_id, revoked_at
+             FROM identity.invitations
+             WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(invitation)
+    }
+
+    /// Mark an invitation revoked within the caller's transaction.
+    /// Idempotent — already-revoked invitations stay revoked.
+    pub async fn revoke(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invitation_id: InvitationId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE identity.invitations
+             SET revoked_at = COALESCE(revoked_at, now())
+             WHERE id = $1",
+        )
+        .bind(invitation_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 }
 

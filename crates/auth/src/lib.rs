@@ -162,6 +162,26 @@ pub async fn verify_credentials(
     }
 }
 
+/// Update a user's password hash within the caller's transaction. Bumps
+/// `updated_at`. The caller is responsible for verifying the *current*
+/// password first; this function trusts the new hash.
+pub async fn update_password_hash(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+    new_phc: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE auth.credentials
+         SET password_hash = $2, updated_at = now()
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .bind(new_phc)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Session lifetime for this checkpoint. The design spec eventually wants
 /// a 15-minute access token + 90-day sliding refresh token; we use a flat
 /// 24-hour session for now and refactor when refresh tokens land.
@@ -250,6 +270,30 @@ impl SessionRepository {
         Ok(())
     }
 
+    /// Revoke every active session for `user_id` except the given one.
+    /// Returns the number of rows revoked (sessions that were already
+    /// revoked or expired are not counted). Used by the password-change
+    /// flow to invalidate stolen tokens elsewhere.
+    pub async fn revoke_all_for_user_except(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: UserId,
+        keep_session_id: Uuid,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE auth.sessions
+             SET revoked_at = now()
+             WHERE user_id = $1
+               AND id <> $2
+               AND revoked_at IS NULL
+               AND expires_at > now()",
+        )
+        .bind(user_id)
+        .bind(keep_session_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Count active (non-revoked, non-expired) sessions. Used by /health.
     pub async fn count_active(&self) -> Result<i64> {
         let (count,): (i64,) = sqlx::query_as(
@@ -259,6 +303,51 @@ impl SessionRepository {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    /// List a user's sessions (active and historical), newest first.
+    /// Includes revoked + expired so `/account/sessions` can show "this
+    /// session was revoked" entries; the caller filters as needed.
+    pub async fn list_for_user(&self, user_id: UserId) -> Result<Vec<Session>> {
+        let sessions: Vec<Session> = sqlx::query_as(
+            "SELECT id, user_id, created_at, expires_at, revoked_at
+             FROM auth.sessions
+             WHERE user_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
+    /// List every active session across all users, newest first.
+    /// Intended for `/admin/sessions`.
+    pub async fn list_all_active(&self) -> Result<Vec<Session>> {
+        let sessions: Vec<Session> = sqlx::query_as(
+            "SELECT id, user_id, created_at, expires_at, revoked_at
+             FROM auth.sessions
+             WHERE revoked_at IS NULL AND expires_at > now()
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(sessions)
+    }
+
+    /// Look up a single session row by id (no token-hash check). Returns
+    /// the session regardless of revoked/expired state so callers can
+    /// produce specific error messages.
+    pub async fn find_by_id(&self, session_id: Uuid) -> Result<Option<Session>> {
+        let session: Option<Session> = sqlx::query_as(
+            "SELECT id, user_id, created_at, expires_at, revoked_at
+             FROM auth.sessions
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(session)
     }
 }
 

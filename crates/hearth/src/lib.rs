@@ -1,3 +1,4 @@
+pub mod account_routes;
 pub mod admin_routes;
 pub mod app;
 pub mod auth_routes;
@@ -9,6 +10,7 @@ pub mod job_object;
 pub mod postgres;
 pub mod shutdown;
 pub mod telemetry;
+pub mod views;
 
 use anyhow::Context;
 
@@ -72,7 +74,8 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
 
     let users = identity::UserRepository::new(pool.clone());
     let sessions = auth::SessionRepository::new(pool.clone());
-    let router = app::router(started_at, pool.clone(), users, sessions);
+    let invitations = identity::InvitationRepository::new(pool.clone());
+    let router = app::router(started_at, pool.clone(), users, sessions, invitations);
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await

@@ -83,6 +83,53 @@ pub async fn count(pool: &PgPool) -> Result<i64> {
     Ok(count)
 }
 
+/// Filter / pagination knobs for `list`. All fields are optional.
+/// `limit` is clamped by `list` to [1, MAX_PAGE_SIZE].
+#[derive(Debug, Clone, Default)]
+pub struct ListFilter {
+    /// Only events whose actor matches this user_id. `None` = no actor filter.
+    pub actor: Option<Uuid>,
+    /// Only events with `occurred_at > since`. `None` = no time filter.
+    pub since: Option<DateTime<Utc>>,
+    /// Cursor: only events with `seqno < before_seqno`. `None` = start from
+    /// the newest event. Returned as `next_cursor` for the following page.
+    pub before_seqno: Option<i64>,
+    /// Max rows. Defaults to `DEFAULT_PAGE_SIZE` if `None`, clamped to
+    /// `MAX_PAGE_SIZE`.
+    pub limit: Option<u32>,
+}
+
+pub const DEFAULT_PAGE_SIZE: u32 = 50;
+pub const MAX_PAGE_SIZE: u32 = 200;
+
+/// Paginated list of audit events, newest first. Use the returned slice's
+/// last item's `seqno` as `before_seqno` on the next call to walk further
+/// back.
+pub async fn list(pool: &PgPool, filter: &ListFilter) -> Result<Vec<AuditEvent>> {
+    let limit = filter
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+
+    let events: Vec<AuditEvent> = sqlx::query_as(
+        "SELECT seqno, occurred_at, actor_user_id, actor_display_name, app_id,
+                event_type, event_data, prev_hash, hash
+         FROM audit.events
+         WHERE ($1::uuid IS NULL OR actor_user_id = $1)
+           AND ($2::timestamptz IS NULL OR occurred_at > $2)
+           AND ($3::bigint IS NULL OR seqno < $3)
+         ORDER BY seqno DESC
+         LIMIT $4",
+    )
+    .bind(filter.actor)
+    .bind(filter.since)
+    .bind(filter.before_seqno)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+    Ok(events)
+}
+
 /// Append a new event to the chain within the caller's transaction.
 ///
 /// The caller controls the transaction lifecycle - this lets the audit
