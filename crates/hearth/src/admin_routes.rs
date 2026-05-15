@@ -8,7 +8,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use identity::{
-    DEFAULT_INVITATION_TTL, InstanceRole, InvitationRepository, UserLifecycle,
+    DEFAULT_INVITATION_TTL, InstanceRole, InvitationId, InvitationRepository, UserLifecycle,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -293,6 +293,99 @@ fn next_audit_cursor(events: &[audit::AuditEvent], requested_limit: Option<u32>)
         None
     } else {
         events.last().map(|e| e.seqno)
+    }
+}
+
+#[derive(Serialize)]
+pub struct InvitationView {
+    pub id: Uuid,
+    pub email: String,
+    pub invited_by_user_id: Uuid,
+    pub instance_role: InstanceRole,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// `GET /admin/invites` — pending invitations (not accepted, not revoked,
+/// not expired), newest first.
+pub async fn list_invites(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> impl IntoResponse {
+    match state.invitations.list_pending().await {
+        Ok(invites) => {
+            let views: Vec<InvitationView> = invites
+                .into_iter()
+                .map(|i| InvitationView {
+                    id: i.id.0,
+                    email: i.email,
+                    invited_by_user_id: i.invited_by_user_id.0,
+                    instance_role: i.instance_role,
+                    created_at: i.created_at,
+                    expires_at: i.expires_at,
+                })
+                .collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(?e, "listing pending invites");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/invites/{id}/revoke` — revoke a pending invitation.
+/// Already-revoked or already-accepted invitations return 404 to avoid
+/// leaking which IDs ever existed.
+pub async fn revoke_invite(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let invitation_id = InvitationId::new(id);
+    let invitation = match state.invitations.find_by_id(invitation_id).await {
+        Ok(Some(inv)) => inv,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "invite_not_found").into_response(),
+        Err(e) => {
+            tracing::error!(?e, "lookup invitation");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+
+    if invitation.accepted_at.is_some() {
+        return err(StatusCode::CONFLICT, "invite_already_accepted").into_response();
+    }
+    if invitation.revoked_at.is_some() {
+        return err(StatusCode::NOT_FOUND, "invite_not_found").into_response();
+    }
+
+    let actor = admin.actor();
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        InvitationRepository::revoke(&mut tx, invitation_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "invite_revoked",
+            serde_json::json!({
+                "invitation_id": id,
+                "invited_email": invitation.email,
+                "instance_role": invitation.instance_role,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(?e, "revoking invitation");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
     }
 }
 

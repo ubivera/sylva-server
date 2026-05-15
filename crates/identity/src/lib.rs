@@ -138,6 +138,33 @@ impl UserRepository {
         Ok(users)
     }
 
+    /// Partial profile update within the caller's transaction. Each `Some`
+    /// field is written; `None` leaves the existing value alone (treated
+    /// as "no change", not "set to NULL"). Returns the post-update row.
+    /// `updated_at` is bumped to now.
+    pub async fn update_profile(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+        display_name: Option<&str>,
+        locale: Option<&str>,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET display_name = COALESCE($2, display_name),
+                 locale       = COALESCE($3, locale),
+                 updated_at   = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(display_name)
+        .bind(locale)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
+    }
+
     /// True when at least one non-soft/hard-deleted user already has
     /// `email_lower = lower(email)`. Cheaper than fetching the full row
     /// for an existence check.
@@ -320,6 +347,55 @@ impl InvitationRepository {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    /// List pending invitations (non-accepted, non-revoked, non-expired),
+    /// newest first. Intended for `GET /admin/invites`.
+    pub async fn list_pending(&self) -> Result<Vec<Invitation>> {
+        let invitations: Vec<Invitation> = sqlx::query_as(
+            "SELECT id, email, invited_by_user_id, instance_role,
+                    created_at, expires_at, accepted_at, accepted_user_id, revoked_at
+             FROM identity.invitations
+             WHERE accepted_at IS NULL
+               AND revoked_at IS NULL
+               AND expires_at > now()
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(invitations)
+    }
+
+    /// Look up an invitation by id (regardless of status). Returns the
+    /// row in any state so callers can produce specific error messages.
+    pub async fn find_by_id(&self, id: InvitationId) -> Result<Option<Invitation>> {
+        let invitation: Option<Invitation> = sqlx::query_as(
+            "SELECT id, email, invited_by_user_id, instance_role,
+                    created_at, expires_at, accepted_at, accepted_user_id, revoked_at
+             FROM identity.invitations
+             WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(invitation)
+    }
+
+    /// Mark an invitation revoked within the caller's transaction.
+    /// Idempotent — already-revoked invitations stay revoked.
+    pub async fn revoke(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invitation_id: InvitationId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE identity.invitations
+             SET revoked_at = COALESCE(revoked_at, now())
+             WHERE id = $1",
+        )
+        .bind(invitation_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 }
 

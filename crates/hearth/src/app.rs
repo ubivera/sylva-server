@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use auth::SessionRepository;
-use axum::{Router, routing::{get, post}};
+use axum::{Router, routing::{get, patch, post}};
 use identity::{InvitationRepository, UserRepository};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
@@ -41,13 +41,22 @@ pub fn router(
         .route("/auth/accept-invite", post(auth_routes::accept_invite))
         .route("/me", get(auth_routes::me))
         .route("/account/activity", get(account_routes::activity))
+        .route("/account/password", post(account_routes::change_password))
+        .route("/account/profile", patch(account_routes::update_profile))
         .route("/account/sessions", get(account_routes::list_sessions))
         .route(
             "/account/sessions/{id}/revoke",
             post(account_routes::revoke_session),
         )
         .route("/admin/users", get(admin_routes::list_users))
-        .route("/admin/invites", post(admin_routes::create_invite))
+        .route(
+            "/admin/invites",
+            get(admin_routes::list_invites).post(admin_routes::create_invite),
+        )
+        .route(
+            "/admin/invites/{id}/revoke",
+            post(admin_routes::revoke_invite),
+        )
         .route("/admin/audit", get(admin_routes::list_audit))
         .route("/admin/sessions", get(admin_routes::list_sessions))
         .route(
