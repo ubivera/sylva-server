@@ -11,3 +11,9 @@ cargo run --bin bootstrap
 cargo run --bin hearth
 cargo run --bin clean
 ```
+
+```bash
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace --lib
+cargo test --test integration
+```
