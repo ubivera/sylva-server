@@ -55,7 +55,7 @@ async fn owner_demoting_peer_owner_creates_pending_row() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -86,7 +86,7 @@ async fn owner_demoting_peer_owner_creates_pending_row() {
 async fn pending_transition_appears_in_list() {
     let (app, _a_id, a_tok, b_id, b_tok) = app_with_two_owners().await;
     app.post(
-        &format!("/admin/users/{b_id}/role"),
+        &format!("/api/admin/users/{b_id}/role"),
         Some(&a_tok),
         Some(json!({ "role": "admin" })),
     )
@@ -94,7 +94,7 @@ async fn pending_transition_appears_in_list() {
     .assert_status(StatusCode::ACCEPTED);
 
     let rows: Vec<PendingTransitionView> = app
-        .get("/admin/pending-transitions", Some(&b_tok))
+        .get("/api/admin/pending-transitions", Some(&b_tok))
         .await
         .json();
     assert_eq!(rows.len(), 1);
@@ -106,7 +106,7 @@ async fn target_owner_can_veto_their_own_pending_demotion() {
     let (app, _a_id, a_tok, b_id, b_tok) = app_with_two_owners().await;
     let pending: PendingTransitionView = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -115,7 +115,7 @@ async fn target_owner_can_veto_their_own_pending_demotion() {
 
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/veto", pending.id),
+            &format!("/api/admin/pending-transitions/{}/veto", pending.id),
             Some(&b_tok),
             None,
         )
@@ -159,7 +159,7 @@ async fn third_party_owner_can_veto_on_behalf_of_target() {
 
     let pending: PendingTransitionView = app
         .post(
-            &format!("/admin/users/{}/role", b.id.0),
+            &format!("/api/admin/users/{}/role", b.id.0),
             Some(&a_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -169,7 +169,7 @@ async fn third_party_owner_can_veto_on_behalf_of_target() {
     // C (third party Owner) vetoes B's demotion.
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/veto", pending.id),
+            &format!("/api/admin/pending-transitions/{}/veto", pending.id),
             Some(&c_tok),
             None,
         )
@@ -185,7 +185,7 @@ async fn initiator_can_cancel_their_own_pending() {
     let (app, a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     let pending: PendingTransitionView = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -194,7 +194,7 @@ async fn initiator_can_cancel_their_own_pending() {
 
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/cancel", pending.id),
+            &format!("/api/admin/pending-transitions/{}/cancel", pending.id),
             Some(&a_tok),
             None,
         )
@@ -210,7 +210,7 @@ async fn veto_after_resolution_returns_409() {
     let (app, _a_id, a_tok, b_id, b_tok) = app_with_two_owners().await;
     let pending: PendingTransitionView = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -218,7 +218,7 @@ async fn veto_after_resolution_returns_409() {
         .json();
 
     app.post(
-        &format!("/admin/pending-transitions/{}/veto", pending.id),
+        &format!("/api/admin/pending-transitions/{}/veto", pending.id),
         Some(&b_tok),
         None,
     )
@@ -228,7 +228,7 @@ async fn veto_after_resolution_returns_409() {
     // Second veto returns 409.
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/veto", pending.id),
+            &format!("/api/admin/pending-transitions/{}/veto", pending.id),
             Some(&b_tok),
             None,
         )
@@ -241,7 +241,7 @@ async fn veto_after_resolution_returns_409() {
 async fn worker_applies_due_transitions() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     app.post(
-        &format!("/admin/users/{b_id}/role"),
+        &format!("/api/admin/users/{b_id}/role"),
         Some(&a_tok),
         Some(json!({ "role": "admin" })),
     )
@@ -274,7 +274,7 @@ async fn worker_applies_due_transitions() {
 async fn worker_does_not_apply_future_transitions() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     app.post(
-        &format!("/admin/users/{b_id}/role"),
+        &format!("/api/admin/users/{b_id}/role"),
         Some(&a_tok),
         Some(json!({ "role": "admin" })),
     )
@@ -301,7 +301,7 @@ async fn second_pending_against_same_target_is_blocked() {
     let c_tok = app.login(&c.email, "cpw").await;
 
     app.post(
-        &format!("/admin/users/{}/role", b.id.0),
+        &format!("/api/admin/users/{}/role", b.id.0),
         Some(&a_tok),
         Some(json!({ "role": "admin" })),
     )
@@ -311,7 +311,7 @@ async fn second_pending_against_same_target_is_blocked() {
     // C tries to also demote B → 409.
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", b.id.0),
+            &format!("/api/admin/users/{}/role", b.id.0),
             Some(&c_tok),
             Some(json!({ "role": "user" })),
         )
@@ -339,7 +339,7 @@ async fn admin_cannot_veto_or_cancel() {
 
     let pending: PendingTransitionView = app
         .post(
-            &format!("/admin/users/{}/role", other_owner.id.0),
+            &format!("/api/admin/users/{}/role", other_owner.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -348,7 +348,7 @@ async fn admin_cannot_veto_or_cancel() {
 
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/veto", pending.id),
+            &format!("/api/admin/pending-transitions/{}/veto", pending.id),
             Some(&admin_tok),
             None,
         )
@@ -357,7 +357,7 @@ async fn admin_cannot_veto_or_cancel() {
 
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/cancel", pending.id),
+            &format!("/api/admin/pending-transitions/{}/cancel", pending.id),
             Some(&admin_tok),
             None,
         )
@@ -376,7 +376,7 @@ async fn rotate_with_correct_current_code_replaces_it() {
 
     let resp = app
         .post(
-            "/admin/server/recovery-code/rotate",
+            "/api/admin/server/recovery-code/rotate",
             Some(&a_tok),
             Some(json!({ "current_code": original })),
         )
@@ -417,7 +417,7 @@ async fn rotate_with_wrong_current_code_returns_401() {
 
     let resp = app
         .post(
-            "/admin/server/recovery-code/rotate",
+            "/api/admin/server/recovery-code/rotate",
             Some(&a_tok),
             Some(json!({ "current_code": "wrong".repeat(13) })),
         )
@@ -433,7 +433,7 @@ async fn bypass_with_valid_code_applies_immediately() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({
                 "role": "admin",
@@ -478,7 +478,7 @@ async fn bypass_with_wrong_code_returns_401() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({
                 "role": "admin",
@@ -506,7 +506,7 @@ async fn notifications_disabled_does_not_block_pending_flow() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/role"),
+            &format!("/api/admin/users/{b_id}/role"),
             Some(&a_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -543,7 +543,7 @@ async fn owner_on_owner_deactivate_goes_pending() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/deactivate"),
+            &format!("/api/admin/users/{b_id}/deactivate"),
             Some(&a_tok),
             None,
         )
@@ -567,7 +567,7 @@ async fn owner_on_owner_deactivate_goes_pending() {
 async fn owner_on_owner_delete_goes_pending() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     let resp = app
-        .post(&format!("/admin/users/{b_id}/delete"), Some(&a_tok), None)
+        .post(&format!("/api/admin/users/{b_id}/delete"), Some(&a_tok), None)
         .await;
     resp.assert_status(StatusCode::ACCEPTED);
     let body: PendingTransitionView = resp.json();
@@ -578,7 +578,7 @@ async fn owner_on_owner_delete_goes_pending() {
 async fn owner_on_owner_purge_goes_pending() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     let resp = app
-        .post(&format!("/admin/users/{b_id}/purge"), Some(&a_tok), None)
+        .post(&format!("/api/admin/users/{b_id}/purge"), Some(&a_tok), None)
         .await;
     resp.assert_status(StatusCode::ACCEPTED);
     let body: PendingTransitionView = resp.json();
@@ -592,7 +592,7 @@ async fn bypass_lifecycle_deactivate_applies_immediately() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/deactivate"),
+            &format!("/api/admin/users/{b_id}/deactivate"),
             Some(&a_tok),
             Some(json!({ "bypass_recovery_code": recovery })),
         )
@@ -633,7 +633,7 @@ async fn bypass_lifecycle_delete_applies_immediately_and_redacts() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/delete"),
+            &format!("/api/admin/users/{b_id}/delete"),
             Some(&a_tok),
             Some(json!({ "bypass_recovery_code": recovery })),
         )
@@ -658,7 +658,7 @@ async fn bypass_lifecycle_wrong_code_returns_401() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/deactivate"),
+            &format!("/api/admin/users/{b_id}/deactivate"),
             Some(&a_tok),
             Some(json!({ "bypass_recovery_code": "FEED-FACE-BEEF-DEAD-FEED-FACE-BEEF-DEAD" })),
         )
@@ -680,7 +680,7 @@ async fn target_can_veto_pending_deactivate() {
     let (app, _a_id, a_tok, b_id, b_tok) = app_with_two_owners().await;
     let pending: PendingTransitionView = app
         .post(
-            &format!("/admin/users/{b_id}/deactivate"),
+            &format!("/api/admin/users/{b_id}/deactivate"),
             Some(&a_tok),
             None,
         )
@@ -689,7 +689,7 @@ async fn target_can_veto_pending_deactivate() {
 
     let resp = app
         .post(
-            &format!("/admin/pending-transitions/{}/veto", pending.id),
+            &format!("/api/admin/pending-transitions/{}/veto", pending.id),
             Some(&b_tok),
             None,
         )
@@ -722,7 +722,7 @@ async fn target_can_veto_pending_deactivate() {
 async fn worker_applies_due_lifecycle_deactivate() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     app.post(
-        &format!("/admin/users/{b_id}/deactivate"),
+        &format!("/api/admin/users/{b_id}/deactivate"),
         Some(&a_tok),
         None,
     )
@@ -749,7 +749,7 @@ async fn worker_applies_due_lifecycle_deactivate() {
 #[tokio::test]
 async fn worker_applies_due_lifecycle_delete_with_redaction() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
-    app.post(&format!("/admin/users/{b_id}/delete"), Some(&a_tok), None)
+    app.post(&format!("/api/admin/users/{b_id}/delete"), Some(&a_tok), None)
         .await
         .assert_status(StatusCode::ACCEPTED);
 
@@ -788,7 +788,7 @@ async fn owner_can_reactivate_peer_deactivated_owner() {
     // Bypass-deactivate B first so we have a deactivated Owner to act on.
     let recovery = app.seed_recovery_code().await;
     app.post(
-        &format!("/admin/users/{b_id}/deactivate"),
+        &format!("/api/admin/users/{b_id}/deactivate"),
         Some(&a_tok),
         Some(json!({ "bypass_recovery_code": recovery })),
     )
@@ -798,7 +798,7 @@ async fn owner_can_reactivate_peer_deactivated_owner() {
     // Owner A reactivates Owner B (no bypass, no pending — immediate).
     let resp = app
         .post(
-            &format!("/admin/users/{b_id}/reactivate"),
+            &format!("/api/admin/users/{b_id}/reactivate"),
             Some(&a_tok),
             None,
         )
@@ -830,13 +830,13 @@ async fn second_owner_on_owner_lifecycle_action_is_blocked() {
     let a_tok = app.login(&a.email, "apw").await;
     let c_tok = app.login(&c.email, "cpw").await;
 
-    app.post(&format!("/admin/users/{}/deactivate", b.id.0), Some(&a_tok), None)
+    app.post(&format!("/api/admin/users/{}/deactivate", b.id.0), Some(&a_tok), None)
         .await
         .assert_status(StatusCode::ACCEPTED);
 
     // C tries to delete the same target while A's deactivate is in flight.
     let resp = app
-        .post(&format!("/admin/users/{}/delete", b.id.0), Some(&c_tok), None)
+        .post(&format!("/api/admin/users/{}/delete", b.id.0), Some(&c_tok), None)
         .await;
     resp.assert_status(StatusCode::CONFLICT)
         .assert_error("pending_action_exists");

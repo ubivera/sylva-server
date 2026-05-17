@@ -20,3 +20,5 @@ mod auth;
 mod notifications;
 #[path = "integration/pending_transitions.rs"]
 mod pending_transitions;
+#[path = "integration/web.rs"]
+mod web;

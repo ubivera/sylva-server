@@ -14,15 +14,23 @@ pub mod views;
 
 use anyhow::Context;
 
-pub fn run() -> anyhow::Result<()> {
+/// Type of the UI-router builder passed in by the bin crate. Given the
+/// composed [`app::AppState`], returns an `axum::Router` to be merged
+/// alongside the JSON API at server boot.
+pub type UiRouterFn = fn(app::AppState) -> axum::Router;
+
+/// Entry point used by `hearth-server`'s `main`. The `ui_router` parameter
+/// lets the binary plug in the [`web`](https://docs.rs/web) crate's HTML
+/// router without `hearth` having a circular dependency on it.
+pub fn run(ui_router: UiRouterFn) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build Tokio runtime")?;
-    runtime.block_on(run_async())
+    runtime.block_on(run_async(ui_router))
 }
 
-async fn run_async() -> anyhow::Result<()> {
+async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
     telemetry::init(&config)?;
 
@@ -58,7 +66,7 @@ async fn run_async() -> anyhow::Result<()> {
     .await
     .context("starting bundled postgres")?;
 
-    let serve_result = serve(&config, started_at).await;
+    let serve_result = serve(&config, started_at, ui_router).await;
 
     if let Err(err) = postgres.stop().await {
         tracing::warn!(?err, "error stopping postgres");
@@ -67,7 +75,11 @@ async fn run_async() -> anyhow::Result<()> {
     serve_result
 }
 
-async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyhow::Result<()> {
+async fn serve(
+    config: &config::Config,
+    started_at: std::time::Instant,
+    ui_router: UiRouterFn,
+) -> anyhow::Result<()> {
     let pool = db::connect(&config.postgres_url).await?;
     db::run_migrations(&pool).await?;
     tracing::info!("migrations up to date");
@@ -94,14 +106,24 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
     );
     tracing::info!("pending-transition worker started");
 
-    let router = app::router(
+    let state = app::AppState {
         started_at,
-        pool.clone(),
+        db: pool.clone(),
         users,
         sessions,
         invitations,
-        config.public_base_url.clone(),
-    );
+        public_base_url: config.public_base_url.clone(),
+    };
+
+    let health = axum::Router::new()
+        .route("/health", axum::routing::get(health::handler))
+        .with_state(state.clone());
+
+    let router = axum::Router::new()
+        .nest("/api", app::api_router(state.clone()))
+        .merge(ui_router(state))
+        .merge(health)
+        .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await

@@ -1,0 +1,22 @@
+[package]
+name = "hearth-server"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sylva Hearth server binary: composes the API and web routers"
+
+[[bin]]
+name = "hearth"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+
+hearth = { path = "../hearth" }
+web = { path = "../web" }
+
+[lints]
+workspace = true

@@ -66,7 +66,7 @@ async fn chain_is_intact_after_a_busy_session() {
 
     let inv: serde_json::Value = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "alice@test.local" })),
         )
@@ -74,7 +74,7 @@ async fn chain_is_intact_after_a_busy_session() {
         .json();
     let alice_tok: String = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": inv["token"],
@@ -89,20 +89,20 @@ async fn chain_is_intact_after_a_busy_session() {
         .to_string();
 
     app.patch(
-        "/account/profile",
+        "/api/account/profile",
         Some(&alice_tok),
         Some(json!({ "display_name": "Alice Q" })),
     )
     .await;
     app.post(
-        "/account/password",
+        "/api/account/password",
         Some(&alice_tok),
         Some(json!({ "current_password": "alicepw", "new_password": "alicepw2" })),
     )
     .await;
     // Failed login → audits signin_failed_password.
     app.post(
-        "/auth/login",
+        "/api/auth/login",
         None,
         Some(json!({ "email": owner.email, "password": "wrong" })),
     )

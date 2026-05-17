@@ -83,11 +83,11 @@ async fn regular_user_blocked_from_admin_routes() {
     let tok = app.login(&u.email, "pw").await;
 
     for route in [
-        ("GET", "/admin/users"),
-        ("GET", "/admin/invites"),
-        ("POST", "/admin/invites"),
-        ("GET", "/admin/audit"),
-        ("GET", "/admin/sessions"),
+        ("GET", "/api/admin/users"),
+        ("GET", "/api/admin/invites"),
+        ("POST", "/api/admin/invites"),
+        ("GET", "/api/admin/audit"),
+        ("GET", "/api/admin/sessions"),
     ] {
         let resp = match route.0 {
             "GET" => app.get(route.1, Some(&tok)).await,
@@ -110,7 +110,7 @@ async fn regular_user_blocked_from_admin_routes() {
 #[tokio::test]
 async fn unauthenticated_admin_routes_return_401() {
     let app = TestApp::new().await;
-    let resp = app.get("/admin/users", None).await;
+    let resp = app.get("/api/admin/users", None).await;
     resp.assert_status(StatusCode::UNAUTHORIZED);
 }
 
@@ -147,7 +147,7 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
         .await
         .unwrap();
 
-    let resp = app.get("/admin/users", Some(&owner_tok)).await;
+    let resp = app.get("/api/admin/users", Some(&owner_tok)).await;
     resp.assert_status(StatusCode::OK);
     let users: Vec<AdminUserView> = resp.json();
     let emails: Vec<&str> = users.iter().map(|u| u.email.as_str()).collect();
@@ -172,7 +172,7 @@ async fn create_invite_emits_token_and_audit() {
     let (app, owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "alice@test.local" })),
         )
@@ -202,7 +202,7 @@ async fn create_invite_requires_email() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "   " })),
         )
@@ -216,7 +216,7 @@ async fn admin_cannot_invite_owner_role() {
     let (app, _owner, _owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&admin_tok),
             Some(json!({ "email": "x@test.local", "instance_role": "owner" })),
         )
@@ -230,7 +230,7 @@ async fn owner_can_invite_admin() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "newadmin@test.local", "instance_role": "admin" })),
         )
@@ -246,7 +246,7 @@ async fn create_invite_rejects_existing_email() {
     // Admin's email is already taken by an active user.
     let resp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": admin.email })),
         )
@@ -259,7 +259,7 @@ async fn create_invite_rejects_existing_email() {
 async fn create_invite_rejects_duplicate_active_invite() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "dup@test.local" })),
     )
@@ -268,7 +268,7 @@ async fn create_invite_rejects_duplicate_active_invite() {
 
     let dup = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "dup@test.local" })),
         )
@@ -285,7 +285,7 @@ async fn list_invites_returns_pending_only_newest_first() {
 
     let first: CreateInviteResp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "a@test.local" })),
         )
@@ -295,7 +295,7 @@ async fn list_invites_returns_pending_only_newest_first() {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let second: CreateInviteResp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "b@test.local" })),
         )
@@ -303,7 +303,7 @@ async fn list_invites_returns_pending_only_newest_first() {
         .json();
 
     let list: Vec<InvitationView> = app
-        .get("/admin/invites", Some(&owner_tok))
+        .get("/api/admin/invites", Some(&owner_tok))
         .await
         .json();
     assert_eq!(list.len(), 2);
@@ -319,7 +319,7 @@ async fn revoke_invite_drops_from_pending() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let inv: CreateInviteResp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "rev@test.local" })),
         )
@@ -328,7 +328,7 @@ async fn revoke_invite_drops_from_pending() {
 
     let revoke = app
         .post(
-            &format!("/admin/invites/{}/revoke", inv.invitation_id),
+            &format!("/api/admin/invites/{}/revoke", inv.invitation_id),
             Some(&owner_tok),
             None,
         )
@@ -336,7 +336,7 @@ async fn revoke_invite_drops_from_pending() {
     revoke.assert_status(StatusCode::NO_CONTENT);
 
     let list: Vec<InvitationView> = app
-        .get("/admin/invites", Some(&owner_tok))
+        .get("/api/admin/invites", Some(&owner_tok))
         .await
         .json();
     assert!(list.is_empty());
@@ -347,7 +347,7 @@ async fn revoke_invite_idempotent_second_call_404() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let inv: CreateInviteResp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "id@test.local" })),
         )
@@ -355,7 +355,7 @@ async fn revoke_invite_idempotent_second_call_404() {
         .json();
 
     app.post(
-        &format!("/admin/invites/{}/revoke", inv.invitation_id),
+        &format!("/api/admin/invites/{}/revoke", inv.invitation_id),
         Some(&owner_tok),
         None,
     )
@@ -364,7 +364,7 @@ async fn revoke_invite_idempotent_second_call_404() {
 
     let second = app
         .post(
-            &format!("/admin/invites/{}/revoke", inv.invitation_id),
+            &format!("/api/admin/invites/{}/revoke", inv.invitation_id),
             Some(&owner_tok),
             None,
         )
@@ -380,7 +380,7 @@ async fn revoke_unknown_invite_returns_404() {
     let bogus = Uuid::new_v4();
     let resp = app
         .post(
-            &format!("/admin/invites/{bogus}/revoke"),
+            &format!("/api/admin/invites/{bogus}/revoke"),
             Some(&owner_tok),
             None,
         )
@@ -394,7 +394,7 @@ async fn revoke_accepted_invite_returns_409() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let inv: CreateInviteResp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "acc@test.local" })),
         )
@@ -403,7 +403,7 @@ async fn revoke_accepted_invite_returns_409() {
 
     // Accept the invite.
     app.post(
-        "/auth/accept-invite",
+        "/api/auth/accept-invite",
         None,
         Some(json!({
             "token": inv.token,
@@ -416,7 +416,7 @@ async fn revoke_accepted_invite_returns_409() {
 
     let resp = app
         .post(
-            &format!("/admin/invites/{}/revoke", inv.invitation_id),
+            &format!("/api/admin/invites/{}/revoke", inv.invitation_id),
             Some(&owner_tok),
             None,
         )
@@ -434,7 +434,7 @@ async fn audit_pagination_cursor_walks_the_chain() {
     // that already happened in setup.
     for i in 0..6 {
         app.post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": format!("p{i}@test.local") })),
         )
@@ -443,7 +443,7 @@ async fn audit_pagination_cursor_walks_the_chain() {
     }
 
     let page1: PaginatedAudit = app
-        .get("/admin/audit?limit=3", Some(&owner_tok))
+        .get("/api/admin/audit?limit=3", Some(&owner_tok))
         .await
         .json();
     assert_eq!(page1.items.len(), 3);
@@ -452,7 +452,7 @@ async fn audit_pagination_cursor_walks_the_chain() {
         .expect("next_cursor present when page is full");
 
     let page2: PaginatedAudit = app
-        .get(&format!("/admin/audit?limit=3&cursor={cursor}"), Some(&owner_tok))
+        .get(&format!("/api/admin/audit?limit=3&cursor={cursor}"), Some(&owner_tok))
         .await
         .json();
     assert_eq!(page2.items.len(), 3);
@@ -464,7 +464,7 @@ async fn audit_pagination_cursor_walks_the_chain() {
     let mut total = page1.items.len() + page2.items.len();
     while let Some(c) = next {
         let page: PaginatedAudit = app
-            .get(&format!("/admin/audit?limit=10&cursor={c}"), Some(&owner_tok))
+            .get(&format!("/api/admin/audit?limit=10&cursor={c}"), Some(&owner_tok))
             .await
             .json();
         total += page.items.len();
@@ -479,7 +479,7 @@ async fn audit_filter_actor_scopes_correctly() {
     let (app, owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
     // owner creates an invite (actor = owner)
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "f@test.local" })),
     )
@@ -488,7 +488,7 @@ async fn audit_filter_actor_scopes_correctly() {
 
     let resp = app
         .get(
-            &format!("/admin/audit?actor={}", owner.id.0),
+            &format!("/api/admin/audit?actor={}", owner.id.0),
             Some(&owner_tok),
         )
         .await;
@@ -510,7 +510,7 @@ async fn audit_filter_actor_scopes_correctly() {
 #[tokio::test]
 async fn admin_sessions_lists_all_active_users() {
     let (app, owner, _owner_tok, admin, admin_tok) = app_with_owner_and_admin().await;
-    let resp = app.get("/admin/sessions", Some(&admin_tok)).await;
+    let resp = app.get("/api/admin/sessions", Some(&admin_tok)).await;
     resp.assert_status(StatusCode::OK);
     let sessions: Vec<SessionView> = resp.json();
     let user_ids: Vec<Uuid> = sessions.iter().map(|s| s.user_id).collect();
@@ -524,7 +524,7 @@ async fn admin_revoke_session_kills_target_token() {
 
     // Find owner's session id via admin's session list.
     let sessions: Vec<SessionView> = app
-        .get("/admin/sessions", Some(&admin_tok))
+        .get("/api/admin/sessions", Some(&admin_tok))
         .await
         .json();
     let target = sessions
@@ -534,14 +534,14 @@ async fn admin_revoke_session_kills_target_token() {
         .expect("owner has an active session");
 
     app.post(
-        &format!("/admin/sessions/{target}/revoke"),
+        &format!("/api/admin/sessions/{target}/revoke"),
         Some(&admin_tok),
         None,
     )
     .await
     .assert_status(StatusCode::NO_CONTENT);
 
-    app.get("/me", Some(&owner_tok))
+    app.get("/api/me", Some(&owner_tok))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
 
@@ -569,7 +569,7 @@ async fn admin_revoke_nonexistent_session_returns_404() {
     let bogus = Uuid::new_v4();
     let resp = app
         .post(
-            &format!("/admin/sessions/{bogus}/revoke"),
+            &format!("/api/admin/sessions/{bogus}/revoke"),
             Some(&admin_tok),
             None,
         )
@@ -614,7 +614,7 @@ async fn deactivate_then_reactivate_cycle() {
     // Deactivate.
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/deactivate"),
+            &format!("/api/admin/users/{user_id}/deactivate"),
             Some(&owner_tok),
             None,
         )
@@ -624,13 +624,13 @@ async fn deactivate_then_reactivate_cycle() {
     assert_eq!(body.lifecycle, "deactivated");
 
     // User's session is dead.
-    app.get("/me", Some(&user_tok))
+    app.get("/api/me", Some(&user_tok))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
 
     // Login attempt: invalid_credentials (deactivated reads as unknown).
     app.post(
-        "/auth/login",
+        "/api/auth/login",
         None,
         Some(json!({ "email": "u@test.local", "password": "upw" })),
     )
@@ -641,7 +641,7 @@ async fn deactivate_then_reactivate_cycle() {
     // Reactivate.
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/reactivate"),
+            &format!("/api/admin/users/{user_id}/reactivate"),
             Some(&owner_tok),
             None,
         )
@@ -652,7 +652,7 @@ async fn deactivate_then_reactivate_cycle() {
 
     // Same password works again — credentials were preserved.
     app.post(
-        "/auth/login",
+        "/api/auth/login",
         None,
         Some(json!({ "email": "u@test.local", "password": "upw" })),
     )
@@ -667,7 +667,7 @@ async fn deactivate_already_deactivated_returns_409() {
         seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
 
     app.post(
-        &format!("/admin/users/{user_id}/deactivate"),
+        &format!("/api/admin/users/{user_id}/deactivate"),
         Some(&owner_tok),
         None,
     )
@@ -676,7 +676,7 @@ async fn deactivate_already_deactivated_returns_409() {
 
     let again = app
         .post(
-            &format!("/admin/users/{user_id}/deactivate"),
+            &format!("/api/admin/users/{user_id}/deactivate"),
             Some(&owner_tok),
             None,
         )
@@ -694,7 +694,7 @@ async fn reactivate_already_active_returns_409() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/reactivate"),
+            &format!("/api/admin/users/{user_id}/reactivate"),
             Some(&owner_tok),
             None,
         )
@@ -709,7 +709,7 @@ async fn cannot_target_self_for_any_lifecycle_action() {
     for action in ["deactivate", "reactivate", "delete", "purge"] {
         let resp = app
             .post(
-                &format!("/admin/users/{}/{action}", owner.id.0),
+                &format!("/api/admin/users/{}/{action}", owner.id.0),
                 Some(&owner_tok),
                 None,
             )
@@ -739,7 +739,7 @@ async fn admin_cannot_act_on_peer_admin() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/deactivate", admin2.id.0),
+            &format!("/api/admin/users/{}/deactivate", admin2.id.0),
             Some(&tok1),
             None,
         )
@@ -753,7 +753,7 @@ async fn admin_cannot_act_on_owner() {
     let (app, owner, _owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            &format!("/admin/users/{}/deactivate", owner.id.0),
+            &format!("/api/admin/users/{}/deactivate", owner.id.0),
             Some(&admin_tok),
             None,
         )
@@ -767,7 +767,7 @@ async fn owner_can_deactivate_admin() {
     let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            &format!("/admin/users/{}/deactivate", admin.id.0),
+            &format!("/api/admin/users/{}/deactivate", admin.id.0),
             Some(&owner_tok),
             None,
         )
@@ -782,7 +782,7 @@ async fn lifecycle_action_on_unknown_user_returns_404() {
     for action in ["deactivate", "reactivate", "delete", "purge"] {
         let resp = app
             .post(
-                &format!("/admin/users/{bogus}/{action}"),
+                &format!("/api/admin/users/{bogus}/{action}"),
                 Some(&owner_tok),
                 None,
             )
@@ -804,7 +804,7 @@ async fn delete_redacts_pii_and_frees_email() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/delete"),
+            &format!("/api/admin/users/{user_id}/delete"),
             Some(&owner_tok),
             None,
         )
@@ -812,7 +812,7 @@ async fn delete_redacts_pii_and_frees_email() {
     resp.assert_status(StatusCode::NO_CONTENT);
 
     // Session is dead.
-    app.get("/me", Some(&user_tok))
+    app.get("/api/me", Some(&user_tok))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
 
@@ -843,7 +843,7 @@ async fn delete_redacts_pii_and_frees_email() {
     // Original email is freed for re-invitation.
     let invite_resp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "victim@test.local" })),
         )
@@ -873,7 +873,7 @@ async fn purge_can_target_already_soft_deleted_user() {
 
     // Soft-delete first.
     app.post(
-        &format!("/admin/users/{user_id}/delete"),
+        &format!("/api/admin/users/{user_id}/delete"),
         Some(&owner_tok),
         None,
     )
@@ -883,7 +883,7 @@ async fn purge_can_target_already_soft_deleted_user() {
     // Purge a soft-deleted user.
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/purge"),
+            &format!("/api/admin/users/{user_id}/purge"),
             Some(&owner_tok),
             None,
         )
@@ -918,7 +918,7 @@ async fn purge_directly_from_active_works() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/purge"),
+            &format!("/api/admin/users/{user_id}/purge"),
             Some(&owner_tok),
             None,
         )
@@ -941,7 +941,7 @@ async fn deleted_user_is_invisible_to_admin_list() {
         seed_user_token(&app, "vanish@test.local", "Vanish", "pw", InstanceRole::User).await;
 
     app.post(
-        &format!("/admin/users/{user_id}/delete"),
+        &format!("/api/admin/users/{user_id}/delete"),
         Some(&owner_tok),
         None,
     )
@@ -949,7 +949,7 @@ async fn deleted_user_is_invisible_to_admin_list() {
     .assert_status(StatusCode::NO_CONTENT);
 
     let list: Vec<AdminUserView> = app
-        .get("/admin/users", Some(&owner_tok))
+        .get("/api/admin/users", Some(&owner_tok))
         .await
         .json();
     assert!(
@@ -966,7 +966,7 @@ async fn reactivate_only_works_from_deactivated_state() {
 
     // Soft-delete then attempt reactivate → 404 (account is gone).
     app.post(
-        &format!("/admin/users/{user_id}/delete"),
+        &format!("/api/admin/users/{user_id}/delete"),
         Some(&owner_tok),
         None,
     )
@@ -975,7 +975,7 @@ async fn reactivate_only_works_from_deactivated_state() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{user_id}/reactivate"),
+            &format!("/api/admin/users/{user_id}/reactivate"),
             Some(&owner_tok),
             None,
         )
@@ -995,7 +995,7 @@ async fn deactivate_revokes_all_sessions() {
     let t3 = app.login(&user.email, "pw").await;
 
     app.post(
-        &format!("/admin/users/{}/deactivate", user.id.0),
+        &format!("/api/admin/users/{}/deactivate", user.id.0),
         Some(&owner_tok),
         None,
     )
@@ -1003,7 +1003,7 @@ async fn deactivate_revokes_all_sessions() {
     .assert_status(StatusCode::OK);
 
     for tok in [&t1, &t2, &t3] {
-        app.get("/me", Some(tok))
+        app.get("/api/me", Some(tok))
             .await
             .assert_status(StatusCode::UNAUTHORIZED);
     }
@@ -1032,7 +1032,7 @@ async fn owner_promotes_user_to_admin() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/users/{}/role", target.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1043,7 +1043,7 @@ async fn owner_promotes_user_to_admin() {
 
     // /me as that user now reflects the new role.
     let user_tok = app.login(&target.email, "pw").await;
-    let me: serde_json::Value = app.get("/me", Some(&user_tok)).await.json();
+    let me: serde_json::Value = app.get("/api/me", Some(&user_tok)).await.json();
     assert_eq!(me["instance_role"].as_str(), Some("admin"));
 }
 
@@ -1053,7 +1053,7 @@ async fn owner_demotes_admin_to_user() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", admin.id.0),
+            &format!("/api/admin/users/{}/role", admin.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "user" })),
         )
@@ -1081,7 +1081,7 @@ async fn owner_can_promote_admin_to_owner_multi_owner() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", admin.id.0),
+            &format!("/api/admin/users/{}/role", admin.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "owner" })),
         )
@@ -1110,7 +1110,7 @@ async fn owner_can_demote_another_owner_via_recovery_bypass() {
     let recovery = app.seed_recovery_code().await;
 
     app.post(
-        &format!("/admin/users/{}/role", admin.id.0),
+        &format!("/api/admin/users/{}/role", admin.id.0),
         Some(&owner_tok),
         Some(json!({ "role": "owner" })),
     )
@@ -1119,7 +1119,7 @@ async fn owner_can_demote_another_owner_via_recovery_bypass() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", admin.id.0),
+            &format!("/api/admin/users/{}/role", admin.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin", "bypass_recovery_code": recovery })),
         )
@@ -1138,7 +1138,7 @@ async fn admin_cannot_change_roles() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/users/{}/role", target.id.0),
             Some(&admin_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1161,7 +1161,7 @@ async fn regular_user_cannot_change_roles() {
     // The AdminUser extractor itself returns 403 here.
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", owner.id.0),
+            &format!("/api/admin/users/{}/role", owner.id.0),
             Some(&user_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1174,7 +1174,7 @@ async fn change_role_blocks_self_target() {
     let (app, owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", owner.id.0),
+            &format!("/api/admin/users/{}/role", owner.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1192,7 +1192,7 @@ async fn change_role_same_role_returns_409() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/users/{}/role", target.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "user" })),
         )
@@ -1210,7 +1210,7 @@ async fn change_role_on_deleted_user_returns_404() {
 
     // Soft-delete first.
     app.post(
-        &format!("/admin/users/{}/delete", target.id.0),
+        &format!("/api/admin/users/{}/delete", target.id.0),
         Some(&owner_tok),
         None,
     )
@@ -1219,7 +1219,7 @@ async fn change_role_on_deleted_user_returns_404() {
 
     let resp = app
         .post(
-            &format!("/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/users/{}/role", target.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1238,7 +1238,7 @@ async fn demoted_owner_loses_powers_on_next_request() {
     let recovery = app.seed_recovery_code().await;
 
     app.post(
-        &format!("/admin/users/{}/role", admin.id.0),
+        &format!("/api/admin/users/{}/role", admin.id.0),
         Some(&owner1_tok),
         Some(json!({ "role": "owner" })),
     )
@@ -1247,24 +1247,24 @@ async fn demoted_owner_loses_powers_on_next_request() {
 
     let owner2_tok = app.login(&admin.email, "adminpw").await;
 
-    app.get("/admin/users", Some(&owner2_tok))
+    app.get("/api/admin/users", Some(&owner2_tok))
         .await
         .assert_status(StatusCode::OK);
 
     app.post(
-        &format!("/admin/users/{}/role", admin.id.0),
+        &format!("/api/admin/users/{}/role", admin.id.0),
         Some(&owner1_tok),
         Some(json!({ "role": "user", "bypass_recovery_code": recovery })),
     )
     .await
     .assert_status(StatusCode::OK);
 
-    let me = app.get("/me", Some(&owner2_tok)).await;
+    let me = app.get("/api/me", Some(&owner2_tok)).await;
     me.assert_status(StatusCode::OK);
     let me_body: serde_json::Value = me.json();
     assert_eq!(me_body["instance_role"].as_str(), Some("user"));
 
-    app.get("/admin/users", Some(&owner2_tok))
+    app.get("/api/admin/users", Some(&owner2_tok))
         .await
         .assert_status(StatusCode::FORBIDDEN);
 }
