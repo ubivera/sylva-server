@@ -10,6 +10,11 @@ pub struct Config {
     pub log_filter: String,
     pub data_dir: PathBuf,
     pub postgres_url: String,
+    /// Public-facing base URL used when constructing links inside outbound
+    /// emails (e.g., invitation accept URLs). Distinct from `listen_addr`
+    /// because production sits behind a reverse proxy on a different host.
+    pub public_base_url: String,
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,11 +23,44 @@ pub enum LogFormat {
     Pretty,
 }
 
+#[derive(Debug, Clone)]
+pub enum NotificationsConfig {
+    /// No emails ever sent. Outbox rows are still inserted at the call site
+    /// and the worker marks them `skipped` for admin visibility.
+    Disabled,
+    /// Dev/test backend that emits a tracing line per "send."
+    Log,
+    /// Real SMTP delivery. All fields validated at startup.
+    Smtp(SmtpSettings),
+}
+
+#[derive(Debug, Clone)]
+pub struct SmtpSettings {
+    pub host: String,
+    pub port: u16,
+    pub tls: SmtpTls,
+    pub username: String,
+    pub password: String,
+    pub from_email: String,
+    pub from_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpTls {
+    Starttls,
+    Implicit,
+    None,
+}
+
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8443";
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_FILTER: &str = "info,hearth=debug";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_POSTGRES_URL: &str = "postgresql://hearth@127.0.0.1:15432/hearth";
+const DEFAULT_PUBLIC_BASE_URL: &str = "http://127.0.0.1:8443";
+const DEFAULT_NOTIFICATIONS_MODE: &str = "disabled";
+const DEFAULT_SMTP_PORT: u16 = 587;
+const DEFAULT_SMTP_TLS: &str = "starttls";
 
 impl Config {
     /// Build a Config from process environment variables.
@@ -66,12 +104,21 @@ impl Config {
             .parse()
             .with_context(|| format!("invalid HEARTH_POSTGRES_URL: {postgres_url}"))?;
 
+        let public_base_url = get("HEARTH_PUBLIC_BASE_URL")
+            .unwrap_or_else(|| DEFAULT_PUBLIC_BASE_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
+
+        let notifications = parse_notifications(&get)?;
+
         Ok(Self {
             listen_addr,
             log_format,
             log_filter,
             data_dir,
             postgres_url,
+            public_base_url,
+            notifications,
         })
     }
 
@@ -91,6 +138,65 @@ impl Config {
             .map(|opts| opts.get_port())
             .unwrap_or(15432)
     }
+}
+
+fn parse_notifications<F>(get: &F) -> anyhow::Result<NotificationsConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mode = get("HEARTH_NOTIFICATIONS_MODE")
+        .unwrap_or_else(|| DEFAULT_NOTIFICATIONS_MODE.to_string());
+
+    match mode.as_str() {
+        "disabled" => Ok(NotificationsConfig::Disabled),
+        "log" => Ok(NotificationsConfig::Log),
+        "smtp" => {
+            let host = required(get, "HEARTH_SMTP_HOST")?;
+            let port = match get("HEARTH_SMTP_PORT") {
+                Some(s) => s
+                    .parse::<u16>()
+                    .with_context(|| format!("HEARTH_SMTP_PORT not a port number: {s}"))?,
+                None => DEFAULT_SMTP_PORT,
+            };
+            let tls_str = get("HEARTH_SMTP_TLS").unwrap_or_else(|| DEFAULT_SMTP_TLS.to_string());
+            let tls = match tls_str.as_str() {
+                "starttls" => SmtpTls::Starttls,
+                "implicit" => SmtpTls::Implicit,
+                "none" => SmtpTls::None,
+                other => bail!(
+                    "invalid HEARTH_SMTP_TLS: {other}; expected 'starttls', 'implicit', or 'none'"
+                ),
+            };
+            let username = required(get, "HEARTH_SMTP_USERNAME")?;
+            let password = required(get, "HEARTH_SMTP_PASSWORD")?;
+            let from_email = required(get, "HEARTH_SMTP_FROM_EMAIL")?;
+            let from_name = get("HEARTH_SMTP_FROM_NAME");
+
+            Ok(NotificationsConfig::Smtp(SmtpSettings {
+                host,
+                port,
+                tls,
+                username,
+                password,
+                from_email,
+                from_name,
+            }))
+        }
+        other => bail!(
+            "invalid HEARTH_NOTIFICATIONS_MODE: {other}; expected 'disabled', 'log', or 'smtp'"
+        ),
+    }
+}
+
+fn required<F>(get: &F, key: &str) -> anyhow::Result<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get(key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{key} is required when HEARTH_NOTIFICATIONS_MODE=smtp"
+        )
+    })
 }
 
 #[cfg(test)]

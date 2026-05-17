@@ -207,6 +207,10 @@ fn workspace_root() -> PathBuf {
 pub struct TestApp {
     pub router: Router,
     pub pool: PgPool,
+    /// Test-side notification worker. Defaults to [`notifications::NotifierImpl::Log`]
+    /// — tests that need to observe failure paths swap it via
+    /// [`TestApp::set_notifier`].
+    pub notification_worker: std::sync::Mutex<notifications::Worker>,
     #[allow(dead_code)] // retained so a future Drop impl can clean up the DB
     db_name: String,
 }
@@ -260,13 +264,48 @@ impl TestApp {
         let users = UserRepository::new(pool.clone());
         let sessions = SessionRepository::new(pool.clone());
         let invitations = InvitationRepository::new(pool.clone());
-        let router = app::router(Instant::now(), pool.clone(), users, sessions, invitations);
+        let router = app::router(
+            Instant::now(),
+            pool.clone(),
+            users,
+            sessions,
+            invitations,
+            "http://127.0.0.1:8443".to_string(),
+        );
+
+        let worker =
+            notifications::Worker::new(pool.clone(), notifications::NotifierImpl::Log);
 
         TestApp {
             router,
             pool,
+            notification_worker: std::sync::Mutex::new(worker),
             db_name,
         }
+    }
+
+    /// Replace the notification worker's notifier (e.g. with
+    /// `NotifierImpl::AlwaysFail` to drive the retry/dead path). Returns
+    /// nothing; callers that need to flip back to log mode build a fresh
+    /// worker with `notifications::NotifierImpl::Log`.
+    pub fn set_notifier(&self, notifier: notifications::NotifierImpl) {
+        let mut guard = self.notification_worker.lock().expect("worker mutex poisoned");
+        *guard = notifications::Worker::new(self.pool.clone(), notifier);
+    }
+
+    /// Run a single drain cycle of the notification worker. Returns the
+    /// number of rows processed.
+    pub async fn run_notifications_once(&self) -> usize {
+        // Clone the worker out so we don't hold the mutex across the await.
+        let worker = self
+            .notification_worker
+            .lock()
+            .expect("worker mutex poisoned")
+            .clone();
+        worker
+            .process_pending()
+            .await
+            .expect("notification worker cycle failed")
     }
 
     /// Seed a user with the given role + an `active` lifecycle and a real

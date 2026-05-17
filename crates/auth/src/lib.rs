@@ -182,6 +182,21 @@ pub async fn update_password_hash(
     Ok(())
 }
 
+/// Delete a user's stored password hash. Called by the soft-delete and
+/// purge lifecycle handlers — once a user account is gone, their password
+/// material has no remaining purpose and must not survive the
+/// transition. Idempotent (zero rows affected = already gone).
+pub async fn delete_credentials(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+) -> Result<()> {
+    sqlx::query("DELETE FROM auth.credentials WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Session lifetime for this checkpoint. The design spec eventually wants
 /// a 15-minute access token + 90-day sliding refresh token; we use a flat
 /// 24-hour session for now and refactor when refresh tokens land.
@@ -289,6 +304,27 @@ impl SessionRepository {
         )
         .bind(user_id)
         .bind(keep_session_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Revoke every active session for `user_id`. Returns the number of
+    /// rows revoked. Used by the admin lifecycle handlers (deactivate /
+    /// delete / purge) — there is no "current" session to preserve from
+    /// the target's perspective; the actor is the admin.
+    pub async fn revoke_all_for_user(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: UserId,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE auth.sessions
+             SET revoked_at = now()
+             WHERE user_id = $1
+               AND revoked_at IS NULL
+               AND expires_at > now()",
+        )
+        .bind(user_id)
         .execute(&mut **tx)
         .await?;
         Ok(result.rows_affected())

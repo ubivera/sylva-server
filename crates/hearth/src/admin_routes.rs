@@ -8,8 +8,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use identity::{
-    DEFAULT_INVITATION_TTL, InstanceRole, InvitationId, InvitationRepository, UserLifecycle,
+    DEFAULT_INVITATION_TTL, InstanceRole, InvitationId, InvitationRepository, User, UserId,
+    UserLifecycle, UserRepository,
 };
+use notifications::{OutboxRow, OutboxState};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -136,6 +138,8 @@ pub async fn create_invite(
     }
 
     let actor = admin.actor();
+    let inviter_display_name = admin.0.user.display_name.clone();
+    let base = state.public_base_url.clone();
     let result: anyhow::Result<CreateInviteResponse> = async {
         let mut tx = state.db.begin().await?;
         let (invitation, token) = InvitationRepository::create(
@@ -159,12 +163,31 @@ pub async fn create_invite(
             }),
         )
         .await?;
+
+        // Enqueue the delivery email in the same transaction so we never
+        // create an invitation without queuing its email (or vice versa).
+        let full_accept_url = format!("{base}/invite/{token}");
+        notifications::enqueue(
+            &mut tx,
+            notifications::Notification::Invitation {
+                recipient_email: invitation.email.clone(),
+                inviter_display_name: inviter_display_name.clone(),
+                accept_url: full_accept_url.clone(),
+                expires_at: invitation.expires_at,
+                instance_role: invitation.instance_role,
+                invitation_id: invitation.id.0,
+            },
+        )
+        .await?;
+
         tx.commit().await?;
 
         Ok(CreateInviteResponse {
             invitation_id: invitation.id.0,
             email: invitation.email,
             instance_role: invitation.instance_role,
+            // The relative path is kept for back-compat in case any caller
+            // depends on it; the email contains the full URL via base_url.
             accept_url: format!("/invite/{token}"),
             token,
             expires_at: invitation.expires_at,
@@ -389,3 +412,461 @@ pub async fn revoke_invite(
     }
 }
 
+#[derive(Serialize)]
+pub struct LifecycleResponse {
+    pub id: Uuid,
+    pub email: String,
+    pub display_name: String,
+    pub lifecycle: UserLifecycle,
+    pub instance_role: InstanceRole,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<User> for LifecycleResponse {
+    fn from(u: User) -> Self {
+        Self {
+            id: u.id.0,
+            email: u.email,
+            display_name: u.display_name,
+            lifecycle: u.lifecycle,
+            instance_role: u.instance_role,
+            updated_at: u.updated_at,
+        }
+    }
+}
+
+/// Shared preamble: look up the target, run the self-target and strict-rank
+/// authz checks. On failure returns the error response directly so the
+/// caller can `?`/early-return.
+async fn resolve_lifecycle_target(
+    state: &AppState,
+    admin: &AdminUser,
+    target_id: Uuid,
+) -> std::result::Result<User, (StatusCode, Json<ErrorResponse>)> {
+    let target = state
+        .users
+        .find_any(UserId::new(target_id))
+        .await
+        .map_err(|e| {
+            tracing::error!(?e, "lookup target user");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "user_not_found"))?;
+
+    if target.id == admin.0.user.id {
+        return Err(err(StatusCode::FORBIDDEN, "cannot_target_self"));
+    }
+    if !authz::outranks(admin.0.user.instance_role, target.instance_role) {
+        return Err(err(StatusCode::FORBIDDEN, "cannot_target_peer_or_higher"));
+    }
+    Ok(target)
+}
+
+/// `POST /admin/users/{id}/deactivate` — Active → Deactivated. Revokes
+/// every active session; credentials stay so reactivation works without a
+/// password reset.
+pub async fn deactivate_user(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(target_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
+        Ok(t) => t,
+        Err(resp) => return resp.into_response(),
+    };
+
+    match target.lifecycle {
+        UserLifecycle::Active => {}
+        UserLifecycle::Deactivated => {
+            return err(StatusCode::CONFLICT, "already_deactivated").into_response();
+        }
+        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        }
+        UserLifecycle::PendingInvite => {
+            return err(StatusCode::CONFLICT, "not_active").into_response();
+        }
+    }
+
+    let actor = admin.actor();
+    let target_user_id = target.id;
+    let target_email = target.email.clone();
+
+    let result: anyhow::Result<User> = async {
+        let mut tx = state.db.begin().await?;
+        let updated = UserRepository::deactivate(&mut tx, target_user_id).await?;
+        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "user_deactivated",
+            serde_json::json!({
+                "target_user_id": target_user_id.0,
+                "target_email": target_email,
+                "sessions_revoked": revoked,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+    .await;
+
+    match result {
+        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
+        Err(e) => {
+            tracing::error!(?e, "deactivating user");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/users/{id}/reactivate` — Deactivated → Active. The user
+/// must sign in again to obtain a new session; their existing password
+/// hash is still valid.
+pub async fn reactivate_user(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(target_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
+        Ok(t) => t,
+        Err(resp) => return resp.into_response(),
+    };
+
+    match target.lifecycle {
+        UserLifecycle::Deactivated => {}
+        UserLifecycle::Active => {
+            return err(StatusCode::CONFLICT, "already_active").into_response();
+        }
+        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        }
+        UserLifecycle::PendingInvite => {
+            return err(StatusCode::CONFLICT, "not_deactivated").into_response();
+        }
+    }
+
+    let actor = admin.actor();
+    let target_user_id = target.id;
+    let target_email = target.email.clone();
+
+    let result: anyhow::Result<User> = async {
+        let mut tx = state.db.begin().await?;
+        let updated = UserRepository::reactivate(&mut tx, target_user_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "user_reactivated",
+            serde_json::json!({
+                "target_user_id": target_user_id.0,
+                "target_email": target_email,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+    .await;
+
+    match result {
+        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
+        Err(e) => {
+            tracing::error!(?e, "reactivating user");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/users/{id}/delete` — terminal "account removed" state.
+/// Active/Deactivated → SoftDeleted. Revokes sessions, deletes the
+/// credentials row, redacts PII. Content the user authored that other
+/// users have access to is preserved (future content-cleanup hook drops
+/// orphans once the apps platform lands).
+pub async fn delete_user(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(target_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
+        Ok(t) => t,
+        Err(resp) => return resp.into_response(),
+    };
+
+    match target.lifecycle {
+        UserLifecycle::Active | UserLifecycle::Deactivated => {}
+        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        }
+        UserLifecycle::PendingInvite => {
+            return err(StatusCode::CONFLICT, "not_active").into_response();
+        }
+    }
+
+    let actor = admin.actor();
+    let target_user_id = target.id;
+
+    let result: anyhow::Result<u64> = async {
+        let mut tx = state.db.begin().await?;
+        let (_redacted, original_email) =
+            UserRepository::soft_delete(&mut tx, target_user_id).await?;
+        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
+        auth::delete_credentials(&mut tx, target_user_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "user_deleted",
+            serde_json::json!({
+                "target_user_id": target_user_id.0,
+                "redacted_from_email": original_email,
+                "sessions_revoked": revoked,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(revoked)
+    }
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(?e, "soft-deleting user");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/users/{id}/purge` — terminal "full purge" state.
+/// Active/Deactivated/SoftDeleted → HardDeleted. Today the row-level
+/// effect matches `delete_user`; once content lives in the apps
+/// platform, the content-cleanup hook here drops *all* their content
+/// regardless of collaborators.
+pub async fn purge_user(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(target_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
+        Ok(t) => t,
+        Err(resp) => return resp.into_response(),
+    };
+
+    match target.lifecycle {
+        UserLifecycle::Active | UserLifecycle::Deactivated | UserLifecycle::SoftDeleted => {}
+        UserLifecycle::HardDeleted => {
+            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        }
+        UserLifecycle::PendingInvite => {
+            return err(StatusCode::CONFLICT, "not_active").into_response();
+        }
+    }
+
+    let actor = admin.actor();
+    let target_user_id = target.id;
+    let prior_lifecycle = target.lifecycle;
+
+    let result: anyhow::Result<u64> = async {
+        let mut tx = state.db.begin().await?;
+        let (_redacted, original_email) =
+            UserRepository::hard_delete(&mut tx, target_user_id).await?;
+        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
+        auth::delete_credentials(&mut tx, target_user_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "user_purged",
+            serde_json::json!({
+                "target_user_id": target_user_id.0,
+                "redacted_from_email": original_email,
+                "prior_lifecycle": prior_lifecycle,
+                "sessions_revoked": revoked,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(revoked)
+    }
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(?e, "purging user");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ChangeRoleRequest {
+    pub role: InstanceRole,
+}
+
+/// `POST /admin/users/{id}/role` — change a user's instance role.
+///
+/// Owner-only. Admin callers get `403 forbidden` even though they pass
+/// the `AdminUser` extractor; managing who is an Admin is a deliberate
+/// privilege-escalation surface that we keep at the Owner level.
+///
+/// Self-targeting is blocked (which also enforces the "last Owner can't
+/// remove themselves" invariant, since a sole Owner trying to demote
+/// themselves hits this 403). Other Owners can be demoted by another
+/// Owner — multi-Owner is supported by the data model.
+///
+/// Sessions are *not* revoked on role change. The `AuthenticatedUser`
+/// extractor re-loads the user row on every request, so role updates
+/// take effect on the target's next call — promoted users gain powers
+/// immediately, demoted users lose them immediately.
+pub async fn change_user_role(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(target_id): Path<Uuid>,
+    Json(req): Json<ChangeRoleRequest>,
+) -> impl IntoResponse {
+    // Owner-only — Admin gets 403. Note we intentionally do NOT use
+    // `resolve_lifecycle_target` here: its strict-outrank check would
+    // forbid Owner-on-Owner demotion (peers), which we want to allow in
+    // a multi-Owner deployment.
+    if admin.0.user.instance_role != InstanceRole::Owner {
+        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+
+    let target = match state.users.find_any(UserId::new(target_id)).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "user_not_found").into_response(),
+        Err(e) => {
+            tracing::error!(?e, "lookup target user");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+
+    if target.id == admin.0.user.id {
+        return err(StatusCode::FORBIDDEN, "cannot_target_self").into_response();
+    }
+
+    match target.lifecycle {
+        UserLifecycle::Active | UserLifecycle::Deactivated => {}
+        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        }
+        UserLifecycle::PendingInvite => {
+            return err(StatusCode::CONFLICT, "not_active").into_response();
+        }
+    }
+
+    let from_role = target.instance_role;
+    let to_role = req.role;
+    if from_role == to_role {
+        return err(StatusCode::CONFLICT, "already_in_role").into_response();
+    }
+
+    let actor = admin.actor();
+    let target_user_id = target.id;
+    let target_email = target.email.clone();
+
+    let result: anyhow::Result<User> = async {
+        let mut tx = state.db.begin().await?;
+        let updated = UserRepository::set_instance_role(&mut tx, target_user_id, to_role).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "user_role_changed",
+            serde_json::json!({
+                "target_user_id": target_user_id.0,
+                "target_email": target_email,
+                "from_role": from_role,
+                "to_role": to_role,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+    .await;
+
+    match result {
+        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
+        Err(e) => {
+            tracing::error!(?e, "changing user role");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /admin/notifications
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct NotificationsQuery {
+    pub state: Option<OutboxState>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct NotificationView {
+    pub id: Uuid,
+    pub kind: notifications::OutboxKind,
+    pub recipient_email: String,
+    pub subject: String,
+    pub state: OutboxState,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub next_attempt_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub payload: serde_json::Value,
+}
+
+impl From<OutboxRow> for NotificationView {
+    fn from(r: OutboxRow) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            recipient_email: r.recipient_email,
+            subject: r.subject,
+            state: r.state,
+            attempts: r.attempts,
+            last_error: r.last_error,
+            next_attempt_at: r.next_attempt_at,
+            created_at: r.created_at,
+            sent_at: r.sent_at,
+            payload: r.payload,
+        }
+    }
+}
+
+const NOTIFICATIONS_DEFAULT_LIMIT: u32 = 50;
+const NOTIFICATIONS_MAX_LIMIT: u32 = 200;
+
+/// `GET /admin/notifications` — recent outbox rows, newest first.
+/// Optional `?state=pending|sending|sent|failed|dead|skipped` filter and
+/// `?limit=N` (clamped to [1, 200], default 50). Body and HTML are
+/// intentionally excluded from this view to keep responses small; the
+/// subject and recipient give an admin enough to debug delivery.
+pub async fn list_notifications(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Query(q): Query<NotificationsQuery>,
+) -> impl IntoResponse {
+    let limit = q
+        .limit
+        .unwrap_or(NOTIFICATIONS_DEFAULT_LIMIT)
+        .clamp(1, NOTIFICATIONS_MAX_LIMIT);
+    match notifications::list(&state.db, q.state, limit).await {
+        Ok(rows) => {
+            let views: Vec<NotificationView> = rows.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(?e, "listing notifications");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}

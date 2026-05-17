@@ -40,6 +40,21 @@ impl std::fmt::Display for UserId {
 }
 
 /// Lifecycle state of a user record. Mirrors `identity.user_lifecycle` in SQL.
+///
+/// Semantics:
+/// - `PendingInvite` — placeholder for the eventual flow that materializes a
+///   user row at invite-create time (today users are only inserted at
+///   accept-invite).
+/// - `Active` — normal user.
+/// - `Deactivated` — recoverable suspension. Sessions revoked, login blocked,
+///   credentials preserved. Reactivatable to `Active`.
+/// - `SoftDeleted` — terminal. The account is "gone": sessions revoked,
+///   credentials deleted, PII redacted in the row. Content the user created
+///   that other users have access to remains; orphaned content is dropped
+///   when the apps platform lands.
+/// - `HardDeleted` — terminal. Full purge: same row-level effect as
+///   `SoftDeleted` today, but the future content-cleanup hook drops *all*
+///   their content regardless of collaborators.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize,
 )]
@@ -48,6 +63,7 @@ impl std::fmt::Display for UserId {
 pub enum UserLifecycle {
     PendingInvite,
     Active,
+    Deactivated,
     SoftDeleted,
     HardDeleted,
 }
@@ -96,12 +112,35 @@ impl UserRepository {
         Ok(count)
     }
 
+    /// Look up a "live" user (Active, Deactivated, or PendingInvite).
+    /// Soft-deleted and hard-deleted users are treated as not-found here —
+    /// they're invisible to normal application code. Admin lifecycle
+    /// handlers that need to operate on already-deleted users use
+    /// [`UserRepository::find_any`] instead.
     pub async fn find_by_id(&self, id: UserId) -> Result<Option<User>> {
         let user = sqlx::query_as::<_, User>(
             "SELECT id, email, display_name, lifecycle, instance_role, \
                     locale, created_at, updated_at \
              FROM identity.users \
-             WHERE id = $1 AND lifecycle <> 'hard_deleted'",
+             WHERE id = $1 \
+               AND lifecycle IN ('pending_invite', 'active', 'deactivated')",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(user)
+    }
+
+    /// Look up a user by id regardless of lifecycle. Returns soft- and
+    /// hard-deleted rows too. Intended for admin lifecycle handlers that
+    /// need to inspect the current state before transitioning it; do not
+    /// use this for auth/visibility decisions.
+    pub async fn find_any(&self, id: UserId) -> Result<Option<User>> {
+        let user = sqlx::query_as::<_, User>(
+            "SELECT id, email, display_name, lifecycle, instance_role, \
+                    locale, created_at, updated_at \
+             FROM identity.users \
+             WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -114,7 +153,8 @@ impl UserRepository {
             "SELECT id, email, display_name, lifecycle, instance_role, \
                     locale, created_at, updated_at \
              FROM identity.users \
-             WHERE email_lower = lower($1) AND lifecycle <> 'hard_deleted'",
+             WHERE email_lower = lower($1) \
+               AND lifecycle IN ('pending_invite', 'active', 'deactivated')",
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -122,20 +162,44 @@ impl UserRepository {
         Ok(user)
     }
 
-    /// List all non-purged users, oldest first. Intended for admin
-    /// surfaces (e.g., `GET /admin/users`). Excludes `hard_deleted`
-    /// rows because those have been redacted.
+    /// List manageable users (Active, Deactivated, PendingInvite), oldest
+    /// first. Soft- and hard-deleted accounts are hidden — those users are
+    /// "gone" from the directory's perspective; audit events that
+    /// reference them still display via the snapshot `actor_display_name`.
     pub async fn list_all(&self) -> Result<Vec<User>> {
         let users = sqlx::query_as::<_, User>(
             "SELECT id, email, display_name, lifecycle, instance_role, \
                     locale, created_at, updated_at \
              FROM identity.users \
-             WHERE lifecycle <> 'hard_deleted' \
+             WHERE lifecycle IN ('pending_invite', 'active', 'deactivated') \
              ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(users)
+    }
+
+    /// Set a user's `instance_role` within the caller's transaction.
+    /// Bumps `updated_at`. The caller is responsible for the authz check
+    /// (only Owner can change roles) and for refusing same-role no-ops
+    /// before reaching here.
+    pub async fn set_instance_role(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+        new_role: InstanceRole,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET instance_role = $2, updated_at = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(new_role)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
     }
 
     /// Partial profile update within the caller's transaction. Each `Some`
@@ -165,14 +229,15 @@ impl UserRepository {
         Ok(user)
     }
 
-    /// True when at least one non-soft/hard-deleted user already has
-    /// `email_lower = lower(email)`. Cheaper than fetching the full row
-    /// for an existence check.
+    /// True when at least one manageable user (Active, Deactivated,
+    /// PendingInvite) already has `email_lower = lower(email)`. Soft- and
+    /// hard-deleted users' redacted emails are not considered "in use" —
+    /// the original email is freed for re-invitation.
     pub async fn email_in_use(&self, email: &str) -> Result<bool> {
         let exists: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM identity.users \
              WHERE email_lower = lower($1) \
-               AND lifecycle <> 'hard_deleted' \
+               AND lifecycle IN ('pending_invite', 'active', 'deactivated') \
              LIMIT 1",
         )
         .bind(email)
@@ -180,6 +245,104 @@ impl UserRepository {
         .await?;
         Ok(exists.is_some())
     }
+
+    /// Transition `Active` → `Deactivated`. The caller is responsible for
+    /// the authz check and for revoking sessions in the same transaction.
+    /// Bumps `updated_at`.
+    pub async fn deactivate(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET lifecycle = 'deactivated', updated_at = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
+    }
+
+    /// Transition `Deactivated` → `Active`. Sessions are not restored
+    /// (the user must sign in again); credentials were preserved across
+    /// deactivation so the existing password still works.
+    pub async fn reactivate(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET lifecycle = 'active', updated_at = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
+    }
+
+    /// Transition to `SoftDeleted`: terminal "account removed" state.
+    /// Redacts PII in the row so the user is no longer identifiable from
+    /// `identity.users`. Returns the original email (pre-redaction) so the
+    /// audit caller can record what was wiped. The caller is responsible
+    /// for revoking sessions, deleting credentials, and running future
+    /// content-cleanup hooks (collaborator-aware) in the same transaction.
+    pub async fn soft_delete(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+    ) -> Result<(User, String)> {
+        redact_and_terminate(tx, id, UserLifecycle::SoftDeleted).await
+    }
+
+    /// Transition to `HardDeleted`: terminal "full purge" state. Same
+    /// row-level effect as `soft_delete` today; once apps exist, the
+    /// content-cleanup hook drops *all* their data regardless of
+    /// collaborators. Returns the original email.
+    pub async fn hard_delete(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+    ) -> Result<(User, String)> {
+        redact_and_terminate(tx, id, UserLifecycle::HardDeleted).await
+    }
+}
+
+/// Shared implementation for the two terminal transitions. Redacts PII
+/// (email + display_name + locale) in place and sets the requested
+/// terminal lifecycle. Returns the row in its post-update form alongside
+/// the *original* email so the caller can record it in the audit event.
+async fn redact_and_terminate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: UserId,
+    new_lifecycle: UserLifecycle,
+) -> Result<(User, String)> {
+    let original_email: String =
+        sqlx::query_scalar("SELECT email FROM identity.users WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+
+    let updated: User = sqlx::query_as(
+        "UPDATE identity.users
+         SET email = 'deleted+' || id || '@purged.invalid',
+             display_name = '[deleted user]',
+             locale = NULL,
+             lifecycle = $2,
+             updated_at = now()
+         WHERE id = $1
+         RETURNING id, email, display_name, lifecycle, instance_role,
+                   locale, created_at, updated_at",
+    )
+    .bind(id)
+    .bind(new_lifecycle)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok((updated, original_email))
 }
 
 /// Strongly-typed invitation identifier.

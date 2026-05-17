@@ -17,6 +17,11 @@ pub struct AppState {
     pub users: UserRepository,
     pub sessions: SessionRepository,
     pub invitations: InvitationRepository,
+    /// Public-facing base URL used when building links inside outbound
+    /// emails (e.g., the invitation accept URL). Set from
+    /// `HEARTH_PUBLIC_BASE_URL`; reverse proxies in production override
+    /// the default loopback value.
+    pub public_base_url: String,
 }
 
 pub fn router(
@@ -25,6 +30,7 @@ pub fn router(
     users: UserRepository,
     sessions: SessionRepository,
     invitations: InvitationRepository,
+    public_base_url: String,
 ) -> Router {
     let state = AppState {
         started_at,
@@ -32,6 +38,7 @@ pub fn router(
         users,
         sessions,
         invitations,
+        public_base_url,
     };
 
     Router::new()
@@ -50,6 +57,20 @@ pub fn router(
         )
         .route("/admin/users", get(admin_routes::list_users))
         .route(
+            "/admin/users/{id}/deactivate",
+            post(admin_routes::deactivate_user),
+        )
+        .route(
+            "/admin/users/{id}/reactivate",
+            post(admin_routes::reactivate_user),
+        )
+        .route("/admin/users/{id}/delete", post(admin_routes::delete_user))
+        .route("/admin/users/{id}/purge", post(admin_routes::purge_user))
+        .route(
+            "/admin/users/{id}/role",
+            post(admin_routes::change_user_role),
+        )
+        .route(
             "/admin/invites",
             get(admin_routes::list_invites).post(admin_routes::create_invite),
         )
@@ -62,6 +83,10 @@ pub fn router(
         .route(
             "/admin/sessions/{id}/revoke",
             post(admin_routes::revoke_session),
+        )
+        .route(
+            "/admin/notifications",
+            get(admin_routes::list_notifications),
         )
         .with_state(state)
         .layer(TraceLayer::new_for_http())

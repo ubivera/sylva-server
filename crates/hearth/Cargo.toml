@@ -35,6 +35,7 @@ identity = { path = "../identity" }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 authz = { path = "../authz" }
+notifications = { path = "../notifications" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
