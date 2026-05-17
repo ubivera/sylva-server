@@ -705,33 +705,37 @@ pub async fn purge_user(
 #[derive(Deserialize)]
 pub struct ChangeRoleRequest {
     pub role: InstanceRole,
+    /// Optional: if supplied and valid, bypasses the Owner-on-Owner veto
+    /// window and applies the role change immediately. Verified against
+    /// the server's active recovery code.
+    pub bypass_recovery_code: Option<String>,
+}
+
+/// Response shape covering both immediate and pending outcomes.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ChangeRoleResponse {
+    Applied(LifecycleResponse),
+    Pending(PendingTransitionView),
 }
 
 /// `POST /admin/users/{id}/role` — change a user's instance role.
 ///
-/// Owner-only. Admin callers get `403 forbidden` even though they pass
-/// the `AdminUser` extractor; managing who is an Admin is a deliberate
-/// privilege-escalation surface that we keep at the Owner level.
+/// Owner-only. Admins get `403 forbidden`.
 ///
-/// Self-targeting is blocked (which also enforces the "last Owner can't
-/// remove themselves" invariant, since a sole Owner trying to demote
-/// themselves hits this 403). Other Owners can be demoted by another
-/// Owner — multi-Owner is supported by the data model.
-///
-/// Sessions are *not* revoked on role change. The `AuthenticatedUser`
-/// extractor re-loads the user row on every request, so role updates
-/// take effect on the target's next call — promoted users gain powers
-/// immediately, demoted users lose them immediately.
+/// Behaviour by case:
+/// - Target is **not** an Owner: applies immediately. Returns 200.
+/// - Target is an Owner, no `bypass_recovery_code`: creates a pending
+///   transition with a 72-hour veto window. Returns 202.
+/// - Target is an Owner, `bypass_recovery_code` matches the active code:
+///   applies immediately, audit-marked `via: "recovery_bypass"`. Returns 200.
+/// - Target is an Owner, `bypass_recovery_code` wrong: 401.
 pub async fn change_user_role(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     Json(req): Json<ChangeRoleRequest>,
 ) -> impl IntoResponse {
-    // Owner-only — Admin gets 403. Note we intentionally do NOT use
-    // `resolve_lifecycle_target` here: its strict-outrank check would
-    // forbid Owner-on-Owner demotion (peers), which we want to allow in
-    // a multi-Owner deployment.
     if admin.0.user.instance_role != InstanceRole::Owner {
         return err(StatusCode::FORBIDDEN, "forbidden").into_response();
     }
@@ -765,43 +769,119 @@ pub async fn change_user_role(
         return err(StatusCode::CONFLICT, "already_in_role").into_response();
     }
 
+    // If target is an Owner, route through the pending flow unless the
+    // caller presents a valid recovery code.
+    let owner_on_owner = from_role == InstanceRole::Owner;
+
+    let bypass_code_id: Option<Uuid> = if owner_on_owner {
+        match &req.bypass_recovery_code {
+            Some(code) => match auth::recovery_code::verify(&state.db, code).await {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => {
+                    return err(StatusCode::UNAUTHORIZED, "invalid_recovery_code")
+                        .into_response();
+                }
+                Err(e) => {
+                    tracing::error!(?e, "verifying recovery code");
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if owner_on_owner && bypass_code_id.is_none() {
+        return enqueue_pending_role_change(&state, &admin, &target, to_role).await;
+    }
+
+    // Immediate apply path (non-Owner target, or Owner with valid bypass).
     let actor = admin.actor();
     let target_user_id = target.id;
     let target_email = target.email.clone();
+    let target_display_name = target.display_name.clone();
+    let initiator_display_name = admin.0.user.display_name.clone();
 
     let result: anyhow::Result<User> = async {
         let mut tx = state.db.begin().await?;
         let updated = UserRepository::set_instance_role(&mut tx, target_user_id, to_role).await?;
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "user_role_changed",
-            serde_json::json!({
-                "target_user_id": target_user_id.0,
-                "target_email": target_email,
-                "from_role": from_role,
-                "to_role": to_role,
-            }),
-        )
-        .await?;
+
+        if let Some(code_id) = bypass_code_id {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "recovery_code_used",
+                serde_json::json!({
+                    "code_id": code_id,
+                    "used_by": actor.user_id.0,
+                    "target_user_id": target_user_id.0,
+                    "action": "role_change",
+                }),
+            )
+            .await?;
+
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "pending_role_change_applied",
+                serde_json::json!({
+                    "transition_id": serde_json::Value::Null,
+                    "via": "recovery_bypass",
+                    "initiator_user_id": actor.user_id.0,
+                    "target_user_id": target_user_id.0,
+                    "from_role": from_role,
+                    "applied_role": to_role,
+                }),
+            )
+            .await?;
+
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingRoleChangeApplied {
+                    recipient_email: target_email.clone(),
+                    target_display_name: target_display_name.clone(),
+                    initiator_display_name: initiator_display_name.clone(),
+                    applied_role: to_role,
+                    via_recovery_bypass: true,
+                    transition_id: Uuid::nil(),
+                },
+            )
+            .await?;
+        } else {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "user_role_changed",
+                serde_json::json!({
+                    "target_user_id": target_user_id.0,
+                    "target_email": target_email,
+                    "from_role": from_role,
+                    "to_role": to_role,
+                }),
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(updated)
     }
     .await;
 
     match result {
-        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
+        Ok(u) => (
+            StatusCode::OK,
+            Json(ChangeRoleResponse::Applied(LifecycleResponse::from(u))),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!(?e, "changing user role");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────
-// /admin/notifications
-// ────────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct NotificationsQuery {
@@ -866,6 +946,427 @@ pub async fn list_notifications(
         }
         Err(e) => {
             tracing::error!(?e, "listing notifications");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct PendingTransitionView {
+    pub id: Uuid,
+    pub kind: pending::TransitionKind,
+    pub initiator_user_id: Option<Uuid>,
+    pub target_user_id: Option<Uuid>,
+    pub payload: serde_json::Value,
+    pub state: pending::TransitionState,
+    pub effective_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolved_by_user_id: Option<Uuid>,
+    pub resolution: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<pending::TransitionRow> for PendingTransitionView {
+    fn from(r: pending::TransitionRow) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            initiator_user_id: r.initiator_user_id,
+            target_user_id: r.target_user_id,
+            payload: r.payload,
+            state: r.state,
+            effective_at: r.effective_at,
+            resolved_at: r.resolved_at,
+            resolved_by_user_id: r.resolved_by_user_id,
+            resolution: r.resolution,
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// Owner-only: enqueue a pending role change. Helper for `change_user_role`.
+/// All side effects (audit, notification) commit with the pending row.
+async fn enqueue_pending_role_change(
+    state: &AppState,
+    admin: &AdminUser,
+    target: &User,
+    to_role: InstanceRole,
+) -> axum::response::Response {
+    let initiator = admin.0.user.id;
+    let initiator_display_name = admin.0.user.display_name.clone();
+    let target_user_id = target.id;
+    let target_email = target.email.clone();
+    let target_display_name = target.display_name.clone();
+    let from_role = target.instance_role;
+    let actor = admin.actor();
+    let base = state.public_base_url.clone();
+
+    let result: anyhow::Result<pending::TransitionRow> = async {
+        let mut tx = state.db.begin().await?;
+        let (transition_id, effective_at) =
+            pending::enqueue_role_change(&mut tx, initiator, target_user_id, to_role).await?;
+
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "pending_role_change_initiated",
+            serde_json::json!({
+                "transition_id": transition_id,
+                "initiator_user_id": initiator.0,
+                "target_user_id": target_user_id.0,
+                "from_role": from_role,
+                "to_role": to_role,
+                "effective_at": effective_at,
+            }),
+        )
+        .await?;
+
+        notifications::enqueue(
+            &mut tx,
+            notifications::Notification::PendingRoleChangeInitiated {
+                recipient_email: target_email,
+                target_display_name,
+                initiator_display_name,
+                from_role,
+                to_role,
+                effective_at,
+                veto_url: format!("{base}/admin/pending-transitions/{transition_id}/veto"),
+                transition_id,
+            },
+        )
+        .await?;
+
+        // Reload the row for the response.
+        let row: pending::TransitionRow = sqlx::query_as(
+            "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
+                    effective_at, resolved_at, resolved_by_user_id, resolution,
+                    created_at
+             FROM pending.transitions WHERE id = $1",
+        )
+        .bind(transition_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(row)
+    }
+    .await;
+
+    match result {
+        Ok(row) => (
+            StatusCode::ACCEPTED,
+            Json(ChangeRoleResponse::Pending(PendingTransitionView::from(row))),
+        )
+            .into_response(),
+        Err(e) => {
+            if let Some(pending_err) = e.downcast_ref::<pending::PendingError>()
+                && matches!(pending_err, pending::PendingError::PendingActionExists)
+            {
+                return err(StatusCode::CONFLICT, "pending_action_exists").into_response();
+            }
+            tracing::error!(?e, "enqueuing pending role change");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `GET /admin/pending-transitions` — every transition row, newest first.
+/// Owner or Admin can read; the actions themselves are Owner-only.
+pub async fn list_pending_transitions(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> impl IntoResponse {
+    match pending::list_all(&state.db).await {
+        Ok(rows) => {
+            let views: Vec<PendingTransitionView> =
+                rows.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(?e, "listing pending transitions");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/pending-transitions/{id}/veto` — any Owner can veto.
+pub async fn veto_pending_transition(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    if admin.0.user.instance_role != InstanceRole::Owner {
+        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    resolve_pending(&state, &admin, id, ResolveKind::Veto).await
+}
+
+/// `POST /admin/pending-transitions/{id}/cancel` — initiator or any Owner.
+pub async fn cancel_pending_transition(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    // Anyone with Admin or higher can read pending state; cancellation is
+    // restricted to Owner OR the initiator themselves (any role).
+    let row = match pending::find_by_id(&state.db, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err(StatusCode::NOT_FOUND, "transition_not_found").into_response();
+        }
+        Err(e) => {
+            tracing::error!(?e, "lookup pending transition");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+
+    let is_owner = admin.0.user.instance_role == InstanceRole::Owner;
+    let is_initiator = row.initiator_user_id == Some(admin.0.user.id.0);
+    if !is_owner && !is_initiator {
+        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+
+    resolve_pending(&state, &admin, id, ResolveKind::Cancel).await
+}
+
+#[derive(Clone, Copy)]
+enum ResolveKind {
+    Veto,
+    Cancel,
+}
+
+async fn resolve_pending(
+    state: &AppState,
+    admin: &AdminUser,
+    transition_id: Uuid,
+    kind: ResolveKind,
+) -> axum::response::Response {
+    let actor = admin.actor();
+    let by_user_id = admin.0.user.id;
+    let admin_display_name = admin.0.user.display_name.clone();
+
+    let result: anyhow::Result<pending::TransitionRow> = async {
+        let mut tx = state.db.begin().await?;
+        let row = match kind {
+            ResolveKind::Veto => pending::veto(&mut tx, transition_id, by_user_id).await?,
+            ResolveKind::Cancel => pending::cancel(&mut tx, transition_id, by_user_id).await?,
+        };
+
+        // Look up initiator + target display info for audit + notification.
+        let initiator_id = row
+            .initiator_user_id
+            .ok_or_else(|| anyhow::anyhow!("initiator_user_id is null"))?;
+        let target_id = row
+            .target_user_id
+            .ok_or_else(|| anyhow::anyhow!("target_user_id is null"))?;
+        let (initiator_email, initiator_display_name, target_display_name): (
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT
+                (SELECT email FROM identity.users WHERE id = $1),
+                (SELECT display_name FROM identity.users WHERE id = $1),
+                (SELECT display_name FROM identity.users WHERE id = $2)",
+        )
+        .bind(initiator_id)
+        .bind(target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let payload = row.role_payload()?;
+        let event_type = match kind {
+            ResolveKind::Veto => "pending_role_change_vetoed",
+            ResolveKind::Cancel => "pending_role_change_cancelled",
+        };
+
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            event_type,
+            serde_json::json!({
+                "transition_id": transition_id,
+                "initiator_user_id": initiator_id,
+                "target_user_id": target_id,
+                "to_role": payload.to_role,
+                "resolved_by": by_user_id.0,
+            }),
+        )
+        .await?;
+
+        // Notify the initiator on veto. (Skip notification for cancel —
+        // the initiator is usually the cancel-er themselves.)
+        if matches!(kind, ResolveKind::Veto) {
+            // Look up target's current role for the from_role field.
+            let from_role: InstanceRole = sqlx::query_scalar(
+                "SELECT instance_role FROM identity.users WHERE id = $1",
+            )
+            .bind(target_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingRoleChangeVetoed {
+                    recipient_email: initiator_email,
+                    initiator_display_name,
+                    target_display_name,
+                    vetoed_by_display_name: admin_display_name.clone(),
+                    from_role,
+                    to_role: payload.to_role,
+                    transition_id,
+                },
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(row)
+    }
+    .await;
+
+    match result {
+        Ok(row) => (StatusCode::OK, Json(PendingTransitionView::from(row))).into_response(),
+        Err(e) => {
+            if let Some(pe) = e.downcast_ref::<pending::PendingError>() {
+                match pe {
+                    pending::PendingError::NotFound => {
+                        return err(StatusCode::NOT_FOUND, "transition_not_found").into_response();
+                    }
+                    pending::PendingError::NotPending => {
+                        return err(StatusCode::CONFLICT, "not_pending").into_response();
+                    }
+                    _ => {}
+                }
+            }
+            tracing::error!(?e, "resolving pending transition");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /admin/server/recovery-code
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct RecoveryCodeMetadata {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub created_by_user_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct RotateRecoveryCodeRequest {
+    pub current_code: String,
+}
+
+#[derive(Serialize)]
+pub struct RotateRecoveryCodeResponse {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub new_code: String,
+    pub warning: &'static str,
+}
+
+/// `GET /admin/server/recovery-code` — Owner-only. Returns metadata only;
+/// the raw code is never exposed via this endpoint. Lets the operator
+/// confirm a code exists and was generated as expected.
+pub async fn get_recovery_code_metadata(
+    State(state): State<AppState>,
+    admin: AdminUser,
+) -> impl IntoResponse {
+    if admin.0.user.instance_role != InstanceRole::Owner {
+        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    match auth::recovery_code::active_metadata(&state.db).await {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(RecoveryCodeMetadata {
+                id: row.id,
+                created_at: row.created_at,
+                created_by_user_id: row.created_by_user_id,
+            }),
+        )
+            .into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "no_active_recovery_code").into_response(),
+        Err(e) => {
+            tracing::error!(?e, "looking up recovery code");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+/// `POST /admin/server/recovery-code/rotate` — Owner-only. Requires the
+/// current code in the body. Generates a fresh code, returns it **once**,
+/// invalidates the old one. The operator must save the returned value.
+pub async fn rotate_recovery_code(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Json(req): Json<RotateRecoveryCodeRequest>,
+) -> impl IntoResponse {
+    if admin.0.user.instance_role != InstanceRole::Owner {
+        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+
+    let by = admin.0.user.id;
+    let actor = admin.actor();
+
+    let verified = match auth::recovery_code::verify(&state.db, &req.current_code).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            return err(StatusCode::UNAUTHORIZED, "invalid_recovery_code").into_response();
+        }
+        Err(e) => {
+            tracing::error!(?e, "verifying current recovery code");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+    let _ = verified;
+
+    let new_raw = auth::recovery_code::generate_code();
+    let result: anyhow::Result<(Uuid, DateTime<Utc>)> = async {
+        let mut tx = state.db.begin().await?;
+        let (new_id, previous_id) =
+            auth::recovery_code::rotate(&mut tx, &new_raw, by).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "recovery_code_rotated",
+            serde_json::json!({
+                "new_code_id": new_id,
+                "previous_code_id": previous_id,
+                "rotated_by": by.0,
+            }),
+        )
+        .await?;
+        let created_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT created_at FROM auth.recovery_codes WHERE id = $1",
+        )
+        .bind(new_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((new_id, created_at))
+    }
+    .await;
+
+    match result {
+        Ok((id, created_at)) => (
+            StatusCode::OK,
+            Json(RotateRecoveryCodeResponse {
+                id,
+                created_at,
+                new_code: new_raw,
+                warning: "SAVE THIS CODE NOW. It will not be shown again. \
+                          The previous code is invalidated.",
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(?e, "rotating recovery code");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }

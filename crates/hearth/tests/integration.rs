@@ -18,3 +18,5 @@ mod audit_chain;
 mod auth;
 #[path = "integration/notifications.rs"]
 mod notifications;
+#[path = "integration/pending_transitions.rs"]
+mod pending_transitions;

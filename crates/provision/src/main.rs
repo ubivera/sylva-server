@@ -122,10 +122,45 @@ async fn provision_owner(config: &Config, args: &Args) -> Result<()> {
     .await
     .context("emitting owner_provisioned audit event")?;
 
+    // Generate the initial server recovery code. Owner saves this offline;
+    // it's the bypass credential for the Owner-on-Owner veto window. See
+    // docs/dev/hearth-owner-protection.md.
+    let recovery_code = auth::recovery_code::generate_code();
+    let code_id = auth::recovery_code::bootstrap(
+        &mut tx,
+        &recovery_code,
+        Some(UserId::new(user_id)),
+    )
+    .await
+    .context("bootstrapping recovery code")?;
+    audit::append(
+        &mut tx,
+        Some(&actor),
+        None,
+        "recovery_code_generated",
+        serde_json::json!({
+            "code_id": code_id,
+            "by_user_id": user_id,
+        }),
+    )
+    .await
+    .context("emitting recovery_code_generated audit event")?;
+
     tx.commit().await.context("committing transaction")?;
     pool.close().await;
 
     tracing::info!(%user_id, email = %args.email, "provisioned owner");
+    eprintln!();
+    eprintln!("====================================================================");
+    eprintln!("  SERVER RECOVERY CODE  (SAVE THIS NOW — IT WILL NOT BE SHOWN AGAIN)");
+    eprintln!("====================================================================");
+    eprintln!("  {recovery_code}");
+    eprintln!("====================================================================");
+    eprintln!("  This code bypasses the Owner-on-Owner veto window for emergency");
+    eprintln!("  cleanup. Store it offline (password manager / paper safe). You can");
+    eprintln!("  rotate it later via POST /admin/server/recovery-code/rotate.");
+    eprintln!("====================================================================");
+    eprintln!();
     Ok(())
 }
 

@@ -1,7 +1,10 @@
 CREATE SCHEMA IF NOT EXISTS notifications;
 
 CREATE TYPE notifications.outbox_kind AS ENUM (
-    'invitation'
+    'invitation',
+    'pending_role_change_initiated',
+    'pending_role_change_vetoed',
+    'pending_role_change_applied'
 );
 
 CREATE TYPE notifications.outbox_state AS ENUM (

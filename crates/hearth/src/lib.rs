@@ -77,13 +77,22 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
     let invitations = identity::InvitationRepository::new(pool.clone());
 
     let notifier = build_notifier(&config.notifications)?;
-    let worker = notifications::Worker::new(pool.clone(), notifier);
+    let notif_worker = notifications::Worker::new(pool.clone(), notifier);
     let (worker_shutdown_tx, worker_shutdown_rx) =
         tokio::sync::watch::channel::<bool>(false);
-    let worker_handle = tokio::spawn(
-        worker.run_forever(std::time::Duration::from_secs(5), worker_shutdown_rx),
+    let notif_handle = tokio::spawn(
+        notif_worker.run_forever(std::time::Duration::from_secs(5), worker_shutdown_rx.clone()),
     );
-    tracing::info!(mode = ?notifications_mode_label(&config.notifications), "notification worker started");
+    tracing::info!(
+        mode = ?notifications_mode_label(&config.notifications),
+        "notification worker started"
+    );
+
+    let pending_worker = pending::Worker::new(pool.clone());
+    let pending_handle = tokio::spawn(
+        pending_worker.run_forever(std::time::Duration::from_secs(30), worker_shutdown_rx),
+    );
+    tracing::info!("pending-transition worker started");
 
     let router = app::router(
         started_at,
@@ -105,10 +114,13 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
         .await
         .context("server error");
 
-    // Tell the worker to wind down, then await it (best-effort).
+    // Tell the workers to wind down, then await them (best-effort).
     let _ = worker_shutdown_tx.send(true);
-    if let Err(err) = worker_handle.await {
+    if let Err(err) = notif_handle.await {
         tracing::warn!(?err, "notification worker join failed");
+    }
+    if let Err(err) = pending_handle.await {
+        tracing::warn!(?err, "pending-transition worker join failed");
     }
 
     pool.close().await;

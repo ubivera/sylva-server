@@ -1,28 +1,19 @@
 [package]
-name = "hearth"
+name = "pending"
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth core server"
-
-[[bin]]
-name = "hearth"
-path = "src/main.rs"
+description = "Pending Owner-on-Owner transitions with veto window"
 
 [lib]
-name = "hearth"
 path = "src/lib.rs"
 
 [dependencies]
 tokio = { workspace = true }
-axum = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -33,20 +24,7 @@ uuid = { workspace = true }
 
 identity = { path = "../identity" }
 audit = { path = "../audit" }
-auth = { path = "../auth" }
-authz = { path = "../authz" }
 notifications = { path = "../notifications" }
-pending = { path = "../pending" }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
-
-[dev-dependencies]
-uuid = { workspace = true, features = ["v4"] }
-
-[[test]]
-name = "integration"
-path = "tests/integration.rs"
 
 [lints]
 workspace = true
