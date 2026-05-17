@@ -250,8 +250,14 @@ impl Worker {
     /// Returns the number of rows applied. Each row is processed in its
     /// own transaction so a single-row failure doesn't block the rest.
     pub async fn process_due(&self) -> Result<usize> {
-        // Claim due rows in one shot. Using `FOR UPDATE SKIP LOCKED` so
-        // multiple workers (if we ever scale out) don't trip on each other.
+        // Look at due rows. The real *claim* is the per-row UPDATE inside
+        // `apply_one` (gated on `state = 'pending'`), which is atomic at the
+        // SQL layer — two workers racing on the same row, only one's UPDATE
+        // finds the row still pending. We deliberately don't try `FOR UPDATE
+        // SKIP LOCKED` on this bare SELECT: outside a transaction the lock
+        // would be released the instant the SELECT auto-commits, providing
+        // no real concurrency protection. If we ever add a second worker,
+        // the inner UPDATE keeps us correct without help here.
         let due: Vec<TransitionRow> = sqlx::query_as(
             "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
                     effective_at, resolved_at, resolved_by_user_id, resolution,
@@ -259,7 +265,6 @@ impl Worker {
              FROM pending.transitions
              WHERE state = 'pending' AND effective_at <= now()
              ORDER BY effective_at
-             FOR UPDATE SKIP LOCKED
              LIMIT 32",
         )
         .fetch_all(&self.pool)
@@ -370,7 +375,7 @@ impl Worker {
                 initiator_display_name,
                 applied_role: payload.to_role,
                 via_recovery_bypass: false,
-                transition_id: row.id,
+                transition_id: Some(row.id),
             },
         )
         .await?;

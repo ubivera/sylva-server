@@ -846,7 +846,7 @@ pub async fn change_user_role(
                     initiator_display_name: initiator_display_name.clone(),
                     applied_role: to_role,
                     via_recovery_bypass: true,
-                    transition_id: Uuid::nil(),
+                    transition_id: None,
                 },
             )
             .await?;
@@ -1313,23 +1313,19 @@ pub async fn rotate_recovery_code(
     let by = admin.0.user.id;
     let actor = admin.actor();
 
-    let verified = match auth::recovery_code::verify(&state.db, &req.current_code).await {
-        Ok(Some(_)) => true,
-        Ok(None) => {
-            return err(StatusCode::UNAUTHORIZED, "invalid_recovery_code").into_response();
-        }
-        Err(e) => {
-            tracing::error!(?e, "verifying current recovery code");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-        }
-    };
-    let _ = verified;
-
     let new_raw = auth::recovery_code::generate_code();
-    let result: anyhow::Result<(Uuid, DateTime<Utc>)> = async {
+
+    // Verify-and-rotate happens atomically inside `auth::recovery_code::rotate`
+    // via a single conditional UPDATE — no TOCTOU window between checking the
+    // current code and replacing it.
+    let result: anyhow::Result<Option<(Uuid, DateTime<Utc>)>> = async {
         let mut tx = state.db.begin().await?;
-        let (new_id, previous_id) =
-            auth::recovery_code::rotate(&mut tx, &new_raw, by).await?;
+        let rotated =
+            auth::recovery_code::rotate(&mut tx, &req.current_code, &new_raw, by).await?;
+        let Some((new_id, previous_id)) = rotated else {
+            // Wrong current code — no rows changed; commit-or-rollback is moot.
+            return Ok(None);
+        };
         audit::append(
             &mut tx,
             Some(&actor),
@@ -1349,12 +1345,12 @@ pub async fn rotate_recovery_code(
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok((new_id, created_at))
+        Ok(Some((new_id, created_at)))
     }
     .await;
 
     match result {
-        Ok((id, created_at)) => (
+        Ok(Some((id, created_at))) => (
             StatusCode::OK,
             Json(RotateRecoveryCodeResponse {
                 id,
@@ -1365,6 +1361,7 @@ pub async fn rotate_recovery_code(
             }),
         )
             .into_response(),
+        Ok(None) => err(StatusCode::UNAUTHORIZED, "invalid_recovery_code").into_response(),
         Err(e) => {
             tracing::error!(?e, "rotating recovery code");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()

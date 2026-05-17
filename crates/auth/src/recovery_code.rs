@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{AuthError, Result};
+use crate::Result;
 
 /// 20 random bytes → 32 base32 chars × 5 bits = 160 bits of entropy. Well
 /// above the 128-bit floor for "infeasible to brute-force"; chosen because
@@ -150,33 +150,41 @@ pub async fn verify(pool: &PgPool, presented: &str) -> Result<Option<Uuid>> {
     Ok(id)
 }
 
-/// Rotate the active recovery code within the caller's transaction.
-/// Marks the existing active row as rotated (filling `rotated_at` and
-/// `rotated_by_user_id`), then inserts a fresh row with the new hash.
-/// Returns `(new_row_id, previous_row_id)`.
+/// Atomically rotate the active recovery code: verify possession of the
+/// current code and replace it in one UPDATE so a concurrent rotation
+/// can't slip between a verify and a write.
 ///
-/// Caller is responsible for verifying the *current* code first
-/// ([`verify`]); this function trusts that the operator's possession of
-/// the current code has already been proven.
+/// Returns `Ok(Some((new_id, previous_id)))` on success or `Ok(None)`
+/// when `current_raw` doesn't hash to the active code (the operator
+/// supplied the wrong current code — handler should map to 401).
 pub async fn rotate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    current_raw: &str,
     new_raw: &str,
     by_user_id: UserId,
-) -> Result<(Uuid, Uuid)> {
-    let new_hash = hash_code(new_raw);
+) -> Result<Option<(Uuid, Uuid)>> {
+    let current_hash = hash_code(current_raw);
 
-    // Mark current active row rotated; capture its id for audit.
-    let previous_id: Uuid = sqlx::query_scalar(
+    // Mark current active row rotated only if its hash matches what the
+    // caller supplied. If another rotation happened first, the WHERE
+    // clause fails and we return None — the operator has to retry with
+    // the genuinely-active code.
+    let previous_id: Option<Uuid> = sqlx::query_scalar(
         "UPDATE auth.recovery_codes
          SET rotated_at = now(), rotated_by_user_id = $1
-         WHERE rotated_at IS NULL
+         WHERE rotated_at IS NULL AND code_hash = $2
          RETURNING id",
     )
     .bind(by_user_id)
+    .bind(&current_hash[..])
     .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| AuthError::Database(sqlx::Error::RowNotFound))?;
+    .await?;
 
+    let Some(previous_id) = previous_id else {
+        return Ok(None);
+    };
+
+    let new_hash = hash_code(new_raw);
     let new_id: Uuid = sqlx::query_scalar(
         "INSERT INTO auth.recovery_codes (code_hash, created_by_user_id)
          VALUES ($1, $2)
@@ -187,7 +195,7 @@ pub async fn rotate(
     .fetch_one(&mut **tx)
     .await?;
 
-    Ok((new_id, previous_id))
+    Ok(Some((new_id, previous_id)))
 }
 
 #[cfg(test)]

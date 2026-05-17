@@ -74,14 +74,15 @@ pub enum Notification {
     },
     /// A pending role-change has been applied — either because the timer
     /// expired without a veto, or because the recovery code was used to
-    /// bypass the window.
+    /// bypass the window. `transition_id` is `None` when the action took
+    /// the bypass path (there was no pending row to reference).
     PendingRoleChangeApplied {
         recipient_email: String,
         target_display_name: String,
         initiator_display_name: String,
         applied_role: InstanceRole,
         via_recovery_bypass: bool,
-        transition_id: Uuid,
+        transition_id: Option<Uuid>,
     },
 }
 
