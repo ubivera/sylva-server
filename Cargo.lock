@@ -1211,6 +1211,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "audit",
+ "auth",
  "chrono",
  "identity",
  "notifications",

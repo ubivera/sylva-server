@@ -81,7 +81,7 @@ async fn init_shared_postgres() -> SharedPg {
 /// any startup-class (SQLSTATE 57*) failure for up to 60 seconds.
 async fn wait_for_sql_ready(port: u16) {
     let url = format!("postgresql://{SUPERUSER}@127.0.0.1:{port}/postgres");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut delay = std::time::Duration::from_millis(100);
     loop {
         let attempt = async {

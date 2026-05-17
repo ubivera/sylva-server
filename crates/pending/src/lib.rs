@@ -13,6 +13,9 @@ pub enum PendingError {
     #[error("identity error")]
     Identity(#[from] identity::IdentityError),
 
+    #[error("auth error")]
+    Auth(#[from] auth::AuthError),
+
     #[error("audit error")]
     Audit(#[from] audit::AuditError),
 
@@ -39,8 +42,8 @@ pub type Result<T> = std::result::Result<T, PendingError>;
 /// notice; short enough that legitimate revocations land within a workweek.
 pub const VETO_WINDOW: Duration = Duration::hours(72);
 
-/// Mirrors the SQL enum. Today there's only one variant; checkpoint 15b
-/// adds Deactivate / SoftDelete / HardDelete.
+/// Mirrors the SQL enum. Each kind has its own apply-side semantics in
+/// [`Worker::apply_one`].
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize,
 )]
@@ -48,6 +51,31 @@ pub const VETO_WINDOW: Duration = Duration::hours(72);
 #[serde(rename_all = "snake_case")]
 pub enum TransitionKind {
     RoleChange,
+    Deactivate,
+    SoftDelete,
+    HardDelete,
+}
+
+/// Convenience: which kinds correspond to lifecycle actions (everything
+/// except role_change). Re-exports the notifications crate's enum so
+/// both layers agree on the same type without crate-cycle gymnastics.
+pub use notifications::LifecycleAction;
+
+pub fn lifecycle_to_kind(action: LifecycleAction) -> TransitionKind {
+    match action {
+        LifecycleAction::Deactivate => TransitionKind::Deactivate,
+        LifecycleAction::SoftDelete => TransitionKind::SoftDelete,
+        LifecycleAction::HardDelete => TransitionKind::HardDelete,
+    }
+}
+
+pub fn lifecycle_from_kind(kind: TransitionKind) -> Option<LifecycleAction> {
+    match kind {
+        TransitionKind::Deactivate => Some(LifecycleAction::Deactivate),
+        TransitionKind::SoftDelete => Some(LifecycleAction::SoftDelete),
+        TransitionKind::HardDelete => Some(LifecycleAction::HardDelete),
+        TransitionKind::RoleChange => None,
+    }
 }
 
 #[derive(
@@ -114,15 +142,51 @@ pub async fn enqueue_role_change(
     target: UserId,
     to_role: InstanceRole,
 ) -> Result<(Uuid, DateTime<Utc>)> {
-    let effective_at = Utc::now() + VETO_WINDOW;
-    let payload = serde_json::json!({ "to_role": to_role });
+    enqueue_raw(
+        tx,
+        TransitionKind::RoleChange,
+        initiator,
+        target,
+        serde_json::json!({ "to_role": to_role }),
+    )
+    .await
+}
 
+/// Insert a pending lifecycle-action row (deactivate / soft_delete /
+/// hard_delete). Same caller responsibilities as
+/// [`enqueue_role_change`]. Payload is empty `{}` — the kind itself
+/// fully describes the action.
+pub async fn enqueue_lifecycle(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    initiator: UserId,
+    target: UserId,
+    action: LifecycleAction,
+) -> Result<(Uuid, DateTime<Utc>)> {
+    enqueue_raw(
+        tx,
+        lifecycle_to_kind(action),
+        initiator,
+        target,
+        serde_json::json!({}),
+    )
+    .await
+}
+
+async fn enqueue_raw(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: TransitionKind,
+    initiator: UserId,
+    target: UserId,
+    payload: serde_json::Value,
+) -> Result<(Uuid, DateTime<Utc>)> {
+    let effective_at = Utc::now() + VETO_WINDOW;
     let row: std::result::Result<(Uuid, DateTime<Utc>), sqlx::Error> = sqlx::query_as(
         "INSERT INTO pending.transitions
              (kind, initiator_user_id, target_user_id, payload, effective_at)
-         VALUES ('role_change', $1, $2, $3, $4)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING id, effective_at",
     )
+    .bind(kind)
     .bind(initiator)
     .bind(target)
     .bind(&payload)
@@ -291,6 +355,9 @@ impl Worker {
     async fn apply_one(&self, row: &TransitionRow) -> Result<()> {
         match row.kind {
             TransitionKind::RoleChange => self.apply_role_change(row).await,
+            TransitionKind::Deactivate
+            | TransitionKind::SoftDelete
+            | TransitionKind::HardDelete => self.apply_lifecycle(row).await,
         }
     }
 
@@ -382,6 +449,114 @@ impl Worker {
 
         tx.commit().await?;
         let _ = &updated;
+        Ok(())
+    }
+
+    /// Apply a lifecycle transition (deactivate / soft_delete / hard_delete).
+    /// All three follow the same transactional shape as role-change: claim
+    /// the row, apply the lifecycle change, revoke sessions, audit, enqueue
+    /// the applied-notification.
+    async fn apply_lifecycle(&self, row: &TransitionRow) -> Result<()> {
+        let action = lifecycle_from_kind(row.kind)
+            .ok_or_else(|| PendingError::BadPayload(format!("not a lifecycle kind: {:?}", row.kind)))?;
+        let target_id = row
+            .target_user_id
+            .ok_or_else(|| PendingError::BadPayload("target_user_id is null".into()))?;
+        let initiator_id = row
+            .initiator_user_id
+            .ok_or_else(|| PendingError::BadPayload("initiator_user_id is null".into()))?;
+
+        let mut tx = self.pool.begin().await?;
+
+        let claimed: Option<TransitionRow> = sqlx::query_as(
+            "UPDATE pending.transitions
+             SET state = 'applied', resolved_at = now(), resolution = 'timer'
+             WHERE id = $1 AND state = 'pending'
+             RETURNING id, kind, initiator_user_id, target_user_id, payload, state,
+                       effective_at, resolved_at, resolved_by_user_id, resolution,
+                       created_at",
+        )
+        .bind(row.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if claimed.is_none() {
+            tx.rollback().await?;
+            return Ok(());
+        }
+
+        // Capture display fields for audit + notification BEFORE any
+        // redaction (delete/purge wipe the email + display_name).
+        let (target_email, target_display_name, initiator_display_name): (String, String, String) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT email FROM identity.users WHERE id = $1),
+                    (SELECT display_name FROM identity.users WHERE id = $1),
+                    (SELECT display_name FROM identity.users WHERE id = $2)",
+            )
+            .bind(target_id)
+            .bind(initiator_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let target_user_id = identity::UserId::new(target_id);
+        let (sessions_revoked, original_email) = match action {
+            LifecycleAction::Deactivate => {
+                let _ = identity::UserRepository::deactivate(&mut tx, target_user_id).await?;
+                let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
+                (n, None::<String>)
+            }
+            LifecycleAction::SoftDelete => {
+                let (_, original) =
+                    identity::UserRepository::soft_delete(&mut tx, target_user_id).await?;
+                let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
+                auth::delete_credentials(&mut tx, target_user_id).await?;
+                (n, Some(original))
+            }
+            LifecycleAction::HardDelete => {
+                let (_, original) =
+                    identity::UserRepository::hard_delete(&mut tx, target_user_id).await?;
+                let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
+                auth::delete_credentials(&mut tx, target_user_id).await?;
+                (n, Some(original))
+            }
+        };
+
+        let actor = audit::Actor {
+            user_id: identity::UserId::new(initiator_id),
+            display_name: initiator_display_name.clone(),
+        };
+        let event_type = match action {
+            LifecycleAction::Deactivate => "user_deactivated",
+            LifecycleAction::SoftDelete => "user_deleted",
+            LifecycleAction::HardDelete => "user_purged",
+        };
+        let mut event_data = serde_json::json!({
+            "transition_id": row.id,
+            "via": "timer",
+            "initiator_user_id": initiator_id,
+            "target_user_id": target_id,
+            "sessions_revoked": sessions_revoked,
+        });
+        if let Some(orig) = &original_email {
+            event_data["redacted_from_email"] = serde_json::Value::String(orig.clone());
+        }
+        audit::append(&mut tx, Some(&actor), None, event_type, event_data).await?;
+
+        notifications::enqueue(
+            &mut tx,
+            notifications::Notification::PendingLifecycleApplied {
+                recipient_email: target_email,
+                target_display_name,
+                initiator_display_name,
+                action,
+                via_recovery_bypass: false,
+                transition_id: Some(row.id),
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 

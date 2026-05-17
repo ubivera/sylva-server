@@ -456,20 +456,148 @@ async fn resolve_lifecycle_target(
     if target.id == admin.0.user.id {
         return Err(err(StatusCode::FORBIDDEN, "cannot_target_self"));
     }
-    if !authz::outranks(admin.0.user.instance_role, target.instance_role) {
+
+    if admin.0.user.instance_role != InstanceRole::Owner
+        && !authz::outranks(admin.0.user.instance_role, target.instance_role)
+    {
         return Err(err(StatusCode::FORBIDDEN, "cannot_target_peer_or_higher"));
     }
     Ok(target)
 }
 
+/// Shared body shape for lifecycle endpoints that support recovery-code
+/// bypass (deactivate / delete / purge). Optional — callers that aren't
+/// trying to bypass send no body.
+#[derive(Deserialize, Default)]
+pub struct LifecycleActionRequest {
+    pub bypass_recovery_code: Option<String>,
+}
+
+/// Verify a presented bypass code. `None` input → `Ok(None)` (caller
+/// wasn't bypassing). Otherwise returns `Ok(Some(code_id))` on match or
+/// an error response on mismatch / internal failure.
+async fn verify_bypass_code(
+    state: &AppState,
+    code: Option<&str>,
+) -> std::result::Result<Option<Uuid>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(code) = code else { return Ok(None); };
+    match auth::recovery_code::verify(&state.db, code).await {
+        Ok(Some(id)) => Ok(Some(id)),
+        Ok(None) => Err(err(StatusCode::UNAUTHORIZED, "invalid_recovery_code")),
+        Err(e) => {
+            tracing::error!(?e, "verifying recovery code");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+fn is_owner_on_owner(admin: &AdminUser, target: &User) -> bool {
+    admin.0.user.instance_role == InstanceRole::Owner
+        && target.instance_role == InstanceRole::Owner
+}
+
+/// Enqueue a pending lifecycle transition (deactivate / delete / purge)
+/// against an Owner target. Mirrors `enqueue_pending_role_change`:
+/// transition row + audit + notification commit together.
+async fn enqueue_pending_lifecycle(
+    state: &AppState,
+    admin: &AdminUser,
+    target: &User,
+    action: notifications::LifecycleAction,
+) -> axum::response::Response {
+    let initiator = admin.0.user.id;
+    let initiator_display_name = admin.0.user.display_name.clone();
+    let target_user_id = target.id;
+    let target_email = target.email.clone();
+    let target_display_name = target.display_name.clone();
+    let actor = admin.actor();
+    let base = state.public_base_url.clone();
+
+    let event_type = match action {
+        notifications::LifecycleAction::Deactivate => "pending_deactivate_initiated",
+        notifications::LifecycleAction::SoftDelete => "pending_soft_delete_initiated",
+        notifications::LifecycleAction::HardDelete => "pending_hard_delete_initiated",
+    };
+
+    let result: anyhow::Result<pending::TransitionRow> = async {
+        let mut tx = state.db.begin().await?;
+        let (transition_id, effective_at) =
+            pending::enqueue_lifecycle(&mut tx, initiator, target_user_id, action).await?;
+
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            event_type,
+            serde_json::json!({
+                "transition_id": transition_id,
+                "initiator_user_id": initiator.0,
+                "target_user_id": target_user_id.0,
+                "action": action,
+                "effective_at": effective_at,
+            }),
+        )
+        .await?;
+
+        notifications::enqueue(
+            &mut tx,
+            notifications::Notification::PendingLifecycleInitiated {
+                recipient_email: target_email,
+                target_display_name,
+                initiator_display_name,
+                action,
+                effective_at,
+                veto_url: format!("{base}/admin/pending-transitions/{transition_id}/veto"),
+                transition_id,
+            },
+        )
+        .await?;
+
+        let row: pending::TransitionRow = sqlx::query_as(
+            "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
+                    effective_at, resolved_at, resolved_by_user_id, resolution,
+                    created_at
+             FROM pending.transitions WHERE id = $1",
+        )
+        .bind(transition_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(row)
+    }
+    .await;
+
+    match result {
+        Ok(row) => (
+            StatusCode::ACCEPTED,
+            Json(PendingTransitionView::from(row)),
+        )
+            .into_response(),
+        Err(e) => {
+            if let Some(pe) = e.downcast_ref::<pending::PendingError>()
+                && matches!(pe, pending::PendingError::PendingActionExists)
+            {
+                return err(StatusCode::CONFLICT, "pending_action_exists").into_response();
+            }
+            tracing::error!(?e, "enqueuing pending lifecycle");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
 /// `POST /admin/users/{id}/deactivate` — Active → Deactivated. Revokes
 /// every active session; credentials stay so reactivation works without a
-/// password reset.
+/// password reset. For Owner-on-Owner: routes through the 72h pending
+/// veto flow unless `bypass_recovery_code` is supplied and valid.
 pub async fn deactivate_user(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
+    body: Option<Json<LifecycleActionRequest>>,
 ) -> impl IntoResponse {
+    let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
+
     let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
         Ok(t) => t,
         Err(resp) => return resp.into_response(),
@@ -488,26 +616,77 @@ pub async fn deactivate_user(
         }
     }
 
+    let owner_on_owner = is_owner_on_owner(&admin, &target);
+    let bypass_code_id = if owner_on_owner {
+        match verify_bypass_code(&state, bypass_code.as_deref()).await {
+            Ok(id) => id,
+            Err(resp) => return resp.into_response(),
+        }
+    } else {
+        None
+    };
+    if owner_on_owner && bypass_code_id.is_none() {
+        return enqueue_pending_lifecycle(
+            &state,
+            &admin,
+            &target,
+            notifications::LifecycleAction::Deactivate,
+        )
+        .await;
+    }
+
     let actor = admin.actor();
     let target_user_id = target.id;
     let target_email = target.email.clone();
+    let target_display_name = target.display_name.clone();
+    let initiator_display_name = admin.0.user.display_name.clone();
 
     let result: anyhow::Result<User> = async {
         let mut tx = state.db.begin().await?;
         let updated = UserRepository::deactivate(&mut tx, target_user_id).await?;
         let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "user_deactivated",
-            serde_json::json!({
-                "target_user_id": target_user_id.0,
-                "target_email": target_email,
-                "sessions_revoked": revoked,
-            }),
-        )
-        .await?;
+
+        if let Some(code_id) = bypass_code_id {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "recovery_code_used",
+                serde_json::json!({
+                    "code_id": code_id,
+                    "used_by": actor.user_id.0,
+                    "target_user_id": target_user_id.0,
+                    "action": "deactivate",
+                }),
+            )
+            .await?;
+        }
+
+        let mut event_data = serde_json::json!({
+            "target_user_id": target_user_id.0,
+            "target_email": target_email,
+            "sessions_revoked": revoked,
+        });
+        if bypass_code_id.is_some() {
+            event_data["via"] = serde_json::Value::String("recovery_bypass".into());
+        }
+        audit::append(&mut tx, Some(&actor), None, "user_deactivated", event_data).await?;
+
+        if bypass_code_id.is_some() {
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingLifecycleApplied {
+                    recipient_email: target_email.clone(),
+                    target_display_name: target_display_name.clone(),
+                    initiator_display_name: initiator_display_name.clone(),
+                    action: notifications::LifecycleAction::Deactivate,
+                    via_recovery_bypass: true,
+                    transition_id: None,
+                },
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(updated)
     }
@@ -589,7 +768,10 @@ pub async fn delete_user(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
+    body: Option<Json<LifecycleActionRequest>>,
 ) -> impl IntoResponse {
+    let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
+
     let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
         Ok(t) => t,
         Err(resp) => return resp.into_response(),
@@ -605,8 +787,29 @@ pub async fn delete_user(
         }
     }
 
+    let owner_on_owner = is_owner_on_owner(&admin, &target);
+    let bypass_code_id = if owner_on_owner {
+        match verify_bypass_code(&state, bypass_code.as_deref()).await {
+            Ok(id) => id,
+            Err(resp) => return resp.into_response(),
+        }
+    } else {
+        None
+    };
+    if owner_on_owner && bypass_code_id.is_none() {
+        return enqueue_pending_lifecycle(
+            &state,
+            &admin,
+            &target,
+            notifications::LifecycleAction::SoftDelete,
+        )
+        .await;
+    }
+
     let actor = admin.actor();
     let target_user_id = target.id;
+    let target_display_name = target.display_name.clone();
+    let initiator_display_name = admin.0.user.display_name.clone();
 
     let result: anyhow::Result<u64> = async {
         let mut tx = state.db.begin().await?;
@@ -614,18 +817,48 @@ pub async fn delete_user(
             UserRepository::soft_delete(&mut tx, target_user_id).await?;
         let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
         auth::delete_credentials(&mut tx, target_user_id).await?;
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "user_deleted",
-            serde_json::json!({
-                "target_user_id": target_user_id.0,
-                "redacted_from_email": original_email,
-                "sessions_revoked": revoked,
-            }),
-        )
-        .await?;
+
+        if let Some(code_id) = bypass_code_id {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "recovery_code_used",
+                serde_json::json!({
+                    "code_id": code_id,
+                    "used_by": actor.user_id.0,
+                    "target_user_id": target_user_id.0,
+                    "action": "soft_delete",
+                }),
+            )
+            .await?;
+        }
+
+        let mut event_data = serde_json::json!({
+            "target_user_id": target_user_id.0,
+            "redacted_from_email": original_email,
+            "sessions_revoked": revoked,
+        });
+        if bypass_code_id.is_some() {
+            event_data["via"] = serde_json::Value::String("recovery_bypass".into());
+        }
+        audit::append(&mut tx, Some(&actor), None, "user_deleted", event_data).await?;
+
+        if bypass_code_id.is_some() {
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingLifecycleApplied {
+                    recipient_email: original_email.clone(),
+                    target_display_name: target_display_name.clone(),
+                    initiator_display_name: initiator_display_name.clone(),
+                    action: notifications::LifecycleAction::SoftDelete,
+                    via_recovery_bypass: true,
+                    transition_id: None,
+                },
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(revoked)
     }
@@ -649,7 +882,10 @@ pub async fn purge_user(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
+    body: Option<Json<LifecycleActionRequest>>,
 ) -> impl IntoResponse {
+    let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
+
     let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
         Ok(t) => t,
         Err(resp) => return resp.into_response(),
@@ -665,8 +901,29 @@ pub async fn purge_user(
         }
     }
 
+    let owner_on_owner = is_owner_on_owner(&admin, &target);
+    let bypass_code_id = if owner_on_owner {
+        match verify_bypass_code(&state, bypass_code.as_deref()).await {
+            Ok(id) => id,
+            Err(resp) => return resp.into_response(),
+        }
+    } else {
+        None
+    };
+    if owner_on_owner && bypass_code_id.is_none() {
+        return enqueue_pending_lifecycle(
+            &state,
+            &admin,
+            &target,
+            notifications::LifecycleAction::HardDelete,
+        )
+        .await;
+    }
+
     let actor = admin.actor();
     let target_user_id = target.id;
+    let target_display_name = target.display_name.clone();
+    let initiator_display_name = admin.0.user.display_name.clone();
     let prior_lifecycle = target.lifecycle;
 
     let result: anyhow::Result<u64> = async {
@@ -675,19 +932,49 @@ pub async fn purge_user(
             UserRepository::hard_delete(&mut tx, target_user_id).await?;
         let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
         auth::delete_credentials(&mut tx, target_user_id).await?;
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "user_purged",
-            serde_json::json!({
-                "target_user_id": target_user_id.0,
-                "redacted_from_email": original_email,
-                "prior_lifecycle": prior_lifecycle,
-                "sessions_revoked": revoked,
-            }),
-        )
-        .await?;
+
+        if let Some(code_id) = bypass_code_id {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "recovery_code_used",
+                serde_json::json!({
+                    "code_id": code_id,
+                    "used_by": actor.user_id.0,
+                    "target_user_id": target_user_id.0,
+                    "action": "hard_delete",
+                }),
+            )
+            .await?;
+        }
+
+        let mut event_data = serde_json::json!({
+            "target_user_id": target_user_id.0,
+            "redacted_from_email": original_email,
+            "prior_lifecycle": prior_lifecycle,
+            "sessions_revoked": revoked,
+        });
+        if bypass_code_id.is_some() {
+            event_data["via"] = serde_json::Value::String("recovery_bypass".into());
+        }
+        audit::append(&mut tx, Some(&actor), None, "user_purged", event_data).await?;
+
+        if bypass_code_id.is_some() {
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingLifecycleApplied {
+                    recipient_email: original_email.clone(),
+                    target_display_name: target_display_name.clone(),
+                    initiator_display_name: initiator_display_name.clone(),
+                    action: notifications::LifecycleAction::HardDelete,
+                    via_recovery_bypass: true,
+                    transition_id: None,
+                },
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(revoked)
     }
@@ -1037,7 +1324,6 @@ async fn enqueue_pending_role_change(
         )
         .await?;
 
-        // Reload the row for the response.
         let row: pending::TransitionRow = sqlx::query_as(
             "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
                     effective_at, resolved_at, resolved_by_user_id, resolution,
@@ -1175,50 +1461,68 @@ async fn resolve_pending(
         .fetch_one(&mut *tx)
         .await?;
 
-        let payload = row.role_payload()?;
-        let event_type = match kind {
-            ResolveKind::Veto => "pending_role_change_vetoed",
-            ResolveKind::Cancel => "pending_role_change_cancelled",
+        // Audit + notification details differ by kind. For role_change we
+        // include the to_role; for lifecycle kinds we include the action.
+        let is_lifecycle = pending::lifecycle_from_kind(row.kind).is_some();
+        let event_type = match (kind, is_lifecycle) {
+            (ResolveKind::Veto, false) => "pending_role_change_vetoed",
+            (ResolveKind::Cancel, false) => "pending_role_change_cancelled",
+            (ResolveKind::Veto, true) => "pending_lifecycle_vetoed",
+            (ResolveKind::Cancel, true) => "pending_lifecycle_cancelled",
         };
 
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            event_type,
-            serde_json::json!({
-                "transition_id": transition_id,
-                "initiator_user_id": initiator_id,
-                "target_user_id": target_id,
-                "to_role": payload.to_role,
-                "resolved_by": by_user_id.0,
-            }),
-        )
-        .await?;
+        let mut event_data = serde_json::json!({
+            "transition_id": transition_id,
+            "initiator_user_id": initiator_id,
+            "target_user_id": target_id,
+            "resolved_by": by_user_id.0,
+        });
+        if let Some(action) = pending::lifecycle_from_kind(row.kind) {
+            event_data["action"] = serde_json::to_value(action)?;
+        } else {
+            let payload = row.role_payload()?;
+            event_data["to_role"] = serde_json::to_value(payload.to_role)?;
+        }
+        audit::append(&mut tx, Some(&actor), None, event_type, event_data).await?;
 
         // Notify the initiator on veto. (Skip notification for cancel —
         // the initiator is usually the cancel-er themselves.)
         if matches!(kind, ResolveKind::Veto) {
-            // Look up target's current role for the from_role field.
-            let from_role: InstanceRole = sqlx::query_scalar(
-                "SELECT instance_role FROM identity.users WHERE id = $1",
-            )
-            .bind(target_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            notifications::enqueue(
-                &mut tx,
-                notifications::Notification::PendingRoleChangeVetoed {
-                    recipient_email: initiator_email,
-                    initiator_display_name,
-                    target_display_name,
-                    vetoed_by_display_name: admin_display_name.clone(),
-                    from_role,
-                    to_role: payload.to_role,
-                    transition_id,
-                },
-            )
-            .await?;
+            if let Some(action) = pending::lifecycle_from_kind(row.kind) {
+                notifications::enqueue(
+                    &mut tx,
+                    notifications::Notification::PendingLifecycleVetoed {
+                        recipient_email: initiator_email,
+                        initiator_display_name,
+                        target_display_name,
+                        vetoed_by_display_name: admin_display_name.clone(),
+                        action,
+                        transition_id,
+                    },
+                )
+                .await?;
+            } else {
+                let payload = row.role_payload()?;
+                let from_role: InstanceRole = sqlx::query_scalar(
+                    "SELECT instance_role FROM identity.users WHERE id = $1",
+                )
+                .bind(target_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                notifications::enqueue(
+                    &mut tx,
+                    notifications::Notification::PendingRoleChangeVetoed {
+                        recipient_email: initiator_email,
+                        initiator_display_name,
+                        target_display_name,
+                        vetoed_by_display_name: admin_display_name.clone(),
+                        from_role,
+                        to_role: payload.to_role,
+                        transition_id,
+                    },
+                )
+                .await?;
+            }
         }
 
         tx.commit().await?;

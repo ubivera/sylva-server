@@ -23,6 +23,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 identity = { path = "../identity" }
+auth = { path = "../auth" }
 audit = { path = "../audit" }
 notifications = { path = "../notifications" }
 

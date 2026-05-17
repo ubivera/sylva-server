@@ -532,3 +532,312 @@ async fn notifications_disabled_does_not_block_pending_flow() {
     .unwrap();
     assert_eq!(transition_state, "pending");
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Lifecycle actions (deactivate / delete / purge) on Owner targets
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn owner_on_owner_deactivate_goes_pending() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{b_id}/deactivate"),
+            Some(&a_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let body: PendingTransitionView = resp.json();
+    assert_eq!(body.kind, "deactivate");
+    assert_eq!(body.state, "pending");
+
+    // B's lifecycle is unchanged.
+    let (lifecycle,): (String,) =
+        sqlx::query_as("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "active");
+}
+
+#[tokio::test]
+async fn owner_on_owner_delete_goes_pending() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    let resp = app
+        .post(&format!("/admin/users/{b_id}/delete"), Some(&a_tok), None)
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let body: PendingTransitionView = resp.json();
+    assert_eq!(body.kind, "soft_delete");
+}
+
+#[tokio::test]
+async fn owner_on_owner_purge_goes_pending() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    let resp = app
+        .post(&format!("/admin/users/{b_id}/purge"), Some(&a_tok), None)
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let body: PendingTransitionView = resp.json();
+    assert_eq!(body.kind, "hard_delete");
+}
+
+#[tokio::test]
+async fn bypass_lifecycle_deactivate_applies_immediately() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    let recovery = app.seed_recovery_code().await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{b_id}/deactivate"),
+            Some(&a_tok),
+            Some(json!({ "bypass_recovery_code": recovery })),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+
+    let (lifecycle,): (String,) =
+        sqlx::query_as("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "deactivated");
+
+    // No pending row created.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending.transitions")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // recovery_code_used audit captured the lifecycle action.
+    let (event_data,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT event_data FROM audit.events
+         WHERE event_type = 'recovery_code_used'
+         ORDER BY seqno DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(event_data["action"].as_str(), Some("deactivate"));
+}
+
+#[tokio::test]
+async fn bypass_lifecycle_delete_applies_immediately_and_redacts() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    let recovery = app.seed_recovery_code().await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{b_id}/delete"),
+            Some(&a_tok),
+            Some(json!({ "bypass_recovery_code": recovery })),
+        )
+        .await;
+    resp.assert_status(StatusCode::NO_CONTENT);
+
+    let (email, lifecycle): (String, String) = sqlx::query_as(
+        "SELECT email, lifecycle::text FROM identity.users WHERE id = $1",
+    )
+    .bind(b_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, "soft_deleted");
+    assert!(email.starts_with("deleted+") && email.ends_with("@purged.invalid"));
+}
+
+#[tokio::test]
+async fn bypass_lifecycle_wrong_code_returns_401() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    let _ = app.seed_recovery_code().await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{b_id}/deactivate"),
+            Some(&a_tok),
+            Some(json!({ "bypass_recovery_code": "FEED-FACE-BEEF-DEAD-FEED-FACE-BEEF-DEAD" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::UNAUTHORIZED)
+        .assert_error("invalid_recovery_code");
+
+    let (lifecycle,): (String,) =
+        sqlx::query_as("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "active", "no state change on failed bypass");
+}
+
+#[tokio::test]
+async fn target_can_veto_pending_deactivate() {
+    let (app, _a_id, a_tok, b_id, b_tok) = app_with_two_owners().await;
+    let pending: PendingTransitionView = app
+        .post(
+            &format!("/admin/users/{b_id}/deactivate"),
+            Some(&a_tok),
+            None,
+        )
+        .await
+        .json();
+
+    let resp = app
+        .post(
+            &format!("/admin/pending-transitions/{}/veto", pending.id),
+            Some(&b_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: PendingTransitionView = resp.json();
+    assert_eq!(body.state, "vetoed");
+
+    // B is still active (not deactivated).
+    let (lifecycle,): (String,) =
+        sqlx::query_as("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "active");
+
+    // Initiator (A) got a PendingLifecycleVetoed notification.
+    let (kind,): (String,) = sqlx::query_as(
+        "SELECT kind::text FROM notifications.outbox
+         WHERE kind = 'pending_lifecycle_vetoed' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "pending_lifecycle_vetoed");
+}
+
+#[tokio::test]
+async fn worker_applies_due_lifecycle_deactivate() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    app.post(
+        &format!("/admin/users/{b_id}/deactivate"),
+        Some(&a_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::ACCEPTED);
+
+    sqlx::query("UPDATE pending.transitions SET effective_at = now() - interval '1 minute'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let applied = app.run_pending_transitions_once().await;
+    assert_eq!(applied, 1);
+
+    let (lifecycle,): (String,) =
+        sqlx::query_as("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "deactivated");
+}
+
+#[tokio::test]
+async fn worker_applies_due_lifecycle_delete_with_redaction() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    app.post(&format!("/admin/users/{b_id}/delete"), Some(&a_tok), None)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+
+    sqlx::query("UPDATE pending.transitions SET effective_at = now() - interval '1 minute'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let applied = app.run_pending_transitions_once().await;
+    assert_eq!(applied, 1);
+
+    let (email, lifecycle): (String, String) = sqlx::query_as(
+        "SELECT email, lifecycle::text FROM identity.users WHERE id = $1",
+    )
+    .bind(b_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, "soft_deleted");
+    assert!(email.starts_with("deleted+") && email.ends_with("@purged.invalid"));
+
+    // Credentials row gone.
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM auth.credentials WHERE user_id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn owner_can_reactivate_peer_deactivated_owner() {
+    // After 15b: a deactivated Owner can be reactivated by another Owner.
+    // Reactivate stays immediate (no pending — it's restorative).
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    // Bypass-deactivate B first so we have a deactivated Owner to act on.
+    let recovery = app.seed_recovery_code().await;
+    app.post(
+        &format!("/admin/users/{b_id}/deactivate"),
+        Some(&a_tok),
+        Some(json!({ "bypass_recovery_code": recovery })),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+
+    // Owner A reactivates Owner B (no bypass, no pending — immediate).
+    let resp = app
+        .post(
+            &format!("/admin/users/{b_id}/reactivate"),
+            Some(&a_tok),
+            None,
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+
+    let (lifecycle,): (String,) =
+        sqlx::query_as("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "active");
+}
+
+#[tokio::test]
+async fn second_owner_on_owner_lifecycle_action_is_blocked() {
+    // The "at most one pending per target" invariant covers lifecycle too.
+    let app = TestApp::new().await;
+    let a = app
+        .seed_user("a@test.local", "A", "apw", InstanceRole::Owner)
+        .await;
+    let b = app
+        .seed_user("b@test.local", "B", "bpw", InstanceRole::Owner)
+        .await;
+    let c = app
+        .seed_user("c@test.local", "C", "cpw", InstanceRole::Owner)
+        .await;
+    let a_tok = app.login(&a.email, "apw").await;
+    let c_tok = app.login(&c.email, "cpw").await;
+
+    app.post(&format!("/admin/users/{}/deactivate", b.id.0), Some(&a_tok), None)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+
+    // C tries to delete the same target while A's deactivate is in flight.
+    let resp = app
+        .post(&format!("/admin/users/{}/delete", b.id.0), Some(&c_tok), None)
+        .await;
+    resp.assert_status(StatusCode::CONFLICT)
+        .assert_error("pending_action_exists");
+}
