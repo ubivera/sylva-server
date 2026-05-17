@@ -50,7 +50,7 @@ async fn change_password_wrong_current_returns_401() {
     let (app, _user, token) = app_with_user().await;
     let resp = app
         .post(
-            "/account/password",
+            "/api/account/password",
             Some(&token),
             Some(json!({ "current_password": "wrong", "new_password": "x" })),
         )
@@ -64,7 +64,7 @@ async fn change_password_empty_new_returns_400() {
     let (app, _user, token) = app_with_user().await;
     let resp = app
         .post(
-            "/account/password",
+            "/api/account/password",
             Some(&token),
             Some(json!({ "current_password": PW, "new_password": "" })),
         )
@@ -80,7 +80,7 @@ async fn change_password_revokes_other_sessions_but_keeps_caller() {
 
     let resp = app
         .post(
-            "/account/password",
+            "/api/account/password",
             Some(&token1),
             Some(json!({ "current_password": PW, "new_password": "new-pw" })),
         )
@@ -90,26 +90,26 @@ async fn change_password_revokes_other_sessions_but_keeps_caller() {
     assert_eq!(body.sessions_revoked, 1);
 
     // token2 is now dead.
-    app.get("/me", Some(&token2))
+    app.get("/api/me", Some(&token2))
         .await
         .assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("invalid_session");
 
     // token1 (caller) still works.
-    app.get("/me", Some(&token1))
+    app.get("/api/me", Some(&token1))
         .await
         .assert_status(StatusCode::OK);
 
     // New password lets login through; old does not.
     app.post(
-        "/auth/login",
+        "/api/auth/login",
         None,
         Some(json!({ "email": user.email, "password": "new-pw" })),
     )
     .await
     .assert_status(StatusCode::OK);
     app.post(
-        "/auth/login",
+        "/api/auth/login",
         None,
         Some(json!({ "email": user.email, "password": PW })),
     )
@@ -124,7 +124,7 @@ async fn change_password_emits_audit_event() {
     app.login(&user.email, PW).await; // 2nd session so revoked count > 0
 
     app.post(
-        "/account/password",
+        "/api/account/password",
         Some(&token),
         Some(json!({ "current_password": PW, "new_password": "new" })),
     )
@@ -148,7 +148,7 @@ async fn change_password_emits_audit_event() {
 #[tokio::test]
 async fn profile_no_changes_returns_400() {
     let (app, _user, token) = app_with_user().await;
-    let resp = app.patch("/account/profile", Some(&token), Some(json!({}))).await;
+    let resp = app.patch("/api/account/profile", Some(&token), Some(json!({}))).await;
     resp.assert_status(StatusCode::BAD_REQUEST)
         .assert_error("no_changes_specified");
 }
@@ -158,7 +158,7 @@ async fn profile_whitespace_display_name_returns_400() {
     let (app, _user, token) = app_with_user().await;
     let resp = app
         .patch(
-            "/account/profile",
+            "/api/account/profile",
             Some(&token),
             Some(json!({ "display_name": "   " })),
         )
@@ -172,7 +172,7 @@ async fn profile_update_display_name() {
     let (app, user, token) = app_with_user().await;
     let resp = app
         .patch(
-            "/account/profile",
+            "/api/account/profile",
             Some(&token),
             Some(json!({ "display_name": "U Updated" })),
         )
@@ -190,7 +190,7 @@ async fn profile_update_locale_only() {
     let (app, _user, token) = app_with_user().await;
     let resp = app
         .patch(
-            "/account/profile",
+            "/api/account/profile",
             Some(&token),
             Some(json!({ "locale": "fr-FR" })),
         )
@@ -205,7 +205,7 @@ async fn profile_update_locale_only() {
 async fn profile_update_both_fields_records_only_changed_in_audit() {
     let (app, user, token) = app_with_user().await;
     app.patch(
-        "/account/profile",
+        "/api/account/profile",
         Some(&token),
         Some(json!({ "display_name": "U Person", "locale": "en-US" })),
     )
@@ -242,7 +242,7 @@ async fn sessions_list_flags_current_session() {
     let (app, user, token1) = app_with_user().await;
     let _token2 = app.login(&user.email, PW).await;
 
-    let resp = app.get("/account/sessions", Some(&token1)).await;
+    let resp = app.get("/api/account/sessions", Some(&token1)).await;
     resp.assert_status(StatusCode::OK);
     let sessions: Vec<SessionView> = resp.json();
     assert_eq!(sessions.len(), 2);
@@ -260,7 +260,7 @@ async fn revoke_own_session_succeeds_and_kills_token() {
 
     // From token2's perspective, the OTHER (non-current) session is token1.
     let sessions: Vec<SessionView> = app
-        .get("/account/sessions", Some(&token2))
+        .get("/api/account/sessions", Some(&token2))
         .await
         .json();
     let other_id = sessions
@@ -271,7 +271,7 @@ async fn revoke_own_session_succeeds_and_kills_token() {
 
     let revoke = app
         .post(
-            &format!("/account/sessions/{other_id}/revoke"),
+            &format!("/api/account/sessions/{other_id}/revoke"),
             Some(&token2),
             None,
         )
@@ -279,11 +279,11 @@ async fn revoke_own_session_succeeds_and_kills_token() {
     revoke.assert_status(StatusCode::NO_CONTENT);
 
     // token1 (the revoked one) is dead.
-    app.get("/me", Some(&token1))
+    app.get("/api/me", Some(&token1))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
     // token2 (the revoker) still works.
-    app.get("/me", Some(&token2))
+    app.get("/api/me", Some(&token2))
         .await
         .assert_status(StatusCode::OK);
 }
@@ -302,7 +302,7 @@ async fn revoke_another_users_session_returns_404() {
 
     // Get bob's session id.
     let bob_sessions: Vec<SessionView> = app
-        .get("/account/sessions", Some(&bob_token))
+        .get("/api/account/sessions", Some(&bob_token))
         .await
         .json();
     let bob_session_id = bob_sessions[0].id;
@@ -310,7 +310,7 @@ async fn revoke_another_users_session_returns_404() {
     // Alice tries to revoke it.
     let resp = app
         .post(
-            &format!("/account/sessions/{bob_session_id}/revoke"),
+            &format!("/api/account/sessions/{bob_session_id}/revoke"),
             Some(&alice_token),
             None,
         )
@@ -319,7 +319,7 @@ async fn revoke_another_users_session_returns_404() {
         .assert_error("session_not_found");
 
     // Bob's session is still alive.
-    app.get("/me", Some(&bob_token))
+    app.get("/api/me", Some(&bob_token))
         .await
         .assert_status(StatusCode::OK);
 }
@@ -329,7 +329,7 @@ async fn revoke_nonexistent_session_returns_404() {
     let (app, _user, token) = app_with_user().await;
     let fake = Uuid::new_v4();
     let resp = app
-        .post(&format!("/account/sessions/{fake}/revoke"), Some(&token), None)
+        .post(&format!("/api/account/sessions/{fake}/revoke"), Some(&token), None)
         .await;
     resp.assert_status(StatusCode::NOT_FOUND)
         .assert_error("session_not_found");
@@ -364,7 +364,7 @@ async fn activity_scopes_to_caller() {
     // Bob does things too — those must NOT appear in Alice's feed.
     let _ = app.login("b@test.local", "bp").await;
 
-    let resp = app.get("/account/activity", Some(&a_token)).await;
+    let resp = app.get("/api/account/activity", Some(&a_token)).await;
     resp.assert_status(StatusCode::OK);
     let body: PaginatedActivity = resp.json();
     assert!(!body.items.is_empty());

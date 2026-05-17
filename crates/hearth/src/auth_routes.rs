@@ -163,6 +163,28 @@ impl AuthenticatedUser {
     }
 }
 
+/// Name of the cookie carrying the session token for browser clients.
+/// API clients still use `Authorization: Bearer <token>`; the extractor
+/// accepts either.
+pub const SESSION_COOKIE_NAME: &str = "hearth_session";
+
+/// Pull a named cookie's value out of the `Cookie` request header.
+/// Returns `None` when the header is missing, unparseable, or the named
+/// cookie isn't present.
+pub fn extract_cookie(parts: &Parts, name: &str) -> Option<String> {
+    let header = parts.headers.get(axum::http::header::COOKIE)?;
+    let s = header.to_str().ok()?;
+    for kv in s.split(';') {
+        let kv = kv.trim();
+        if let Some(rest) = kv.strip_prefix(name)
+            && let Some(value) = rest.strip_prefix('=')
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 impl FromRequestParts<AppState> for AuthenticatedUser {
     type Rejection = (StatusCode, Json<ErrorResponse>);
 
@@ -170,16 +192,14 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let header = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| unauthorized("missing_authorization"))?;
-
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| unauthorized("missing_bearer_prefix"))?
-            .trim();
+        // Try `Authorization: Bearer <token>` first (API clients), fall back
+        // to the `hearth_session` cookie (browser clients). Both reference
+        // the same session row.
+        let token = bearer_token(parts).or_else(|| extract_cookie(parts, SESSION_COOKIE_NAME));
+        let Some(token) = token else {
+            return Err(unauthorized("missing_authorization"));
+        };
+        let token = token.trim();
         if token.is_empty() {
             return Err(unauthorized("empty_token"));
         }
@@ -209,6 +229,15 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             user,
         })
     }
+}
+
+/// Extract the bearer token from the `Authorization` header, if present.
+fn bearer_token(parts: &Parts) -> Option<String> {
+    let header = parts.headers.get(AUTHORIZATION)?.to_str().ok()?;
+    header
+        .strip_prefix("Bearer ")
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Axum extractor that requires an authenticated user *and* at least the

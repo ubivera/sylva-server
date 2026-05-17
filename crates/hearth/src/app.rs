@@ -24,6 +24,10 @@ pub struct AppState {
     pub public_base_url: String,
 }
 
+/// Convenience used by the integration test harness. Constructs the
+/// shared [`AppState`] and returns the JSON API surface nested under
+/// `/api`. Production composition happens in
+/// [`crate::run`] and composes a UI router alongside this.
 pub fn router(
     started_at: Instant,
     db: PgPool,
@@ -41,8 +45,22 @@ pub fn router(
         public_base_url,
     };
 
-    Router::new()
+    let health = Router::new()
         .route("/health", get(health::handler))
+        .with_state(state.clone());
+
+    Router::new()
+        .nest("/api", api_router(state))
+        .merge(health)
+        .layer(TraceLayer::new_for_http())
+}
+
+/// Build the JSON API router with state already applied. Returned with
+/// **no path prefix** — callers nest it (e.g. under `/api`) themselves.
+/// `/health` is intentionally not here; it lives at the root because
+/// it's an ops endpoint, not part of the API.
+pub fn api_router(state: AppState) -> Router {
+    Router::new()
         .route("/auth/login", post(auth_routes::login))
         .route("/auth/logout", post(auth_routes::logout))
         .route("/auth/accept-invite", post(auth_routes::accept_invite))
@@ -109,5 +127,4 @@ pub fn router(
             post(admin_routes::rotate_recovery_code),
         )
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
 }

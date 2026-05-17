@@ -264,14 +264,28 @@ impl TestApp {
         let users = UserRepository::new(pool.clone());
         let sessions = SessionRepository::new(pool.clone());
         let invitations = InvitationRepository::new(pool.clone());
-        let router = app::router(
-            Instant::now(),
-            pool.clone(),
+
+        // Compose the same shape as production: API under `/api`, the web
+        // UI at root, plus `/health`. Mirrors the composition in
+        // `hearth::serve` and `web::ui_router`.
+        let app_state = app::AppState {
+            started_at: Instant::now(),
+            db: pool.clone(),
             users,
             sessions,
             invitations,
-            "http://127.0.0.1:8443".to_string(),
-        );
+            public_base_url: "http://127.0.0.1:8443".to_string(),
+        };
+        let health = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(hearth::health::handler),
+            )
+            .with_state(app_state.clone());
+        let router = Router::new()
+            .nest("/api", app::api_router(app_state.clone()))
+            .merge(web::ui_router(app_state))
+            .merge(health);
 
         let worker =
             notifications::Worker::new(pool.clone(), notifications::NotifierImpl::Log);
@@ -387,11 +401,11 @@ impl TestApp {
         }
     }
 
-    /// Hit `/auth/login` and return the bearer token. Panics on non-200.
+    /// Hit `/api/auth/login` and return the bearer token. Panics on non-200.
     pub async fn login(&self, email: &str, password: &str) -> String {
         let resp = self
             .post(
-                "/auth/login",
+                "/api/auth/login",
                 None,
                 Some(serde_json::json!({ "email": email, "password": password })),
             )

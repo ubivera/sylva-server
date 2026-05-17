@@ -6,11 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth core server"
-
-[[bin]]
-name = "hearth"
-path = "src/main.rs"
+description = "Sylva Hearth API library (state, extractors, handlers for /api/*)"
 
 [lib]
 name = "hearth"
@@ -43,6 +39,7 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+web = { path = "../web" }
 
 [[test]]
 name = "integration"

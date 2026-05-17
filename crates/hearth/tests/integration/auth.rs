@@ -31,7 +31,7 @@ async fn login_success_returns_token_and_user_id() {
     let (app, owner) = app_with_owner().await;
     let resp = app
         .post(
-            "/auth/login",
+            "/api/auth/login",
             None,
             Some(json!({ "email": owner.email, "password": OWNER_PW })),
         )
@@ -47,7 +47,7 @@ async fn login_wrong_password_returns_generic_401() {
     let (app, owner) = app_with_owner().await;
     let resp = app
         .post(
-            "/auth/login",
+            "/api/auth/login",
             None,
             Some(json!({ "email": owner.email, "password": "wrong" })),
         )
@@ -61,7 +61,7 @@ async fn login_unknown_email_returns_same_generic_401() {
     let app = TestApp::new().await;
     let resp = app
         .post(
-            "/auth/login",
+            "/api/auth/login",
             None,
             Some(json!({ "email": "nope@test.local", "password": "whatever" })),
         )
@@ -84,7 +84,7 @@ async fn login_deactivated_user_treated_as_unknown() {
 
     let resp = app
         .post(
-            "/auth/login",
+            "/api/auth/login",
             None,
             Some(json!({ "email": user.email, "password": user.password })),
         )
@@ -97,7 +97,7 @@ async fn login_deactivated_user_treated_as_unknown() {
 async fn me_returns_caller_identity() {
     let (app, owner) = app_with_owner().await;
     let token = app.login(&owner.email, OWNER_PW).await;
-    let resp = app.get("/me", Some(&token)).await;
+    let resp = app.get("/api/me", Some(&token)).await;
     resp.assert_status(StatusCode::OK);
     let body: MeBody = resp.json();
     assert_eq!(body.id, owner.id.0);
@@ -109,7 +109,7 @@ async fn me_returns_caller_identity() {
 #[tokio::test]
 async fn me_without_token_is_unauthorized() {
     let app = TestApp::new().await;
-    let resp = app.get("/me", None).await;
+    let resp = app.get("/api/me", None).await;
     resp.assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("missing_authorization");
 }
@@ -117,7 +117,7 @@ async fn me_without_token_is_unauthorized() {
 #[tokio::test]
 async fn me_with_garbage_token_is_unauthorized() {
     let app = TestApp::new().await;
-    let resp = app.get("/me", Some("not-a-real-token")).await;
+    let resp = app.get("/api/me", Some("not-a-real-token")).await;
     resp.assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("invalid_session");
 }
@@ -128,7 +128,7 @@ async fn me_with_non_bearer_scheme_is_unauthorized() {
     let app = TestApp::new().await;
     let req = axum::http::Request::builder()
         .method(axum::http::Method::GET)
-        .uri("/me")
+        .uri("/api/me")
         .header(AUTHORIZATION, "Basic abc123")
         .body(axum::body::Body::empty())
         .unwrap();
@@ -143,11 +143,11 @@ async fn logout_revokes_the_session() {
     let (app, owner) = app_with_owner().await;
     let token = app.login(&owner.email, OWNER_PW).await;
 
-    let logout = app.post("/auth/logout", Some(&token), None).await;
+    let logout = app.post("/api/auth/logout", Some(&token), None).await;
     logout.assert_status(StatusCode::NO_CONTENT);
 
     // Same token must no longer work.
-    let me = app.get("/me", Some(&token)).await;
+    let me = app.get("/api/me", Some(&token)).await;
     me.assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("invalid_session");
 }
@@ -180,7 +180,7 @@ async fn accept_invite_creates_user_and_issues_session() {
 
     let resp = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -194,7 +194,7 @@ async fn accept_invite_creates_user_and_issues_session() {
     assert!(!body.token.is_empty());
 
     // The returned session should authenticate.
-    let me: MeBody = app.get("/me", Some(&body.token)).await.json();
+    let me: MeBody = app.get("/api/me", Some(&body.token)).await.json();
     assert_eq!(me.email, "alice@test.local");
     assert_eq!(me.instance_role, InstanceRole::User);
 }
@@ -204,7 +204,7 @@ async fn accept_invite_rejects_invalid_token() {
     let app = TestApp::new().await;
     let resp = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": "deadbeef".repeat(8),
@@ -232,7 +232,7 @@ async fn accept_invite_rejects_expired_token() {
 
     let resp = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -259,7 +259,7 @@ async fn accept_invite_rejects_revoked_token() {
 
     let resp = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -281,7 +281,7 @@ async fn accept_invite_rejects_already_accepted_token() {
     // First accept succeeds.
     let first = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -295,7 +295,7 @@ async fn accept_invite_rejects_already_accepted_token() {
     // Second accept with the same token must fail.
     let second = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -317,7 +317,7 @@ async fn accept_invite_validates_display_name_and_password() {
 
     let r1 = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -331,7 +331,7 @@ async fn accept_invite_validates_display_name_and_password() {
 
     let r2 = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -357,7 +357,7 @@ async fn accept_invite_assigns_role_from_invitation() {
 
     let resp = app
         .post(
-            "/auth/accept-invite",
+            "/api/auth/accept-invite",
             None,
             Some(json!({
                 "token": token,
@@ -369,7 +369,7 @@ async fn accept_invite_assigns_role_from_invitation() {
     resp.assert_status(StatusCode::CREATED);
     let body: LoginBody = resp.json();
 
-    let me: MeBody = app.get("/me", Some(&body.token)).await.json();
+    let me: MeBody = app.get("/api/me", Some(&body.token)).await.json();
     assert_eq!(me.instance_role, InstanceRole::Admin);
 }
 

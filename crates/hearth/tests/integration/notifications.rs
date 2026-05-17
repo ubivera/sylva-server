@@ -47,7 +47,7 @@ async fn creating_an_invitation_enqueues_a_notification() {
 
     let inv: CreateInviteResp = app
         .post(
-            "/admin/invites",
+            "/api/admin/invites",
             Some(&owner_tok),
             Some(json!({ "email": "alice@test.local" })),
         )
@@ -55,7 +55,7 @@ async fn creating_an_invitation_enqueues_a_notification() {
         .json();
 
     let rows: Vec<NotificationView> = app
-        .get("/admin/notifications", Some(&owner_tok))
+        .get("/api/admin/notifications", Some(&owner_tok))
         .await
         .json();
     assert_eq!(rows.len(), 1, "exactly one outbox row should exist");
@@ -76,7 +76,7 @@ async fn worker_marks_pending_rows_as_sent_in_log_mode() {
     let (app, _, owner_tok) = app_with_owner_token().await;
 
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "b@test.local" })),
     )
@@ -87,7 +87,7 @@ async fn worker_marks_pending_rows_as_sent_in_log_mode() {
     assert_eq!(processed, 1);
 
     let rows: Vec<NotificationView> = app
-        .get("/admin/notifications", Some(&owner_tok))
+        .get("/api/admin/notifications", Some(&owner_tok))
         .await
         .json();
     assert_eq!(rows[0].state, "sent");
@@ -102,7 +102,7 @@ async fn transient_failure_schedules_retry_with_backoff() {
     ));
 
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "c@test.local" })),
     )
@@ -135,7 +135,7 @@ async fn exhausted_retries_mark_row_dead() {
     app.set_notifier(notifications::NotifierImpl::AlwaysFail("perma".to_string()));
 
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "d@test.local" })),
     )
@@ -169,7 +169,7 @@ async fn disabled_notifier_marks_rows_as_skipped() {
     app.set_notifier(notifications::NotifierImpl::Disabled);
 
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "e@test.local" })),
     )
@@ -191,7 +191,7 @@ async fn admin_notifications_supports_state_filter() {
     let (app, _, owner_tok) = app_with_owner_token().await;
     // First invite — let it succeed via log notifier.
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "first@test.local" })),
     )
@@ -199,21 +199,21 @@ async fn admin_notifications_supports_state_filter() {
     app.run_notifications_once().await;
     // Second invite — leave it pending (don't run the worker for it).
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "second@test.local" })),
     )
     .await;
 
     let sent: Vec<NotificationView> = app
-        .get("/admin/notifications?state=sent", Some(&owner_tok))
+        .get("/api/admin/notifications?state=sent", Some(&owner_tok))
         .await
         .json();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].recipient_email, "first@test.local");
 
     let pending: Vec<NotificationView> = app
-        .get("/admin/notifications?state=pending", Some(&owner_tok))
+        .get("/api/admin/notifications?state=pending", Some(&owner_tok))
         .await
         .json();
     assert_eq!(pending.len(), 1);
@@ -228,7 +228,7 @@ async fn non_admin_cannot_list_notifications() {
         .await;
     let tok = app.login(&user.email, "pw").await;
 
-    let resp = app.get("/admin/notifications", Some(&tok)).await;
+    let resp = app.get("/api/admin/notifications", Some(&tok)).await;
     resp.assert_status(StatusCode::FORBIDDEN);
 }
 
@@ -241,7 +241,7 @@ async fn outbox_subject_contains_inviter_name_and_role() {
     let owner_tok = app.login(&owner.email, OWNER_PW).await;
 
     app.post(
-        "/admin/invites",
+        "/api/admin/invites",
         Some(&owner_tok),
         Some(json!({ "email": "newcomer@test.local", "instance_role": "admin" })),
     )
