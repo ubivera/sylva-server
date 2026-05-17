@@ -179,6 +179,29 @@ impl UserRepository {
         Ok(users)
     }
 
+    /// Set a user's `instance_role` within the caller's transaction.
+    /// Bumps `updated_at`. The caller is responsible for the authz check
+    /// (only Owner can change roles) and for refusing same-role no-ops
+    /// before reaching here.
+    pub async fn set_instance_role(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+        new_role: InstanceRole,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET instance_role = $2, updated_at = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(new_role)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
+    }
+
     /// Partial profile update within the caller's transaction. Each `Some`
     /// field is written; `None` leaves the existing value alone (treated
     /// as "no change", not "set to NULL"). Returns the post-update row.

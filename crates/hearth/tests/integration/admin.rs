@@ -1018,3 +1018,250 @@ async fn deactivate_revokes_all_sessions() {
     .unwrap();
     assert_eq!(event_data["sessions_revoked"].as_u64(), Some(3));
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// /admin/users/{id}/role tests
+// ────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn owner_promotes_user_to_admin() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let target = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", target.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "admin" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: LifecycleBody = resp.json();
+    assert_eq!(body.instance_role, InstanceRole::Admin);
+
+    // /me as that user now reflects the new role.
+    let user_tok = app.login(&target.email, "pw").await;
+    let me: serde_json::Value = app.get("/me", Some(&user_tok)).await.json();
+    assert_eq!(me["instance_role"].as_str(), Some("admin"));
+}
+
+#[tokio::test]
+async fn owner_demotes_admin_to_user() {
+    let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", admin.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "user" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: LifecycleBody = resp.json();
+    assert_eq!(body.instance_role, InstanceRole::User);
+
+    // Audit recorded both ends.
+    let (event_data,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT event_data FROM audit.events
+         WHERE event_type = 'user_role_changed'
+         ORDER BY seqno DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(event_data["from_role"].as_str(), Some("admin"));
+    assert_eq!(event_data["to_role"].as_str(), Some("user"));
+}
+
+#[tokio::test]
+async fn owner_can_promote_admin_to_owner_multi_owner() {
+    let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", admin.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "owner" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: LifecycleBody = resp.json();
+    assert_eq!(body.instance_role, InstanceRole::Owner);
+
+    let owner_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM identity.users WHERE instance_role = 'owner'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(owner_count, 2, "multi-owner should be allowed");
+}
+
+#[tokio::test]
+async fn owner_can_demote_another_owner() {
+    // Multi-Owner setup: O1 (original) promotes A → O2, then O1 demotes O2.
+    let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+    app.post(
+        &format!("/admin/users/{}/role", admin.id.0),
+        Some(&owner_tok),
+        Some(json!({ "role": "owner" })),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+
+    // O1 demotes O2 back to admin.
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", admin.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "admin" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+    let body: LifecycleBody = resp.json();
+    assert_eq!(body.instance_role, InstanceRole::Admin);
+}
+
+#[tokio::test]
+async fn admin_cannot_change_roles() {
+    let (app, _owner, _owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
+    let target = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", target.id.0),
+            Some(&admin_tok),
+            Some(json!({ "role": "admin" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::FORBIDDEN)
+        .assert_error("forbidden");
+}
+
+#[tokio::test]
+async fn regular_user_cannot_change_roles() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("owner@test.local", "Owner", "ownerpw", InstanceRole::Owner)
+        .await;
+    let user = app
+        .seed_user("u@test.local", "U", "upw", InstanceRole::User)
+        .await;
+    let user_tok = app.login(&user.email, "upw").await;
+
+    // The AdminUser extractor itself returns 403 here.
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", owner.id.0),
+            Some(&user_tok),
+            Some(json!({ "role": "admin" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn change_role_blocks_self_target() {
+    let (app, owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", owner.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "admin" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::FORBIDDEN)
+        .assert_error("cannot_target_self");
+}
+
+#[tokio::test]
+async fn change_role_same_role_returns_409() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let target = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .await;
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", target.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "user" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::CONFLICT)
+        .assert_error("already_in_role");
+}
+
+#[tokio::test]
+async fn change_role_on_deleted_user_returns_404() {
+    let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
+    let target = app
+        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
+        .await;
+
+    // Soft-delete first.
+    app.post(
+        &format!("/admin/users/{}/delete", target.id.0),
+        Some(&owner_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    let resp = app
+        .post(
+            &format!("/admin/users/{}/role", target.id.0),
+            Some(&owner_tok),
+            Some(json!({ "role": "admin" })),
+        )
+        .await;
+    resp.assert_status(StatusCode::NOT_FOUND)
+        .assert_error("user_not_found");
+}
+
+#[tokio::test]
+async fn demoted_owner_loses_powers_on_next_request() {
+    // Owner1 promotes Admin to Owner2, Owner2 makes an admin-level call
+    // successfully, then Owner1 demotes Owner2 to User and Owner2's next
+    // admin call fails with 403.
+    let (app, _owner1, owner1_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+    app.post(
+        &format!("/admin/users/{}/role", admin.id.0),
+        Some(&owner1_tok),
+        Some(json!({ "role": "owner" })),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+
+    // Owner2 logs in.
+    let owner2_tok = app.login(&admin.email, "adminpw").await;
+
+    // Owner2 hits an admin route successfully.
+    app.get("/admin/users", Some(&owner2_tok))
+        .await
+        .assert_status(StatusCode::OK);
+
+    // Owner1 demotes Owner2 all the way to User.
+    app.post(
+        &format!("/admin/users/{}/role", admin.id.0),
+        Some(&owner1_tok),
+        Some(json!({ "role": "user" })),
+    )
+    .await
+    .assert_status(StatusCode::OK);
+
+    // Owner2's existing session is still authenticated (no revocation),
+    // but the AdminUser extractor now 403's them.
+    let me = app.get("/me", Some(&owner2_tok)).await;
+    me.assert_status(StatusCode::OK);
+    let me_body: serde_json::Value = me.json();
+    assert_eq!(me_body["instance_role"].as_str(), Some("user"));
+
+    app.get("/admin/users", Some(&owner2_tok))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+}

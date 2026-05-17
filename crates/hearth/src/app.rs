@@ -60,6 +60,10 @@ pub fn router(
         .route("/admin/users/{id}/delete", post(admin_routes::delete_user))
         .route("/admin/users/{id}/purge", post(admin_routes::purge_user))
         .route(
+            "/admin/users/{id}/role",
+            post(admin_routes::change_user_role),
+        )
+        .route(
             "/admin/invites",
             get(admin_routes::list_invites).post(admin_routes::create_invite),
         )

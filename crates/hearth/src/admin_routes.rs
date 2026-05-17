@@ -679,3 +679,100 @@ pub async fn purge_user(
         }
     }
 }
+
+#[derive(Deserialize)]
+pub struct ChangeRoleRequest {
+    pub role: InstanceRole,
+}
+
+/// `POST /admin/users/{id}/role` — change a user's instance role.
+///
+/// Owner-only. Admin callers get `403 forbidden` even though they pass
+/// the `AdminUser` extractor; managing who is an Admin is a deliberate
+/// privilege-escalation surface that we keep at the Owner level.
+///
+/// Self-targeting is blocked (which also enforces the "last Owner can't
+/// remove themselves" invariant, since a sole Owner trying to demote
+/// themselves hits this 403). Other Owners can be demoted by another
+/// Owner — multi-Owner is supported by the data model.
+///
+/// Sessions are *not* revoked on role change. The `AuthenticatedUser`
+/// extractor re-loads the user row on every request, so role updates
+/// take effect on the target's next call — promoted users gain powers
+/// immediately, demoted users lose them immediately.
+pub async fn change_user_role(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(target_id): Path<Uuid>,
+    Json(req): Json<ChangeRoleRequest>,
+) -> impl IntoResponse {
+    // Owner-only — Admin gets 403. Note we intentionally do NOT use
+    // `resolve_lifecycle_target` here: its strict-outrank check would
+    // forbid Owner-on-Owner demotion (peers), which we want to allow in
+    // a multi-Owner deployment.
+    if admin.0.user.instance_role != InstanceRole::Owner {
+        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+
+    let target = match state.users.find_any(UserId::new(target_id)).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "user_not_found").into_response(),
+        Err(e) => {
+            tracing::error!(?e, "lookup target user");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
+        }
+    };
+
+    if target.id == admin.0.user.id {
+        return err(StatusCode::FORBIDDEN, "cannot_target_self").into_response();
+    }
+
+    match target.lifecycle {
+        UserLifecycle::Active | UserLifecycle::Deactivated => {}
+        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        }
+        UserLifecycle::PendingInvite => {
+            return err(StatusCode::CONFLICT, "not_active").into_response();
+        }
+    }
+
+    let from_role = target.instance_role;
+    let to_role = req.role;
+    if from_role == to_role {
+        return err(StatusCode::CONFLICT, "already_in_role").into_response();
+    }
+
+    let actor = admin.actor();
+    let target_user_id = target.id;
+    let target_email = target.email.clone();
+
+    let result: anyhow::Result<User> = async {
+        let mut tx = state.db.begin().await?;
+        let updated = UserRepository::set_instance_role(&mut tx, target_user_id, to_role).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "user_role_changed",
+            serde_json::json!({
+                "target_user_id": target_user_id.0,
+                "target_email": target_email,
+                "from_role": from_role,
+                "to_role": to_role,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+    .await;
+
+    match result {
+        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
+        Err(e) => {
+            tracing::error!(?e, "changing user role");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
