@@ -11,6 +11,7 @@ use identity::{
     DEFAULT_INVITATION_TTL, InstanceRole, InvitationId, InvitationRepository, User, UserId,
     UserLifecycle, UserRepository,
 };
+use notifications::{OutboxRow, OutboxState};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -137,6 +138,8 @@ pub async fn create_invite(
     }
 
     let actor = admin.actor();
+    let inviter_display_name = admin.0.user.display_name.clone();
+    let base = state.public_base_url.clone();
     let result: anyhow::Result<CreateInviteResponse> = async {
         let mut tx = state.db.begin().await?;
         let (invitation, token) = InvitationRepository::create(
@@ -160,12 +163,31 @@ pub async fn create_invite(
             }),
         )
         .await?;
+
+        // Enqueue the delivery email in the same transaction so we never
+        // create an invitation without queuing its email (or vice versa).
+        let full_accept_url = format!("{base}/invite/{token}");
+        notifications::enqueue(
+            &mut tx,
+            notifications::Notification::Invitation {
+                recipient_email: invitation.email.clone(),
+                inviter_display_name: inviter_display_name.clone(),
+                accept_url: full_accept_url.clone(),
+                expires_at: invitation.expires_at,
+                instance_role: invitation.instance_role,
+                invitation_id: invitation.id.0,
+            },
+        )
+        .await?;
+
         tx.commit().await?;
 
         Ok(CreateInviteResponse {
             invitation_id: invitation.id.0,
             email: invitation.email,
             instance_role: invitation.instance_role,
+            // The relative path is kept for back-compat in case any caller
+            // depends on it; the email contains the full URL via base_url.
             accept_url: format!("/invite/{token}"),
             token,
             expires_at: invitation.expires_at,
@@ -772,6 +794,78 @@ pub async fn change_user_role(
         Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
         Err(e) => {
             tracing::error!(?e, "changing user role");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /admin/notifications
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct NotificationsQuery {
+    pub state: Option<OutboxState>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct NotificationView {
+    pub id: Uuid,
+    pub kind: notifications::OutboxKind,
+    pub recipient_email: String,
+    pub subject: String,
+    pub state: OutboxState,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub next_attempt_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub payload: serde_json::Value,
+}
+
+impl From<OutboxRow> for NotificationView {
+    fn from(r: OutboxRow) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            recipient_email: r.recipient_email,
+            subject: r.subject,
+            state: r.state,
+            attempts: r.attempts,
+            last_error: r.last_error,
+            next_attempt_at: r.next_attempt_at,
+            created_at: r.created_at,
+            sent_at: r.sent_at,
+            payload: r.payload,
+        }
+    }
+}
+
+const NOTIFICATIONS_DEFAULT_LIMIT: u32 = 50;
+const NOTIFICATIONS_MAX_LIMIT: u32 = 200;
+
+/// `GET /admin/notifications` — recent outbox rows, newest first.
+/// Optional `?state=pending|sending|sent|failed|dead|skipped` filter and
+/// `?limit=N` (clamped to [1, 200], default 50). Body and HTML are
+/// intentionally excluded from this view to keep responses small; the
+/// subject and recipient give an admin enough to debug delivery.
+pub async fn list_notifications(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Query(q): Query<NotificationsQuery>,
+) -> impl IntoResponse {
+    let limit = q
+        .limit
+        .unwrap_or(NOTIFICATIONS_DEFAULT_LIMIT)
+        .clamp(1, NOTIFICATIONS_MAX_LIMIT);
+    match notifications::list(&state.db, q.state, limit).await {
+        Ok(rows) => {
+            let views: Vec<NotificationView> = rows.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(?e, "listing notifications");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }

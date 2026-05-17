@@ -75,7 +75,24 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
     let users = identity::UserRepository::new(pool.clone());
     let sessions = auth::SessionRepository::new(pool.clone());
     let invitations = identity::InvitationRepository::new(pool.clone());
-    let router = app::router(started_at, pool.clone(), users, sessions, invitations);
+
+    let notifier = build_notifier(&config.notifications)?;
+    let worker = notifications::Worker::new(pool.clone(), notifier);
+    let (worker_shutdown_tx, worker_shutdown_rx) =
+        tokio::sync::watch::channel::<bool>(false);
+    let worker_handle = tokio::spawn(
+        worker.run_forever(std::time::Duration::from_secs(5), worker_shutdown_rx),
+    );
+    tracing::info!(mode = ?notifications_mode_label(&config.notifications), "notification worker started");
+
+    let router = app::router(
+        started_at,
+        pool.clone(),
+        users,
+        sessions,
+        invitations,
+        config.public_base_url.clone(),
+    );
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
@@ -88,7 +105,46 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
         .await
         .context("server error");
 
+    // Tell the worker to wind down, then await it (best-effort).
+    let _ = worker_shutdown_tx.send(true);
+    if let Err(err) = worker_handle.await {
+        tracing::warn!(?err, "notification worker join failed");
+    }
+
     pool.close().await;
     tracing::info!("hearth http server stopped");
     serve_outcome
+}
+
+fn build_notifier(cfg: &config::NotificationsConfig) -> anyhow::Result<notifications::NotifierImpl> {
+    match cfg {
+        config::NotificationsConfig::Disabled => Ok(notifications::NotifierImpl::Disabled),
+        config::NotificationsConfig::Log => Ok(notifications::NotifierImpl::Log),
+        config::NotificationsConfig::Smtp(s) => {
+            let smtp = notifications::SmtpNotifier::build(notifications::SmtpConfig {
+                host: s.host.clone(),
+                port: s.port,
+                tls: match s.tls {
+                    config::SmtpTls::Starttls => notifications::SmtpTls::Starttls,
+                    config::SmtpTls::Implicit => notifications::SmtpTls::Implicit,
+                    config::SmtpTls::None => notifications::SmtpTls::None,
+                },
+                username: s.username.clone(),
+                password: s.password.clone(),
+                from: notifications::FromAddress {
+                    email: s.from_email.clone(),
+                    name: s.from_name.clone(),
+                },
+            })?;
+            Ok(notifications::NotifierImpl::Smtp(std::sync::Arc::new(smtp)))
+        }
+    }
+}
+
+fn notifications_mode_label(cfg: &config::NotificationsConfig) -> &'static str {
+    match cfg {
+        config::NotificationsConfig::Disabled => "disabled",
+        config::NotificationsConfig::Log => "log",
+        config::NotificationsConfig::Smtp(_) => "smtp",
+    }
 }
