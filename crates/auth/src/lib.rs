@@ -11,6 +11,8 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod recovery_code;
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("password hashing failed")]

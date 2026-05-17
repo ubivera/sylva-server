@@ -614,6 +614,7 @@ dependencies = [
  "chrono",
  "identity",
  "notifications",
+ "pending",
  "serde",
  "serde_json",
  "sqlx",
@@ -1202,6 +1203,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
 dependencies = [
  "base64ct",
+]
+
+[[package]]
+name = "pending"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "audit",
+ "auth",
+ "chrono",
+ "identity",
+ "notifications",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -88,6 +88,26 @@ pub fn router(
             "/admin/notifications",
             get(admin_routes::list_notifications),
         )
+        .route(
+            "/admin/pending-transitions",
+            get(admin_routes::list_pending_transitions),
+        )
+        .route(
+            "/admin/pending-transitions/{id}/veto",
+            post(admin_routes::veto_pending_transition),
+        )
+        .route(
+            "/admin/pending-transitions/{id}/cancel",
+            post(admin_routes::cancel_pending_transition),
+        )
+        .route(
+            "/admin/server/recovery-code",
+            get(admin_routes::get_recovery_code_metadata),
+        )
+        .route(
+            "/admin/server/recovery-code/rotate",
+            post(admin_routes::rotate_recovery_code),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

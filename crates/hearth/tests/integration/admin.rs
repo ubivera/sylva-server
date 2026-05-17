@@ -1100,9 +1100,15 @@ async fn owner_can_promote_admin_to_owner_multi_owner() {
 }
 
 #[tokio::test]
-async fn owner_can_demote_another_owner() {
-    // Multi-Owner setup: O1 (original) promotes A → O2, then O1 demotes O2.
+async fn owner_can_demote_another_owner_via_recovery_bypass() {
+    // Multi-Owner setup: O1 (original) promotes A → O2 (immediate, target
+    // wasn't Owner yet), then O1 demotes O2. The demote is Owner-on-Owner
+    // and goes through the pending flow by default, so we use the recovery
+    // code bypass to keep this test's instant semantics. The pending-flow
+    // tests live in tests/integration/pending_transitions.rs.
     let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+    let recovery = app.seed_recovery_code().await;
+
     app.post(
         &format!("/admin/users/{}/role", admin.id.0),
         Some(&owner_tok),
@@ -1111,12 +1117,11 @@ async fn owner_can_demote_another_owner() {
     .await
     .assert_status(StatusCode::OK);
 
-    // O1 demotes O2 back to admin.
     let resp = app
         .post(
             &format!("/admin/users/{}/role", admin.id.0),
             Some(&owner_tok),
-            Some(json!({ "role": "admin" })),
+            Some(json!({ "role": "admin", "bypass_recovery_code": recovery })),
         )
         .await;
     resp.assert_status(StatusCode::OK);
@@ -1227,8 +1232,11 @@ async fn change_role_on_deleted_user_returns_404() {
 async fn demoted_owner_loses_powers_on_next_request() {
     // Owner1 promotes Admin to Owner2, Owner2 makes an admin-level call
     // successfully, then Owner1 demotes Owner2 to User and Owner2's next
-    // admin call fails with 403.
+    // admin call fails with 403. Uses recovery-code bypass for the
+    // Owner→User demotion since that's Owner-on-Owner.
     let (app, _owner1, owner1_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
+    let recovery = app.seed_recovery_code().await;
+
     app.post(
         &format!("/admin/users/{}/role", admin.id.0),
         Some(&owner1_tok),
@@ -1237,25 +1245,20 @@ async fn demoted_owner_loses_powers_on_next_request() {
     .await
     .assert_status(StatusCode::OK);
 
-    // Owner2 logs in.
     let owner2_tok = app.login(&admin.email, "adminpw").await;
 
-    // Owner2 hits an admin route successfully.
     app.get("/admin/users", Some(&owner2_tok))
         .await
         .assert_status(StatusCode::OK);
 
-    // Owner1 demotes Owner2 all the way to User.
     app.post(
         &format!("/admin/users/{}/role", admin.id.0),
         Some(&owner1_tok),
-        Some(json!({ "role": "user" })),
+        Some(json!({ "role": "user", "bypass_recovery_code": recovery })),
     )
     .await
     .assert_status(StatusCode::OK);
 
-    // Owner2's existing session is still authenticated (no revocation),
-    // but the AdminUser extractor now 403's them.
     let me = app.get("/me", Some(&owner2_tok)).await;
     me.assert_status(StatusCode::OK);
     let me_body: serde_json::Value = me.json();

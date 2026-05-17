@@ -81,7 +81,7 @@ async fn init_shared_postgres() -> SharedPg {
 /// any startup-class (SQLSTATE 57*) failure for up to 60 seconds.
 async fn wait_for_sql_ready(port: u16) {
     let url = format!("postgresql://{SUPERUSER}@127.0.0.1:{port}/postgres");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut delay = std::time::Duration::from_millis(100);
     loop {
         let attempt = async {
@@ -306,6 +306,28 @@ impl TestApp {
             .process_pending()
             .await
             .expect("notification worker cycle failed")
+    }
+
+    /// Run a single cycle of the pending-transitions worker. Tests use this
+    /// instead of waiting for the real 30-second poll interval.
+    pub async fn run_pending_transitions_once(&self) -> usize {
+        let worker = pending::Worker::new(self.pool.clone());
+        worker
+            .process_due()
+            .await
+            .expect("pending-transitions worker cycle failed")
+    }
+
+    /// Bootstrap a recovery code as if `provision` had run. Returns the
+    /// raw code so the test can use it for bypass attempts.
+    pub async fn seed_recovery_code(&self) -> String {
+        let raw = auth::recovery_code::generate_code();
+        let mut tx = self.pool.begin().await.expect("begin");
+        auth::recovery_code::bootstrap(&mut tx, &raw, None)
+            .await
+            .expect("bootstrap recovery code");
+        tx.commit().await.expect("commit");
+        raw
     }
 
     /// Seed a user with the given role + an `active` lifecycle and a real

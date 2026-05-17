@@ -33,6 +33,43 @@ pub type Result<T> = std::result::Result<T, NotificationsError>;
 #[serde(rename_all = "snake_case")]
 pub enum OutboxKind {
     Invitation,
+    PendingRoleChangeInitiated,
+    PendingRoleChangeVetoed,
+    PendingRoleChangeApplied,
+    PendingLifecycleInitiated,
+    PendingLifecycleVetoed,
+    PendingLifecycleApplied,
+}
+
+/// Which lifecycle action a pending transition represents. Shared with
+/// the `pending` crate (re-exported there) so the two layers agree on
+/// the same enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAction {
+    Deactivate,
+    SoftDelete,
+    HardDelete,
+}
+
+impl LifecycleAction {
+    /// Verb-form used in templates: "deactivation", "account deletion",
+    /// "account purge".
+    pub fn noun(self) -> &'static str {
+        match self {
+            LifecycleAction::Deactivate => "deactivation",
+            LifecycleAction::SoftDelete => "account deletion",
+            LifecycleAction::HardDelete => "account purge",
+        }
+    }
+
+    pub fn past_tense(self) -> &'static str {
+        match self {
+            LifecycleAction::Deactivate => "deactivated",
+            LifecycleAction::SoftDelete => "deleted",
+            LifecycleAction::HardDelete => "purged",
+        }
+    }
 }
 
 /// Domain-level notification, before rendering. Each variant is a distinct
@@ -46,6 +83,70 @@ pub enum Notification {
         expires_at: DateTime<Utc>,
         instance_role: InstanceRole,
         invitation_id: Uuid,
+    },
+    /// Owner-on-Owner role-change has been initiated against `recipient`.
+    /// They can veto from `veto_url` before `effective_at`.
+    PendingRoleChangeInitiated {
+        recipient_email: String,
+        target_display_name: String,
+        initiator_display_name: String,
+        from_role: InstanceRole,
+        to_role: InstanceRole,
+        effective_at: DateTime<Utc>,
+        veto_url: String,
+        transition_id: Uuid,
+    },
+    /// An initiator's pending role-change was vetoed.
+    PendingRoleChangeVetoed {
+        recipient_email: String,
+        initiator_display_name: String,
+        target_display_name: String,
+        vetoed_by_display_name: String,
+        from_role: InstanceRole,
+        to_role: InstanceRole,
+        transition_id: Uuid,
+    },
+    /// A pending role-change has been applied — either because the timer
+    /// expired without a veto, or because the recovery code was used to
+    /// bypass the window. `transition_id` is `None` when the action took
+    /// the bypass path (there was no pending row to reference).
+    PendingRoleChangeApplied {
+        recipient_email: String,
+        target_display_name: String,
+        initiator_display_name: String,
+        applied_role: InstanceRole,
+        via_recovery_bypass: bool,
+        transition_id: Option<Uuid>,
+    },
+    /// Owner-on-Owner lifecycle action (deactivate / delete / purge) has
+    /// been queued against `recipient`. Mirrors `PendingRoleChangeInitiated`
+    /// but parameterized by lifecycle action rather than from/to roles.
+    PendingLifecycleInitiated {
+        recipient_email: String,
+        target_display_name: String,
+        initiator_display_name: String,
+        action: LifecycleAction,
+        effective_at: DateTime<Utc>,
+        veto_url: String,
+        transition_id: Uuid,
+    },
+    /// An initiator's pending lifecycle action was vetoed.
+    PendingLifecycleVetoed {
+        recipient_email: String,
+        initiator_display_name: String,
+        target_display_name: String,
+        vetoed_by_display_name: String,
+        action: LifecycleAction,
+        transition_id: Uuid,
+    },
+    /// A pending lifecycle action has been applied (timer or bypass).
+    PendingLifecycleApplied {
+        recipient_email: String,
+        target_display_name: String,
+        initiator_display_name: String,
+        action: LifecycleAction,
+        via_recovery_bypass: bool,
+        transition_id: Option<Uuid>,
     },
 }
 
@@ -117,7 +218,322 @@ impl Notification {
                     payload,
                 }
             }
+            Notification::PendingRoleChangeInitiated {
+                recipient_email,
+                target_display_name,
+                initiator_display_name,
+                from_role,
+                to_role,
+                effective_at,
+                veto_url,
+                transition_id,
+            } => {
+                let from = role_label(from_role);
+                let to = role_label(to_role);
+                let subject = format!(
+                    "{initiator_display_name} has initiated a role change on your account"
+                );
+                let body_text = format!(
+                    "{initiator_display_name} has initiated a pending role change on your \
+                     Sylva Hearth account:\n\n\
+                     \tFrom: {from}\n\
+                     \tTo:   {to}\n\n\
+                     If you don't take action, the change will be applied automatically on \
+                     {effective_at}.\n\n\
+                     If this was not expected, veto the change here:\n  {veto_url}\n\n\
+                     Any other Owner on this instance can also veto it on your behalf.\n",
+                    effective_at = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Hi {target},</p>\
+                     <p><strong>{initiator}</strong> has initiated a pending role change on \
+                     your Sylva Hearth account:</p>\
+                     <ul><li>From: <strong>{from}</strong></li>\
+                     <li>To: <strong>{to}</strong></li></ul>\
+                     <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
+                     <p><a href=\"{url}\" style=\"display:inline-block;padding:10px 16px;\
+                     background:#d83a3a;color:#fff;text-decoration:none;border-radius:4px;\">\
+                     Veto this change</a></p>\
+                     <p style=\"color:#666;font-size:13px;\">Or paste this link into your browser:\
+                     <br><span style=\"font-family:monospace;\">{url}</span></p>\
+                     <p style=\"color:#999;font-size:12px;margin-top:24px;\">\
+                     Any other Owner can also veto on your behalf.</p>\
+                     </body></html>",
+                    target = html_escape(&target_display_name),
+                    initiator = html_escape(&initiator_display_name),
+                    from = from,
+                    to = to,
+                    when = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                    url = html_escape(&veto_url),
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "from_role": from_role,
+                    "to_role": to_role,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingRoleChangeInitiated,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
+            Notification::PendingRoleChangeVetoed {
+                recipient_email,
+                initiator_display_name,
+                target_display_name,
+                vetoed_by_display_name,
+                from_role,
+                to_role,
+                transition_id,
+            } => {
+                let from = role_label(from_role);
+                let to = role_label(to_role);
+                let subject =
+                    format!("Your role change on {target_display_name} was vetoed");
+                let body_text = format!(
+                    "Hi {initiator_display_name},\n\n\
+                     Your pending role change on {target_display_name}'s account \
+                     ({from} → {to}) has been vetoed by {vetoed_by_display_name}.\n\n\
+                     No change was applied. If you still believe this action is necessary, \
+                     coordinate with the other Owners on this instance.\n",
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Hi {initiator},</p>\
+                     <p>Your pending role change on <strong>{target}</strong>'s account \
+                     (<strong>{from}</strong> → <strong>{to}</strong>) has been vetoed by \
+                     <strong>{vetoer}</strong>.</p>\
+                     <p>No change was applied. If you still believe this action is necessary, \
+                     coordinate with the other Owners on this instance.</p>\
+                     </body></html>",
+                    initiator = html_escape(&initiator_display_name),
+                    target = html_escape(&target_display_name),
+                    vetoer = html_escape(&vetoed_by_display_name),
+                    from = from,
+                    to = to,
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "from_role": from_role,
+                    "to_role": to_role,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingRoleChangeVetoed,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
+            Notification::PendingRoleChangeApplied {
+                recipient_email,
+                target_display_name,
+                initiator_display_name,
+                applied_role,
+                via_recovery_bypass,
+                transition_id,
+            } => {
+                let role = role_label(applied_role);
+                let how = if via_recovery_bypass {
+                    "using the server recovery code"
+                } else {
+                    "after the 72-hour veto window expired"
+                };
+                let subject = format!("Your account role has been changed to {role}");
+                let body_text = format!(
+                    "Hi {target_display_name},\n\n\
+                     Your role on Sylva Hearth has been changed to {role} by \
+                     {initiator_display_name} {how}.\n\n\
+                     If you believe this was unauthorized, contact another Owner immediately.\n",
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Hi {target},</p>\
+                     <p>Your role on Sylva Hearth has been changed to <strong>{role}</strong> by \
+                     <strong>{initiator}</strong> {how}.</p>\
+                     <p style=\"color:#666;font-size:13px;\">If you believe this was \
+                     unauthorized, contact another Owner immediately.</p>\
+                     </body></html>",
+                    target = html_escape(&target_display_name),
+                    initiator = html_escape(&initiator_display_name),
+                    role = role,
+                    how = how,
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "applied_role": applied_role,
+                    "via_recovery_bypass": via_recovery_bypass,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingRoleChangeApplied,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
+            Notification::PendingLifecycleInitiated {
+                recipient_email,
+                target_display_name,
+                initiator_display_name,
+                action,
+                effective_at,
+                veto_url,
+                transition_id,
+            } => {
+                let noun = action.noun();
+                let subject = format!(
+                    "{initiator_display_name} has initiated a pending {noun} on your account"
+                );
+                let body_text = format!(
+                    "Hi {target_display_name},\n\n\
+                     {initiator_display_name} has initiated a pending {noun} on your Sylva \
+                     Hearth account.\n\n\
+                     If you don't take action, this will be applied automatically on \
+                     {effective_at}.\n\n\
+                     If this was not expected, veto the action here:\n  {veto_url}\n\n\
+                     Any other Owner on this instance can also veto it on your behalf.\n",
+                    effective_at = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Hi {target},</p>\
+                     <p><strong>{initiator}</strong> has initiated a pending <strong>{noun}</strong> \
+                     on your Sylva Hearth account.</p>\
+                     <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
+                     <p><a href=\"{url}\" style=\"display:inline-block;padding:10px 16px;\
+                     background:#d83a3a;color:#fff;text-decoration:none;border-radius:4px;\">\
+                     Veto this action</a></p>\
+                     <p style=\"color:#666;font-size:13px;\">Or paste this link into your browser:\
+                     <br><span style=\"font-family:monospace;\">{url}</span></p>\
+                     <p style=\"color:#999;font-size:12px;margin-top:24px;\">\
+                     Any other Owner can also veto on your behalf.</p>\
+                     </body></html>",
+                    target = html_escape(&target_display_name),
+                    initiator = html_escape(&initiator_display_name),
+                    noun = noun,
+                    when = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                    url = html_escape(&veto_url),
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "action": action,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingLifecycleInitiated,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
+            Notification::PendingLifecycleVetoed {
+                recipient_email,
+                initiator_display_name,
+                target_display_name,
+                vetoed_by_display_name,
+                action,
+                transition_id,
+            } => {
+                let noun = action.noun();
+                let subject = format!("Your {noun} of {target_display_name} was vetoed");
+                let body_text = format!(
+                    "Hi {initiator_display_name},\n\n\
+                     Your pending {noun} of {target_display_name}'s account has been vetoed by \
+                     {vetoed_by_display_name}.\n\n\
+                     No change was applied. If you still believe this action is necessary, \
+                     coordinate with the other Owners on this instance.\n",
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Hi {initiator},</p>\
+                     <p>Your pending <strong>{noun}</strong> of <strong>{target}</strong>'s \
+                     account has been vetoed by <strong>{vetoer}</strong>.</p>\
+                     <p>No change was applied. If you still believe this action is necessary, \
+                     coordinate with the other Owners on this instance.</p>\
+                     </body></html>",
+                    initiator = html_escape(&initiator_display_name),
+                    target = html_escape(&target_display_name),
+                    vetoer = html_escape(&vetoed_by_display_name),
+                    noun = noun,
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "action": action,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingLifecycleVetoed,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
+            Notification::PendingLifecycleApplied {
+                recipient_email,
+                target_display_name,
+                initiator_display_name,
+                action,
+                via_recovery_bypass,
+                transition_id,
+            } => {
+                let past = action.past_tense();
+                let how = if via_recovery_bypass {
+                    "using the server recovery code"
+                } else {
+                    "after the 72-hour veto window expired"
+                };
+                let subject = format!("Your account has been {past}");
+                let body_text = format!(
+                    "Hi {target_display_name},\n\n\
+                     Your Sylva Hearth account has been {past} by {initiator_display_name} \
+                     {how}.\n\n\
+                     If you believe this was unauthorized, contact another Owner immediately.\n",
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Hi {target},</p>\
+                     <p>Your Sylva Hearth account has been <strong>{past}</strong> by \
+                     <strong>{initiator}</strong> {how}.</p>\
+                     <p style=\"color:#666;font-size:13px;\">If you believe this was \
+                     unauthorized, contact another Owner immediately.</p>\
+                     </body></html>",
+                    target = html_escape(&target_display_name),
+                    initiator = html_escape(&initiator_display_name),
+                    past = past,
+                    how = how,
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "action": action,
+                    "via_recovery_bypass": via_recovery_bypass,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingLifecycleApplied,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
         }
+    }
+}
+
+fn role_label(r: InstanceRole) -> &'static str {
+    match r {
+        InstanceRole::Owner => "Owner",
+        InstanceRole::Admin => "Admin",
+        InstanceRole::User => "User",
     }
 }
 
