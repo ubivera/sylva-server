@@ -161,6 +161,35 @@ pub async fn me_page(
     Html(views::me_page(&ctx).into_string()).into_response()
 }
 
+/// `GET /users` — admin-only directory of every non-purged user.
+/// Mirrors the JSON `/api/admin/users` endpoint shape. Regular users
+/// (role = `User`) get a 403 error page; the Users nav link is hidden
+/// from them in the chrome too, so this gate is the defense in depth.
+pub async fn users_page(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    if !matches!(
+        auth.user.instance_role,
+        identity::InstanceRole::Admin | identity::InstanceRole::Owner,
+    ) {
+        return error_response(StatusCode::FORBIDDEN, "Admins only.");
+    }
+    match state.users.list_all().await {
+        Ok(users) => {
+            let ctx = views::ChromeContext {
+                instance_name: &state.instance_name,
+                user: &auth.user,
+            };
+            Html(views::users_page(&ctx, &users).into_string()).into_response()
+        }
+        Err(err) => {
+            tracing::error!(?err, "listing users for /users page");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
 /// `POST /logout` — revoke the current session, clear the cookie, bounce
 /// to `/login`. Idempotent.
 pub async fn logout_submit(

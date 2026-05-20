@@ -21,6 +21,7 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/", get(routes::root_redirect))
         .route("/login", get(routes::login_page).post(routes::login_submit))
         .route("/me", get(routes::me_page))
+        .route("/users", get(routes::users_page))
         .route("/logout", post(routes::logout_submit))
         .nest_service("/assets", ServeDir::new(assets_dir()))
         .with_state(state)

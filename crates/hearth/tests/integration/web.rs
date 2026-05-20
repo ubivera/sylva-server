@@ -366,3 +366,156 @@ async fn already_authed_login_page_redirects_to_me() {
         Some("/me")
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// /users — admin directory page
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Convenience for the /users tests: build a GET request with an optional
+/// cookie and shoot it through the router.
+async fn get_with_cookie(app: &TestApp, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+    let mut builder = axum::http::Request::builder().method(Method::GET).uri(path);
+    if let Some(c) = cookie {
+        builder = builder.header(header::COOKIE, c);
+    }
+    let req = builder.body(axum::body::Body::empty()).unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let status = resp.status();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body_bytes).into_owned())
+}
+
+#[tokio::test]
+async fn users_page_without_cookie_redirects_to_login() {
+    let app = TestApp::new().await;
+    let (status, _) = get_with_cookie(&app, "/users", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn users_page_forbidden_for_regular_user() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body.contains("Admins only"),
+        "expected forbidden message in body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn users_page_lists_all_users_for_admin() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm In", "pw", InstanceRole::Admin)
+        .await;
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .await;
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::User)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // All three seeded users render with email + display name.
+    for needle in [
+        "admin@test.local",
+        "alice@test.local",
+        "bob@test.local",
+        "Adm In",
+        "Alice",
+        "Bob",
+    ] {
+        assert!(body.contains(needle), "expected {needle:?} in: {body}");
+    }
+    // Role + status badges rendered.
+    assert!(body.contains("role-admin"));
+    assert!(body.contains("role-user"));
+    assert!(body.contains("status-active"));
+    // The viewing admin is tagged as "you".
+    assert!(body.contains("row-self-tag"));
+}
+
+#[tokio::test]
+async fn users_nav_link_hidden_for_regular_user() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (_, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert!(
+        !body.contains(r#"href="/users""#),
+        "Users nav link should NOT appear for regular users: {body}"
+    );
+}
+
+#[tokio::test]
+async fn users_nav_link_visible_for_admin() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (_, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert!(
+        body.contains(r#"href="/users""#),
+        "Users nav link should appear for admins: {body}"
+    );
+}
+
+#[tokio::test]
+async fn active_nav_link_is_marked_on_users_page() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(r#"<a class="nav-link active" href="/users""#),
+        "Users nav link should be marked active on /users: {body}"
+    );
+}
+
+#[tokio::test]
+async fn users_page_renders_deactivated_status_badge() {
+    let app = TestApp::new().await;
+    app.seed_user("owner@test.local", "Big Boss", "pw", InstanceRole::Owner)
+        .await;
+    let deactivated = app
+        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
+        .await;
+
+    // Flip the lifecycle directly to skip the audit + session side effects
+    // of the real deactivate path — we're testing the view, not the repo.
+    sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
+        .bind(deactivated.id.0)
+        .execute(&app.pool)
+        .await
+        .expect("flipping ghost user to deactivated");
+
+    let set_cookie = web_login(&app, "owner@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("status-active"));
+    assert!(
+        body.contains("status-deactivated"),
+        "expected status-deactivated badge in: {body}"
+    );
+    assert!(body.contains("Ghost"));
+}

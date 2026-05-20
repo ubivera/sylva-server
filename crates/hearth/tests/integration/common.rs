@@ -60,9 +60,14 @@ async fn init_shared_postgres() -> SharedPg {
     std::mem::forget(pg);
 
     // hearth's PostgresProcess::start only waits for the TCP listener; the
-    // SQL layer may still be in recovery. Block here on a real `SELECT 1`
-    // so subsequent tests never race against startup-not-ready errors.
-    wait_for_sql_ready(TEST_PG_PORT).await;
+    // SQL layer may still be in recovery. Block on the shared db helper
+    // (same logic prod uses) so subsequent tests never race against
+    // startup-not-ready errors.
+    hearth::db::wait_until_ready(&format!(
+        "postgresql://{SUPERUSER}@127.0.0.1:{TEST_PG_PORT}/postgres"
+    ))
+    .await
+    .expect("postgres never became SQL-ready for tests");
 
     // Clear orphan test databases from prior runs via a single connection
     // (NOT a pool) — sqlx pools are bound to the tokio runtime that created
@@ -74,38 +79,6 @@ async fn init_shared_postgres() -> SharedPg {
 
     SharedPg {
         port: TEST_PG_PORT,
-    }
-}
-
-/// Block until the bundled cluster's SQL layer answers `SELECT 1`. Retries
-/// any startup-class (SQLSTATE 57*) failure for up to 60 seconds.
-async fn wait_for_sql_ready(port: u16) {
-    let url = format!("postgresql://{SUPERUSER}@127.0.0.1:{port}/postgres");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut delay = std::time::Duration::from_millis(100);
-    loop {
-        let attempt = async {
-            let mut c = PgConnection::connect(&url).await?;
-            let _: (i32,) = sqlx::query_as("SELECT 1").fetch_one(&mut c).await?;
-            c.close().await
-        }
-        .await;
-        match attempt {
-            Ok(_) => return,
-            Err(err) => {
-                let transient = matches!(
-                    &err,
-                    sqlx::Error::Database(dbe)
-                        if dbe.code().as_deref().is_some_and(|c| c.starts_with("57"))
-                ) || matches!(&err, sqlx::Error::Io(_));
-                if transient && std::time::Instant::now() < deadline {
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(std::time::Duration::from_millis(500));
-                    continue;
-                }
-                panic!("postgres never became SQL-ready: {err:?}");
-            }
-        }
     }
 }
 

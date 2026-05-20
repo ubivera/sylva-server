@@ -66,6 +66,15 @@ async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
     .await
     .context("starting bundled postgres")?;
 
+    // Postgres opens its TCP listener before the SQL layer accepts queries
+    // (especially after an unclean prior shutdown — crash recovery + fsync
+    // of the data dir can take 20+ seconds). Without this gate, the very
+    // first pool acquire below races and times out.
+    db::wait_until_ready(&config.postgres_url)
+        .await
+        .context("waiting for postgres SQL layer to come up")?;
+    tracing::info!("bundled postgres SQL layer ready");
+
     let serve_result = serve(&config, started_at, ui_router).await;
 
     if let Err(err) = postgres.stop().await {

@@ -14,6 +14,7 @@ pub struct ChromeContext<'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PageId {
     Profile,
+    Users,
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -85,6 +86,7 @@ pub fn shell_app(
 }
 
 fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
+    let is_admin = is_at_least_admin(ctx.user.instance_role);
     html! {
         aside class="sidebar" {
             div class="brand" {
@@ -107,11 +109,18 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
 
             nav class="nav-links" {
                 (nav_link("/me", "Profile", current == PageId::Profile))
+                @if is_admin {
+                    (nav_link("/users", "Users", current == PageId::Users))
+                }
             }
 
             (user_card(ctx.user))
         }
     }
+}
+
+fn is_at_least_admin(role: InstanceRole) -> bool {
+    matches!(role, InstanceRole::Admin | InstanceRole::Owner)
 }
 
 fn nav_link(href: &str, label: &str, active: bool) -> Markup {
@@ -122,23 +131,8 @@ fn nav_link(href: &str, label: &str, active: bool) -> Markup {
 }
 
 fn user_card(user: &User) -> Markup {
-    let initial = user
-        .display_name
-        .chars()
-        .next()
-        .map(|c| c.to_ascii_uppercase())
-        .unwrap_or('?');
+    let initial = display_initial(&user.display_name);
     let color = avatar_color(&user.id.0);
-    let role_class = match user.instance_role {
-        InstanceRole::Owner => "role-badge role-owner",
-        InstanceRole::Admin => "role-badge role-admin",
-        InstanceRole::User => "role-badge role-user",
-    };
-    let role_label = match user.instance_role {
-        InstanceRole::Owner => "Owner",
-        InstanceRole::Admin => "Admin",
-        InstanceRole::User => "User",
-    };
     let lifecycle_note: Option<&'static str> = match user.lifecycle {
         UserLifecycle::Active => None,
         UserLifecycle::Deactivated => Some("Account deactivated"),
@@ -160,7 +154,9 @@ fn user_card(user: &User) -> Markup {
             }
             div class="user-card-menu" {
                 div class="user-card-role" {
-                    span class=(role_class) { (role_label) }
+                    span class=(role_class(user.instance_role)) {
+                        (role_label(user.instance_role))
+                    }
                     @if let Some(note) = lifecycle_note {
                         span class="user-card-note" { (note) }
                     }
@@ -171,6 +167,42 @@ fn user_card(user: &User) -> Markup {
                 }
             }
         }
+    }
+}
+
+fn display_initial(name: &str) -> char {
+    name.chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('?')
+}
+
+fn role_class(role: InstanceRole) -> &'static str {
+    match role {
+        InstanceRole::Owner => "role-badge role-owner",
+        InstanceRole::Admin => "role-badge role-admin",
+        InstanceRole::User => "role-badge role-user",
+    }
+}
+
+fn role_label(role: InstanceRole) -> &'static str {
+    match role {
+        InstanceRole::Owner => "Owner",
+        InstanceRole::Admin => "Admin",
+        InstanceRole::User => "User",
+    }
+}
+
+/// Compact status pill text + CSS class for the users table. The hard/soft
+/// deleted arms are reachable in principle (e.g. a future view that opts
+/// into them) but `UserRepository::list_all` filters them out today.
+fn lifecycle_badge(lifecycle: UserLifecycle) -> (&'static str, &'static str) {
+    match lifecycle {
+        UserLifecycle::Active => ("status-badge status-active", "Active"),
+        UserLifecycle::PendingInvite => ("status-badge status-pending", "Pending"),
+        UserLifecycle::Deactivated => ("status-badge status-deactivated", "Deactivated"),
+        UserLifecycle::SoftDeleted => ("status-badge status-deleted", "Deleted"),
+        UserLifecycle::HardDeleted => ("status-badge status-deleted", "Purged"),
     }
 }
 
@@ -220,11 +252,6 @@ pub fn login_page(error: Option<&str>) -> Markup {
 /// `GET /me` page — the authenticated user's profile.
 pub fn me_page(ctx: &ChromeContext) -> Markup {
     let user = ctx.user;
-    let role_label = match user.instance_role {
-        InstanceRole::Owner => "Owner",
-        InstanceRole::Admin => "Admin",
-        InstanceRole::User => "User",
-    };
     let lifecycle_label = match user.lifecycle {
         UserLifecycle::Active => "Active",
         UserLifecycle::Deactivated => "Deactivated",
@@ -236,7 +263,7 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
         div class="card" {
             dl class="meta" {
                 dt { "Email" }   dd { (user.email) }
-                dt { "Role" }    dd { (role_label) }
+                dt { "Role" }    dd { (role_label(user.instance_role)) }
                 dt { "Status" }  dd { (lifecycle_label) }
                 @if let Some(locale) = &user.locale {
                     dt { "Locale" } dd { (locale) }
@@ -245,6 +272,69 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
         }
     };
     shell_app(ctx, "Your account", PageId::Profile, content)
+}
+
+/// `GET /users` page — admin-only directory of every non-purged account.
+/// Renders as a table; soft/hard-deleted users are filtered out by
+/// [`identity::UserRepository::list_all`].
+pub fn users_page(ctx: &ChromeContext, users: &[User]) -> Markup {
+    let content = html! {
+        @if users.is_empty() {
+            div class="card" {
+                p class="muted" { "No users yet." }
+            }
+        } @else {
+            div class="card users-card" {
+                table class="users-table" {
+                    thead {
+                        tr {
+                            th { "User" }
+                            th { "Role" }
+                            th { "Status" }
+                            th class="col-date" { "Joined" }
+                        }
+                    }
+                    tbody {
+                        @for u in users {
+                            (user_row(u, ctx.user.id == u.id))
+                        }
+                    }
+                }
+            }
+        }
+    };
+    shell_app(ctx, "Users", PageId::Users, content)
+}
+
+fn user_row(user: &User, is_current: bool) -> maud::Markup {
+    let initial = display_initial(&user.display_name);
+    let color = avatar_color(&user.id.0);
+    let (status_class, status_text) = lifecycle_badge(user.lifecycle);
+    let joined = user.created_at.format("%Y-%m-%d").to_string();
+
+    html! {
+        tr class="user-row" {
+            td class="user-row-cell" {
+                div class="user-row-id" {
+                    span class="avatar avatar-sm" style=(format!("background:{color}")) {
+                        (initial)
+                    }
+                    div class="user-row-text" {
+                        span class="user-name" {
+                            (user.display_name)
+                            @if is_current {
+                                span class="row-self-tag" { "you" }
+                            }
+                        }
+                        span class="user-email" { (user.email) }
+                    }
+                }
+            }
+            td { span class=(role_class(user.instance_role)) { (role_label(user.instance_role)) } }
+            td { span class=(status_class) { (status_text) } }
+            td class="col-date" { (joined) }
+        }
+    }
 }
 
 /// Generic error page rendered when something goes very wrong. Uses the
