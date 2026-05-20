@@ -2445,6 +2445,7 @@ dependencies = [
  "serde_json",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

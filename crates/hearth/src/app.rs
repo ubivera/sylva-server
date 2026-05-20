@@ -22,6 +22,10 @@ pub struct AppState {
     /// `HEARTH_PUBLIC_BASE_URL`; reverse proxies in production override
     /// the default loopback value.
     pub public_base_url: String,
+    /// Operator-chosen display name for this Hearth instance. Shown in
+    /// the admin UI chrome and page titles. Set from
+    /// `HEARTH_INSTANCE_NAME` (default `"Hearth"`).
+    pub instance_name: String,
 }
 
 /// Convenience used by the integration test harness. Constructs the
@@ -35,6 +39,7 @@ pub fn router(
     sessions: SessionRepository,
     invitations: InvitationRepository,
     public_base_url: String,
+    instance_name: String,
 ) -> Router {
     let state = AppState {
         started_at,
@@ -43,6 +48,7 @@ pub fn router(
         sessions,
         invitations,
         public_base_url,
+        instance_name,
     };
 
     let health = Router::new()

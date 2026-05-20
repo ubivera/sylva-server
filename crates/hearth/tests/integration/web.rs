@@ -139,6 +139,112 @@ async fn me_page_with_cookie_renders_user() {
 }
 
 #[tokio::test]
+async fn app_shell_includes_instance_name_and_user_card() {
+    let app = TestApp::new().await;
+    app.seed_user("o@test.local", "Big Boss", OWNER_PW, InstanceRole::Owner)
+        .await;
+    let set_cookie = web_login(&app, "o@test.local", OWNER_PW).await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/me")
+        .header(header::COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body_bytes);
+
+    // Instance name appears in title + brand line.
+    assert!(
+        body.contains("test-instance"),
+        "instance name should be visible in chrome: {body}"
+    );
+    // Brand line uses the "Sylva · {name}" format.
+    assert!(body.contains("Sylva"));
+    // Sidebar nav present.
+    assert!(body.contains(r#"class="sidebar""#));
+    assert!(body.contains(r#"href="/me""#));
+    // User card present with avatar + email.
+    assert!(body.contains(r#"class="user-card""#));
+    assert!(body.contains("Big Boss"));
+    assert!(body.contains("o@test.local"));
+    // Owner role badge with the right class.
+    assert!(body.contains("role-owner"));
+    // Search trigger placeholder.
+    assert!(body.contains(r#"class="search-trigger""#));
+}
+
+#[tokio::test]
+async fn login_page_uses_public_shell_not_app_shell() {
+    let app = TestApp::new().await;
+    let resp = app.get("/login", None).await;
+    resp.assert_status(StatusCode::OK);
+    let body = resp.body_as_text();
+    // The login page should NOT carry the authenticated chrome.
+    assert!(!body.contains(r#"class="sidebar""#));
+    assert!(!body.contains(r#"class="user-card""#));
+    assert!(!body.contains(r#"class="search-trigger""#));
+    // But should be styled (CSS link present).
+    assert!(body.contains("/assets/css/app.css"));
+    // And the public wordmark should be there.
+    assert!(body.contains("Sylva Hearth"));
+}
+
+#[tokio::test]
+async fn role_badge_class_matches_user_role() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "Reg User", "userpw", InstanceRole::User)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "userpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/me")
+        .header(header::COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body_bytes);
+    assert!(body.contains("role-user"));
+    assert!(!body.contains("role-owner"));
+    assert!(!body.contains("role-admin"));
+}
+
+#[tokio::test]
+async fn active_nav_link_is_marked_on_me_page() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/me")
+        .header(header::COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body_bytes);
+    // The active link gets the `active` class. Profile is the current page.
+    assert!(
+        body.contains(r#"class="nav-link active""#) && body.contains(r#"href="/me""#),
+        "Profile nav link should be marked active on /me: {body}"
+    );
+}
+
+#[tokio::test]
 async fn logout_clears_cookie_and_revokes_session() {
     let app = TestApp::new().await;
     let user = app

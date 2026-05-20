@@ -275,6 +275,7 @@ impl TestApp {
             sessions,
             invitations,
             public_base_url: "http://127.0.0.1:8443".to_string(),
+            instance_name: "test-instance".to_string(),
         };
         let health = axum::Router::new()
             .route(

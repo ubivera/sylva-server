@@ -15,6 +15,7 @@ path = "src/lib.rs"
 axum = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "trace"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
 maud = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

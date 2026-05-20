@@ -150,8 +150,15 @@ pub async fn login_submit(
 }
 
 /// `GET /me` — render the authenticated user's account page.
-pub async fn me_page(BrowserAuth(auth): BrowserAuth) -> Response {
-    Html(views::me_page(&auth.user).into_string()).into_response()
+pub async fn me_page(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+    };
+    Html(views::me_page(&ctx).into_string()).into_response()
 }
 
 /// `POST /logout` — revoke the current session, clear the cookie, bounce

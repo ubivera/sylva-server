@@ -113,6 +113,7 @@ async fn serve(
         sessions,
         invitations,
         public_base_url: config.public_base_url.clone(),
+        instance_name: config.instance_name.clone(),
     };
 
     let health = axum::Router::new()
