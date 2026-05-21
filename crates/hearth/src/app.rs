@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use auth::SessionRepository;
@@ -6,10 +7,10 @@ use identity::{InvitationRepository, UserRepository};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
-use crate::{account_routes, admin_routes, auth_routes, health};
+use crate::{account_routes, admin_routes, auth_routes, csrf, health};
 
 /// Shared state for every Hearth HTTP handler. Cloning is cheap - every
-/// field is itself a handle (Pool, Repository wrappers, Instant).
+/// field is itself a handle (Pool, Repository wrappers, Instant, Arc).
 #[derive(Clone)]
 pub struct AppState {
     pub started_at: Instant,
@@ -26,6 +27,11 @@ pub struct AppState {
     /// the admin UI chrome and page titles. Set from
     /// `HEARTH_INSTANCE_NAME` (default `"Hearth"`).
     pub instance_name: String,
+    /// Per-process secret for deriving CSRF tokens from session ids.
+    /// Generated on startup; restart invalidates in-flight forms but not
+    /// sessions. Behind an `Arc` so cloning [`AppState`] doesn't copy 32
+    /// bytes per request.
+    pub csrf_secret: Arc<[u8; csrf::SECRET_LEN]>,
 }
 
 /// Convenience used by the integration test harness. Constructs the
@@ -49,6 +55,7 @@ pub fn router(
         invitations,
         public_base_url,
         instance_name,
+        csrf_secret: Arc::new(csrf::generate_secret()),
     };
 
     let health = Router::new()

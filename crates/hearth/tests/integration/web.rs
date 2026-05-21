@@ -253,12 +253,16 @@ async fn logout_clears_cookie_and_revokes_session() {
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    // Logout
+    // Logout (with CSRF token)
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+    let body = format!("csrf_token={}", urlencoding(&csrf));
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/logout")
         .header(header::COOKIE, cookie.clone())
-        .body(axum::body::Body::empty())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);

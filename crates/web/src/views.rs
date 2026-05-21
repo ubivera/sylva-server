@@ -7,6 +7,19 @@ use maud::{DOCTYPE, Markup, html};
 pub struct ChromeContext<'a> {
     pub instance_name: &'a str,
     pub user: &'a User,
+    /// CSRF token for this session — derived via
+    /// [`hearth::csrf::compute_token`]. Embed in every state-changing
+    /// form via [`csrf_input`].
+    pub csrf_token: &'a str,
+}
+
+/// Render the hidden `csrf_token` input for a form. Every state-changing
+/// `<form method="post">` in the authed UI must include this; the route
+/// handler then validates via `hearth::csrf::verify_token`.
+pub fn csrf_input(token: &str) -> Markup {
+    html! {
+        input type="hidden" name="csrf_token" value=(token);
+    }
 }
 
 /// Identifier for which nav entry should render as "current". The chrome
@@ -80,10 +93,34 @@ pub fn shell_app(
                     h1 { (title) }
                     (content)
                 }
+                // Wire up [data-open-dialog] / [data-close-dialog] without
+                // pulling in a framework. Vanilla, ~10 lines, executes on
+                // every authed page (cheap when no dialogs are present).
+                script {
+                    (maud::PreEscaped(DIALOG_JS))
+                }
             }
         }
     }
 }
+
+const DIALOG_JS: &str = r#"
+document.addEventListener('click', function(e) {
+    var openId = e.target.closest('[data-open-dialog]');
+    if (openId) {
+        e.preventDefault();
+        var d = document.getElementById(openId.getAttribute('data-open-dialog'));
+        if (d && typeof d.showModal === 'function') d.showModal();
+        return;
+    }
+    var closeBtn = e.target.closest('[data-close-dialog]');
+    if (closeBtn) {
+        e.preventDefault();
+        var dlg = closeBtn.closest('dialog');
+        if (dlg && typeof dlg.close === 'function') dlg.close();
+    }
+});
+"#;
 
 fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
     let is_admin = is_at_least_admin(ctx.user.instance_role);
@@ -114,7 +151,7 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                 }
             }
 
-            (user_card(ctx.user))
+            (user_card(ctx))
         }
     }
 }
@@ -130,7 +167,8 @@ fn nav_link(href: &str, label: &str, active: bool) -> Markup {
     }
 }
 
-fn user_card(user: &User) -> Markup {
+fn user_card(ctx: &ChromeContext) -> Markup {
+    let user = ctx.user;
     let initial = display_initial(&user.display_name);
     let color = avatar_color(&user.id.0);
     let lifecycle_note: Option<&'static str> = match user.lifecycle {
@@ -163,6 +201,7 @@ fn user_card(user: &User) -> Markup {
                 }
                 a class="user-card-action" href="/me" { "Profile" }
                 form method="post" action="/logout" class="user-card-action-form" {
+                    (csrf_input(ctx.csrf_token))
                     button type="submit" class="user-card-signout" { "Sign out" }
                 }
             }
@@ -274,11 +313,22 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
     shell_app(ctx, "Your account", PageId::Profile, content)
 }
 
+/// Banner inputs surfaced from `?action=...&target=...` (success) or
+/// `?error=...` (failure) query params after a row-action redirect.
+pub struct UsersBanner<'a> {
+    pub action: Option<&'a str>,
+    pub target: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
 /// `GET /users` page — admin-only directory of every non-purged account.
 /// Renders as a table; soft/hard-deleted users are filtered out by
-/// [`identity::UserRepository::list_all`].
-pub fn users_page(ctx: &ChromeContext, users: &[User]) -> Markup {
+/// [`identity::UserRepository::list_all`]. Each row carries a kebab
+/// (`<details>`) menu whose contents depend on the viewer's role and the
+/// target's lifecycle (see [`available_actions`]).
+pub fn users_page(ctx: &ChromeContext, users: &[User], banner: UsersBanner<'_>) -> Markup {
     let content = html! {
+        (render_banner(&banner))
         @if users.is_empty() {
             div class="card" {
                 p class="muted" { "No users yet." }
@@ -292,11 +342,12 @@ pub fn users_page(ctx: &ChromeContext, users: &[User]) -> Markup {
                             th { "Role" }
                             th { "Status" }
                             th class="col-date" { "Joined" }
+                            th class="col-actions" aria-label="Actions" { "" }
                         }
                     }
                     tbody {
                         @for u in users {
-                            (user_row(u, ctx.user.id == u.id))
+                            (user_row(ctx.user, u, ctx.csrf_token))
                         }
                     }
                 }
@@ -306,11 +357,18 @@ pub fn users_page(ctx: &ChromeContext, users: &[User]) -> Markup {
     shell_app(ctx, "Users", PageId::Users, content)
 }
 
-fn user_row(user: &User, is_current: bool) -> maud::Markup {
-    let initial = display_initial(&user.display_name);
-    let color = avatar_color(&user.id.0);
-    let (status_class, status_text) = lifecycle_badge(user.lifecycle);
-    let joined = user.created_at.format("%Y-%m-%d").to_string();
+fn user_row(viewer: &User, target: &User, csrf_token: &str) -> Markup {
+    let is_self = viewer.id == target.id;
+    let initial = display_initial(&target.display_name);
+    let color = avatar_color(&target.id.0);
+    let (status_class, status_text) = lifecycle_badge(target.lifecycle);
+    let joined = target.created_at.format("%Y-%m-%d").to_string();
+    let actions = available_actions(
+        viewer.instance_role,
+        target.instance_role,
+        target.lifecycle,
+        is_self,
+    );
 
     html! {
         tr class="user-row" {
@@ -321,19 +379,277 @@ fn user_row(user: &User, is_current: bool) -> maud::Markup {
                     }
                     div class="user-row-text" {
                         span class="user-name" {
-                            (user.display_name)
-                            @if is_current {
+                            (target.display_name)
+                            @if is_self {
                                 span class="row-self-tag" { "you" }
                             }
                         }
-                        span class="user-email" { (user.email) }
+                        span class="user-email" { (target.email) }
                     }
                 }
             }
-            td { span class=(role_class(user.instance_role)) { (role_label(user.instance_role)) } }
+            td { span class=(role_class(target.instance_role)) { (role_label(target.instance_role)) } }
             td { span class=(status_class) { (status_text) } }
             td class="col-date" { (joined) }
+            td class="col-actions" {
+                @if !actions.is_empty() {
+                    (row_actions_kebab(target, csrf_token, &actions))
+                }
+            }
         }
+    }
+}
+
+/// Available row actions for the given viewer/target combination.
+/// Mirrors the authz rules in `admin_logic::resolve_lifecycle_target` +
+/// the lifecycle-state gates inside each `perform_*`; the UI just hides
+/// what the API would refuse so users don't see dead-end buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Deactivate,
+    Reactivate,
+    ChangeRole,
+    Delete,
+    Purge,
+}
+
+fn available_actions(
+    viewer: InstanceRole,
+    target_role: InstanceRole,
+    target_lifecycle: UserLifecycle,
+    is_self: bool,
+) -> Vec<RowAction> {
+    if is_self {
+        return Vec::new();
+    }
+    // Admin can only act on Users (strict outrank). Owner can act on
+    // anyone; Owner-on-Owner ops route through the pending flow at the
+    // backend, but the UI surface is identical.
+    let can_act = match viewer {
+        InstanceRole::User => false,
+        InstanceRole::Admin => matches!(target_role, InstanceRole::User),
+        InstanceRole::Owner => true,
+    };
+    if !can_act {
+        return Vec::new();
+    }
+    // PendingInvite users can't be acted on at all this round — the API
+    // returns `not_active` for them. Future "Resend invite" / "Revoke
+    // invite" actions live in the invitations checkpoint.
+    if !matches!(
+        target_lifecycle,
+        UserLifecycle::Active | UserLifecycle::Deactivated
+    ) {
+        return Vec::new();
+    }
+
+    let mut actions = Vec::with_capacity(4);
+    match target_lifecycle {
+        UserLifecycle::Active => actions.push(RowAction::Deactivate),
+        UserLifecycle::Deactivated => actions.push(RowAction::Reactivate),
+        _ => {}
+    }
+    if matches!(viewer, InstanceRole::Owner) {
+        actions.push(RowAction::ChangeRole);
+    }
+    actions.push(RowAction::Delete);
+    actions.push(RowAction::Purge);
+    actions
+}
+
+fn row_actions_kebab(target: &User, csrf_token: &str, actions: &[RowAction]) -> Markup {
+    let id = target.id.0;
+    html! {
+        details class="row-actions" {
+            summary class="row-actions-trigger" aria-label="Row actions" {
+                span aria-hidden="true" { "⋯" }
+            }
+            div class="row-actions-menu" {
+                @for action in actions {
+                    (render_action_item(*action, target, csrf_token))
+                }
+            }
+        }
+        // Confirmation / role-change dialogs live as siblings of the
+        // <details> so showModal() floats them over the page regardless
+        // of whether the kebab is open. Only the dialog-opening actions
+        // (Delete / Purge / Change Role) render a dialog; Deactivate /
+        // Reactivate submit straight from the menu.
+        @for action in actions {
+            @if action_uses_dialog(*action) {
+                (render_action_dialog(*action, target, csrf_token, id))
+            }
+        }
+    }
+}
+
+fn action_uses_dialog(action: RowAction) -> bool {
+    matches!(
+        action,
+        RowAction::ChangeRole | RowAction::Delete | RowAction::Purge
+    )
+}
+
+fn render_action_item(action: RowAction, target: &User, csrf_token: &str) -> Markup {
+    let id = target.id.0;
+    match action {
+        RowAction::Deactivate => html! {
+            form method="post" action=(format!("/users/{id}/deactivate")) class="row-action-form" {
+                (csrf_input(csrf_token))
+                button type="submit" class="row-action-item" { "Deactivate" }
+            }
+        },
+        RowAction::Reactivate => html! {
+            form method="post" action=(format!("/users/{id}/reactivate")) class="row-action-form" {
+                (csrf_input(csrf_token))
+                button type="submit" class="row-action-item" { "Reactivate" }
+            }
+        },
+        RowAction::ChangeRole => html! {
+            button type="button" class="row-action-item"
+                   data-open-dialog=(format!("dlg-role-{id}")) {
+                "Change role…"
+            }
+        },
+        RowAction::Delete => html! {
+            button type="button" class="row-action-item row-action-danger"
+                   data-open-dialog=(format!("dlg-delete-{id}")) {
+                "Delete…"
+            }
+        },
+        RowAction::Purge => html! {
+            button type="button" class="row-action-item row-action-danger"
+                   data-open-dialog=(format!("dlg-purge-{id}")) {
+                "Purge…"
+            }
+        },
+    }
+}
+
+fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: uuid::Uuid) -> Markup {
+    let name = &target.display_name;
+    match action {
+        RowAction::ChangeRole => html! {
+            dialog id=(format!("dlg-role-{id}")) class="action-dialog" {
+                form method="post" action=(format!("/users/{id}/role")) {
+                    h2 { "Change role for " (name) }
+                    p class="dialog-note" {
+                        "If the target is an Owner, a 72-hour veto window "
+                        "begins instead of applying immediately."
+                    }
+                    label class="field" {
+                        span { "New role" }
+                        select name="role" required {
+                            @let current = target.instance_role;
+                            option value="user"  selected[current == InstanceRole::User]  { "User" }
+                            option value="admin" selected[current == InstanceRole::Admin] { "Admin" }
+                            option value="owner" selected[current == InstanceRole::Owner] { "Owner" }
+                        }
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="submit" { "Apply" }
+                    }
+                }
+            }
+        },
+        RowAction::Delete => html! {
+            dialog id=(format!("dlg-delete-{id}")) class="action-dialog" {
+                form method="post" action=(format!("/users/{id}/delete")) {
+                    h2 { "Delete " (name) "?" }
+                    p {
+                        "Revokes all sessions, removes their credentials, and "
+                        "redacts their email. The account row is preserved so "
+                        "their authored content keeps its byline."
+                    }
+                    p class="dialog-note" {
+                        "If the target is an Owner, a 72-hour veto window begins "
+                        "instead of applying immediately."
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="submit" class="btn-danger" { "Delete" }
+                    }
+                }
+            }
+        },
+        RowAction::Purge => html! {
+            dialog id=(format!("dlg-purge-{id}")) class="action-dialog" {
+                form method="post" action=(format!("/users/{id}/purge")) {
+                    h2 { "Purge " (name) "?" }
+                    p {
+                        "Same row-level effect as delete today; once the apps "
+                        "platform lands, this also drops every piece of their "
+                        "content regardless of collaborators."
+                    }
+                    p class="dialog-note" {
+                        "If the target is an Owner, a 72-hour veto window begins "
+                        "instead of applying immediately."
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="submit" class="btn-danger" { "Purge" }
+                    }
+                }
+            }
+        },
+        _ => html! {},
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Banners
+// ────────────────────────────────────────────────────────────────────────
+
+fn render_banner(banner: &UsersBanner<'_>) -> Markup {
+    if let Some(error_code) = banner.error {
+        return error_banner(error_code);
+    }
+    if let Some(action) = banner.action {
+        return action_banner(action, banner.target);
+    }
+    html! {}
+}
+
+fn action_banner(action: &str, target: Option<&str>) -> Markup {
+    let name = target.unwrap_or("This user");
+    let msg = match action {
+        "deactivated" => format!("{name} has been deactivated."),
+        "reactivated" => format!("{name} has been reactivated."),
+        "deleted" => format!("{name}'s account has been deleted."),
+        "purged" => format!("{name}'s account has been purged."),
+        "role_changed" => format!("{name}'s role has been updated."),
+        "pending_deactivate" => "A 72-hour veto window has begun for the requested deactivation. The target Owner and any other Owner can cancel during that time.".to_string(),
+        "pending_delete" => "A 72-hour veto window has begun for the requested deletion.".to_string(),
+        "pending_purge" => "A 72-hour veto window has begun for the requested purge.".to_string(),
+        "pending_role_change" => "A 72-hour veto window has begun for the requested role change.".to_string(),
+        _ => return html! {},
+    };
+    html! {
+        div class="banner banner-success" role="status" { (msg) }
+    }
+}
+
+fn error_banner(error: &str) -> Markup {
+    let msg = match error {
+        "cannot_target_self" => "You can't target yourself.",
+        "cannot_target_peer_or_higher" => "You can't target a peer or higher role.",
+        "already_deactivated" => "That user is already deactivated.",
+        "already_active" => "That user is already active.",
+        "already_in_role" => "That user is already in that role.",
+        "user_not_found" => "User not found.",
+        "not_active" => "That user is in pending invite state and can't be acted on.",
+        "not_deactivated" => "That user isn't deactivated.",
+        "pending_action_exists" => "An action is already pending against that user.",
+        "forbidden" => "Only Owners can change roles.",
+        "invalid_recovery_code" => "Invalid recovery code.",
+        _ => "Something went wrong.",
+    };
+    html! {
+        div class="banner banner-error" role="alert" { (msg) }
     }
 }
 

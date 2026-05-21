@@ -1,3 +1,4 @@
+pub mod admin_routes;
 pub mod routes;
 pub mod views;
 
@@ -22,6 +23,11 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/login", get(routes::login_page).post(routes::login_submit))
         .route("/me", get(routes::me_page))
         .route("/users", get(routes::users_page))
+        .route("/users/{id}/deactivate", post(admin_routes::deactivate_user))
+        .route("/users/{id}/reactivate", post(admin_routes::reactivate_user))
+        .route("/users/{id}/delete", post(admin_routes::delete_user))
+        .route("/users/{id}/purge", post(admin_routes::purge_user))
+        .route("/users/{id}/role", post(admin_routes::change_user_role))
         .route("/logout", post(routes::logout_submit))
         .nest_service("/assets", ServeDir::new(assets_dir()))
         .with_state(state)

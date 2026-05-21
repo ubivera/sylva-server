@@ -1,8 +1,10 @@
 pub mod account_routes;
+pub mod admin_logic;
 pub mod admin_routes;
 pub mod app;
 pub mod auth_routes;
 pub mod config;
+pub mod csrf;
 pub mod db;
 pub mod health;
 #[cfg(windows)]
@@ -123,6 +125,7 @@ async fn serve(
         invitations,
         public_base_url: config.public_base_url.clone(),
         instance_name: config.instance_name.clone(),
+        csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
     };
 
     let health = axum::Router::new()

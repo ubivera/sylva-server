@@ -1,10 +1,10 @@
 use axum::{
     Form,
-    extract::{FromRequestParts, OptionalFromRequestParts, State},
+    extract::{FromRequestParts, OptionalFromRequestParts, Query, State},
     http::{StatusCode, request::Parts},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use hearth::{app::AppState, auth_routes::SESSION_COOKIE_NAME};
+use hearth::{app::AppState, auth_routes::SESSION_COOKIE_NAME, csrf};
 use serde::Deserialize;
 
 use crate::views;
@@ -154,11 +154,24 @@ pub async fn me_page(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
 ) -> Response {
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
+        csrf_token: &csrf_token,
     };
     Html(views::me_page(&ctx).into_string()).into_response()
+}
+
+/// Query params surfaced on the `/users` page after a row-action
+/// redirect. Either `action` (success) or `error` (failure) will be set,
+/// never both; `target` is the display name to interpolate into the
+/// success banner.
+#[derive(Deserialize, Default)]
+pub struct UsersPageQuery {
+    pub action: Option<String>,
+    pub target: Option<String>,
+    pub error: Option<String>,
 }
 
 /// `GET /users` — admin-only directory of every non-purged user.
@@ -168,6 +181,7 @@ pub async fn me_page(
 pub async fn users_page(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    Query(query): Query<UsersPageQuery>,
 ) -> Response {
     if !matches!(
         auth.user.instance_role,
@@ -177,11 +191,18 @@ pub async fn users_page(
     }
     match state.users.list_all().await {
         Ok(users) => {
+            let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
             let ctx = views::ChromeContext {
                 instance_name: &state.instance_name,
                 user: &auth.user,
+                csrf_token: &csrf_token,
             };
-            Html(views::users_page(&ctx, &users).into_string()).into_response()
+            let banner = views::UsersBanner {
+                action: query.action.as_deref(),
+                target: query.target.as_deref(),
+                error: query.error.as_deref(),
+            };
+            Html(views::users_page(&ctx, &users, banner).into_string()).into_response()
         }
         Err(err) => {
             tracing::error!(?err, "listing users for /users page");
@@ -190,12 +211,90 @@ pub async fn users_page(
     }
 }
 
+#[derive(Deserialize)]
+pub struct CsrfForm {
+    pub csrf_token: String,
+}
+
+/// Verify a presented CSRF token against the caller's session. On
+/// mismatch returns a 403 error page so the user sees an actionable
+/// "reload and try again" message rather than a silent failure.
+///
+/// `Result<_, Response>` is the natural shape (callers do `if let Err(r)
+/// = ... { return r; }`); allowing `result_large_err` since boxing a
+/// Response just to satisfy the lint would only obscure the call site.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_csrf_token(
+    state: &AppState,
+    session_id: uuid::Uuid,
+    presented: &str,
+) -> Result<(), Response> {
+    if csrf::verify_token(presented, &state.csrf_secret, session_id) {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Invalid form token. Reload the page and try again.",
+        ))
+    }
+}
+
+/// Convenience wrapper for handlers whose form has nothing but
+/// `csrf_token`. Action handlers with extra fields call
+/// [`check_csrf_token`] directly.
+#[allow(clippy::result_large_err)]
+fn check_csrf(state: &AppState, session_id: uuid::Uuid, form: &CsrfForm) -> Result<(), Response> {
+    check_csrf_token(state, session_id, &form.csrf_token)
+}
+
+/// Gate a handler on the caller having an admin-or-higher role. Returns
+/// the same `AdminUser` wrapper that the JSON API uses, so downstream
+/// `admin_logic` calls accept it directly.
+#[allow(clippy::result_large_err)]
+pub(crate) fn require_admin(
+    auth: hearth::auth_routes::AuthenticatedUser,
+) -> Result<hearth::auth_routes::AdminUser, Response> {
+    if matches!(
+        auth.user.instance_role,
+        identity::InstanceRole::Admin | identity::InstanceRole::Owner,
+    ) {
+        Ok(hearth::auth_routes::AdminUser(auth))
+    } else {
+        Err(error_response(StatusCode::FORBIDDEN, "Admins only."))
+    }
+}
+
+/// Percent-encode a string for safe use in a URL query value. Keeps
+/// unreserved ASCII verbatim and percent-encodes everything else
+/// (including non-ASCII UTF-8 bytes).
+pub(crate) fn url_encode(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// `POST /logout` — revoke the current session, clear the cookie, bounce
-/// to `/login`. Idempotent.
+/// to `/login`. Idempotent (modulo CSRF — a missing/bad token still
+/// returns 403, so a malicious cross-site form can't log the user out).
 pub async fn logout_submit(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
+    if let Err(resp) = check_csrf(&state, auth.session_id, &form) {
+        return resp;
+    }
+
     let actor = auth.actor();
     let session_id = auth.session_id;
     let result: anyhow::Result<()> = async {
@@ -262,7 +361,7 @@ fn cookie_value(name: &str, value: &str, clearing: bool) -> String {
     }
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     (
         status,
         Html(views::error_page(status.as_u16(), message).into_string()),

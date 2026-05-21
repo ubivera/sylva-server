@@ -4,18 +4,18 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use identity::{
-    DEFAULT_INVITATION_TTL, InstanceRole, InvitationId, InvitationRepository, User, UserId,
-    UserLifecycle, UserRepository,
+    DEFAULT_INVITATION_TTL, InstanceRole, InvitationId, InvitationRepository, User, UserLifecycle,
 };
 use notifications::{OutboxRow, OutboxState};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    admin_logic::{self, Outcome},
     app::AppState,
     auth_routes::AdminUser,
     views::{AuditEventView, PaginatedAudit, SessionView},
@@ -435,36 +435,6 @@ impl From<User> for LifecycleResponse {
     }
 }
 
-/// Shared preamble: look up the target, run the self-target and strict-rank
-/// authz checks. On failure returns the error response directly so the
-/// caller can `?`/early-return.
-async fn resolve_lifecycle_target(
-    state: &AppState,
-    admin: &AdminUser,
-    target_id: Uuid,
-) -> std::result::Result<User, (StatusCode, Json<ErrorResponse>)> {
-    let target = state
-        .users
-        .find_any(UserId::new(target_id))
-        .await
-        .map_err(|e| {
-            tracing::error!(?e, "lookup target user");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        })?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "user_not_found"))?;
-
-    if target.id == admin.0.user.id {
-        return Err(err(StatusCode::FORBIDDEN, "cannot_target_self"));
-    }
-
-    if admin.0.user.instance_role != InstanceRole::Owner
-        && !authz::outranks(admin.0.user.instance_role, target.instance_role)
-    {
-        return Err(err(StatusCode::FORBIDDEN, "cannot_target_peer_or_higher"));
-    }
-    Ok(target)
-}
-
 /// Shared body shape for lifecycle endpoints that support recovery-code
 /// bypass (deactivate / delete / purge). Optional — callers that aren't
 /// trying to bypass send no body.
@@ -473,114 +443,37 @@ pub struct LifecycleActionRequest {
     pub bypass_recovery_code: Option<String>,
 }
 
-/// Verify a presented bypass code. `None` input → `Ok(None)` (caller
-/// wasn't bypassing). Otherwise returns `Ok(Some(code_id))` on match or
-/// an error response on mismatch / internal failure.
-async fn verify_bypass_code(
-    state: &AppState,
-    code: Option<&str>,
-) -> std::result::Result<Option<Uuid>, (StatusCode, Json<ErrorResponse>)> {
-    let Some(code) = code else { return Ok(None); };
-    match auth::recovery_code::verify(&state.db, code).await {
-        Ok(Some(id)) => Ok(Some(id)),
-        Ok(None) => Err(err(StatusCode::UNAUTHORIZED, "invalid_recovery_code")),
-        Err(e) => {
-            tracing::error!(?e, "verifying recovery code");
-            Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+/// Translate an `admin_logic::LifecycleError` to the JSON-API error
+/// response shape used across this module.
+fn lifecycle_error_to_response(e: admin_logic::LifecycleError) -> Response {
+    use admin_logic::LifecycleError as L;
+    match e {
+        L::NotFound => err(StatusCode::NOT_FOUND, "user_not_found").into_response(),
+        L::SelfTarget => err(StatusCode::FORBIDDEN, "cannot_target_self").into_response(),
+        L::PeerOrHigher => err(StatusCode::FORBIDDEN, "cannot_target_peer_or_higher").into_response(),
+        L::Conflict(code) => err(StatusCode::CONFLICT, code).into_response(),
+        L::InvalidRecoveryCode => err(StatusCode::UNAUTHORIZED, "invalid_recovery_code").into_response(),
+        L::PendingActionExists => err(StatusCode::CONFLICT, "pending_action_exists").into_response(),
+        L::Internal(inner) => {
+            tracing::error!(?inner, "lifecycle action internal error");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }
 }
 
-fn is_owner_on_owner(admin: &AdminUser, target: &User) -> bool {
-    admin.0.user.instance_role == InstanceRole::Owner
-        && target.instance_role == InstanceRole::Owner
-}
-
-/// Enqueue a pending lifecycle transition (deactivate / delete / purge)
-/// against an Owner target. Mirrors `enqueue_pending_role_change`:
-/// transition row + audit + notification commit together.
-async fn enqueue_pending_lifecycle(
-    state: &AppState,
-    admin: &AdminUser,
-    target: &User,
-    action: notifications::LifecycleAction,
-) -> axum::response::Response {
-    let initiator = admin.0.user.id;
-    let initiator_display_name = admin.0.user.display_name.clone();
-    let target_user_id = target.id;
-    let target_email = target.email.clone();
-    let target_display_name = target.display_name.clone();
-    let actor = admin.actor();
-    let base = state.public_base_url.clone();
-
-    let event_type = match action {
-        notifications::LifecycleAction::Deactivate => "pending_deactivate_initiated",
-        notifications::LifecycleAction::SoftDelete => "pending_soft_delete_initiated",
-        notifications::LifecycleAction::HardDelete => "pending_hard_delete_initiated",
-    };
-
-    let result: anyhow::Result<pending::TransitionRow> = async {
-        let mut tx = state.db.begin().await?;
-        let (transition_id, effective_at) =
-            pending::enqueue_lifecycle(&mut tx, initiator, target_user_id, action).await?;
-
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            event_type,
-            serde_json::json!({
-                "transition_id": transition_id,
-                "initiator_user_id": initiator.0,
-                "target_user_id": target_user_id.0,
-                "action": action,
-                "effective_at": effective_at,
-            }),
-        )
-        .await?;
-
-        notifications::enqueue(
-            &mut tx,
-            notifications::Notification::PendingLifecycleInitiated {
-                recipient_email: target_email,
-                target_display_name,
-                initiator_display_name,
-                action,
-                effective_at,
-                veto_url: format!("{base}/admin/pending-transitions/{transition_id}/veto"),
-                transition_id,
-            },
-        )
-        .await?;
-
-        let row: pending::TransitionRow = sqlx::query_as(
-            "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
-                    effective_at, resolved_at, resolved_by_user_id, resolution,
-                    created_at
-             FROM pending.transitions WHERE id = $1",
-        )
-        .bind(transition_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(row)
-    }
-    .await;
-
-    match result {
-        Ok(row) => (
-            StatusCode::ACCEPTED,
-            Json(PendingTransitionView::from(row)),
-        )
-            .into_response(),
-        Err(e) => {
-            if let Some(pe) = e.downcast_ref::<pending::PendingError>()
-                && matches!(pe, pending::PendingError::PendingActionExists)
-            {
-                return err(StatusCode::CONFLICT, "pending_action_exists").into_response();
-            }
-            tracing::error!(?e, "enqueuing pending lifecycle");
+/// Translate an `admin_logic::RoleError` to the JSON-API error response.
+fn role_error_to_response(e: admin_logic::RoleError) -> Response {
+    use admin_logic::RoleError as R;
+    match e {
+        R::Forbidden => err(StatusCode::FORBIDDEN, "forbidden").into_response(),
+        R::NotFound => err(StatusCode::NOT_FOUND, "user_not_found").into_response(),
+        R::SelfTarget => err(StatusCode::FORBIDDEN, "cannot_target_self").into_response(),
+        R::NotActive => err(StatusCode::CONFLICT, "not_active").into_response(),
+        R::AlreadyInRole => err(StatusCode::CONFLICT, "already_in_role").into_response(),
+        R::InvalidRecoveryCode => err(StatusCode::UNAUTHORIZED, "invalid_recovery_code").into_response(),
+        R::PendingActionExists => err(StatusCode::CONFLICT, "pending_action_exists").into_response(),
+        R::Internal(inner) => {
+            tracing::error!(?inner, "role change internal error");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }
@@ -595,109 +488,16 @@ pub async fn deactivate_user(
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     body: Option<Json<LifecycleActionRequest>>,
-) -> impl IntoResponse {
+) -> Response {
     let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
-
-    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
-        Ok(t) => t,
-        Err(resp) => return resp.into_response(),
-    };
-
-    match target.lifecycle {
-        UserLifecycle::Active => {}
-        UserLifecycle::Deactivated => {
-            return err(StatusCode::CONFLICT, "already_deactivated").into_response();
+    match admin_logic::perform_deactivate(&state, &admin, target_id, bypass_code.as_deref()).await {
+        Ok(Outcome::Applied { target }) => {
+            (StatusCode::OK, Json(LifecycleResponse::from(target))).into_response()
         }
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
-            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+        Ok(Outcome::Pending(row)) => {
+            (StatusCode::ACCEPTED, Json(PendingTransitionView::from(row))).into_response()
         }
-        UserLifecycle::PendingInvite => {
-            return err(StatusCode::CONFLICT, "not_active").into_response();
-        }
-    }
-
-    let owner_on_owner = is_owner_on_owner(&admin, &target);
-    let bypass_code_id = if owner_on_owner {
-        match verify_bypass_code(&state, bypass_code.as_deref()).await {
-            Ok(id) => id,
-            Err(resp) => return resp.into_response(),
-        }
-    } else {
-        None
-    };
-    if owner_on_owner && bypass_code_id.is_none() {
-        return enqueue_pending_lifecycle(
-            &state,
-            &admin,
-            &target,
-            notifications::LifecycleAction::Deactivate,
-        )
-        .await;
-    }
-
-    let actor = admin.actor();
-    let target_user_id = target.id;
-    let target_email = target.email.clone();
-    let target_display_name = target.display_name.clone();
-    let initiator_display_name = admin.0.user.display_name.clone();
-
-    let result: anyhow::Result<User> = async {
-        let mut tx = state.db.begin().await?;
-        let updated = UserRepository::deactivate(&mut tx, target_user_id).await?;
-        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-
-        if let Some(code_id) = bypass_code_id {
-            audit::append(
-                &mut tx,
-                Some(&actor),
-                None,
-                "recovery_code_used",
-                serde_json::json!({
-                    "code_id": code_id,
-                    "used_by": actor.user_id.0,
-                    "target_user_id": target_user_id.0,
-                    "action": "deactivate",
-                }),
-            )
-            .await?;
-        }
-
-        let mut event_data = serde_json::json!({
-            "target_user_id": target_user_id.0,
-            "target_email": target_email,
-            "sessions_revoked": revoked,
-        });
-        if bypass_code_id.is_some() {
-            event_data["via"] = serde_json::Value::String("recovery_bypass".into());
-        }
-        audit::append(&mut tx, Some(&actor), None, "user_deactivated", event_data).await?;
-
-        if bypass_code_id.is_some() {
-            notifications::enqueue(
-                &mut tx,
-                notifications::Notification::PendingLifecycleApplied {
-                    recipient_email: target_email.clone(),
-                    target_display_name: target_display_name.clone(),
-                    initiator_display_name: initiator_display_name.clone(),
-                    action: notifications::LifecycleAction::Deactivate,
-                    via_recovery_bypass: true,
-                    transition_id: None,
-                },
-            )
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(updated)
-    }
-    .await;
-
-    match result {
-        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
-        Err(e) => {
-            tracing::error!(?e, "deactivating user");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
-        }
+        Err(e) => lifecycle_error_to_response(e),
     }
 }
 
@@ -708,54 +508,10 @@ pub async fn reactivate_user(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
-) -> impl IntoResponse {
-    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
-        Ok(t) => t,
-        Err(resp) => return resp.into_response(),
-    };
-
-    match target.lifecycle {
-        UserLifecycle::Deactivated => {}
-        UserLifecycle::Active => {
-            return err(StatusCode::CONFLICT, "already_active").into_response();
-        }
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
-            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
-        }
-        UserLifecycle::PendingInvite => {
-            return err(StatusCode::CONFLICT, "not_deactivated").into_response();
-        }
-    }
-
-    let actor = admin.actor();
-    let target_user_id = target.id;
-    let target_email = target.email.clone();
-
-    let result: anyhow::Result<User> = async {
-        let mut tx = state.db.begin().await?;
-        let updated = UserRepository::reactivate(&mut tx, target_user_id).await?;
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "user_reactivated",
-            serde_json::json!({
-                "target_user_id": target_user_id.0,
-                "target_email": target_email,
-            }),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(updated)
-    }
-    .await;
-
-    match result {
-        Ok(u) => (StatusCode::OK, Json(LifecycleResponse::from(u))).into_response(),
-        Err(e) => {
-            tracing::error!(?e, "reactivating user");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
-        }
+) -> Response {
+    match admin_logic::perform_reactivate(&state, &admin, target_id).await {
+        Ok(user) => (StatusCode::OK, Json(LifecycleResponse::from(user))).into_response(),
+        Err(e) => lifecycle_error_to_response(e),
     }
 }
 
@@ -769,107 +525,14 @@ pub async fn delete_user(
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     body: Option<Json<LifecycleActionRequest>>,
-) -> impl IntoResponse {
+) -> Response {
     let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
-
-    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
-        Ok(t) => t,
-        Err(resp) => return resp.into_response(),
-    };
-
-    match target.lifecycle {
-        UserLifecycle::Active | UserLifecycle::Deactivated => {}
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
-            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+    match admin_logic::perform_soft_delete(&state, &admin, target_id, bypass_code.as_deref()).await {
+        Ok(Outcome::Applied { .. }) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Outcome::Pending(row)) => {
+            (StatusCode::ACCEPTED, Json(PendingTransitionView::from(row))).into_response()
         }
-        UserLifecycle::PendingInvite => {
-            return err(StatusCode::CONFLICT, "not_active").into_response();
-        }
-    }
-
-    let owner_on_owner = is_owner_on_owner(&admin, &target);
-    let bypass_code_id = if owner_on_owner {
-        match verify_bypass_code(&state, bypass_code.as_deref()).await {
-            Ok(id) => id,
-            Err(resp) => return resp.into_response(),
-        }
-    } else {
-        None
-    };
-    if owner_on_owner && bypass_code_id.is_none() {
-        return enqueue_pending_lifecycle(
-            &state,
-            &admin,
-            &target,
-            notifications::LifecycleAction::SoftDelete,
-        )
-        .await;
-    }
-
-    let actor = admin.actor();
-    let target_user_id = target.id;
-    let target_display_name = target.display_name.clone();
-    let initiator_display_name = admin.0.user.display_name.clone();
-
-    let result: anyhow::Result<u64> = async {
-        let mut tx = state.db.begin().await?;
-        let (_redacted, original_email) =
-            UserRepository::soft_delete(&mut tx, target_user_id).await?;
-        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-        auth::delete_credentials(&mut tx, target_user_id).await?;
-
-        if let Some(code_id) = bypass_code_id {
-            audit::append(
-                &mut tx,
-                Some(&actor),
-                None,
-                "recovery_code_used",
-                serde_json::json!({
-                    "code_id": code_id,
-                    "used_by": actor.user_id.0,
-                    "target_user_id": target_user_id.0,
-                    "action": "soft_delete",
-                }),
-            )
-            .await?;
-        }
-
-        let mut event_data = serde_json::json!({
-            "target_user_id": target_user_id.0,
-            "redacted_from_email": original_email,
-            "sessions_revoked": revoked,
-        });
-        if bypass_code_id.is_some() {
-            event_data["via"] = serde_json::Value::String("recovery_bypass".into());
-        }
-        audit::append(&mut tx, Some(&actor), None, "user_deleted", event_data).await?;
-
-        if bypass_code_id.is_some() {
-            notifications::enqueue(
-                &mut tx,
-                notifications::Notification::PendingLifecycleApplied {
-                    recipient_email: original_email.clone(),
-                    target_display_name: target_display_name.clone(),
-                    initiator_display_name: initiator_display_name.clone(),
-                    action: notifications::LifecycleAction::SoftDelete,
-                    via_recovery_bypass: true,
-                    transition_id: None,
-                },
-            )
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(revoked)
-    }
-    .await;
-
-    match result {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(?e, "soft-deleting user");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
-        }
+        Err(e) => lifecycle_error_to_response(e),
     }
 }
 
@@ -883,109 +546,14 @@ pub async fn purge_user(
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     body: Option<Json<LifecycleActionRequest>>,
-) -> impl IntoResponse {
+) -> Response {
     let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
-
-    let target = match resolve_lifecycle_target(&state, &admin, target_id).await {
-        Ok(t) => t,
-        Err(resp) => return resp.into_response(),
-    };
-
-    match target.lifecycle {
-        UserLifecycle::Active | UserLifecycle::Deactivated | UserLifecycle::SoftDeleted => {}
-        UserLifecycle::HardDeleted => {
-            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
+    match admin_logic::perform_hard_delete(&state, &admin, target_id, bypass_code.as_deref()).await {
+        Ok(Outcome::Applied { .. }) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Outcome::Pending(row)) => {
+            (StatusCode::ACCEPTED, Json(PendingTransitionView::from(row))).into_response()
         }
-        UserLifecycle::PendingInvite => {
-            return err(StatusCode::CONFLICT, "not_active").into_response();
-        }
-    }
-
-    let owner_on_owner = is_owner_on_owner(&admin, &target);
-    let bypass_code_id = if owner_on_owner {
-        match verify_bypass_code(&state, bypass_code.as_deref()).await {
-            Ok(id) => id,
-            Err(resp) => return resp.into_response(),
-        }
-    } else {
-        None
-    };
-    if owner_on_owner && bypass_code_id.is_none() {
-        return enqueue_pending_lifecycle(
-            &state,
-            &admin,
-            &target,
-            notifications::LifecycleAction::HardDelete,
-        )
-        .await;
-    }
-
-    let actor = admin.actor();
-    let target_user_id = target.id;
-    let target_display_name = target.display_name.clone();
-    let initiator_display_name = admin.0.user.display_name.clone();
-    let prior_lifecycle = target.lifecycle;
-
-    let result: anyhow::Result<u64> = async {
-        let mut tx = state.db.begin().await?;
-        let (_redacted, original_email) =
-            UserRepository::hard_delete(&mut tx, target_user_id).await?;
-        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-        auth::delete_credentials(&mut tx, target_user_id).await?;
-
-        if let Some(code_id) = bypass_code_id {
-            audit::append(
-                &mut tx,
-                Some(&actor),
-                None,
-                "recovery_code_used",
-                serde_json::json!({
-                    "code_id": code_id,
-                    "used_by": actor.user_id.0,
-                    "target_user_id": target_user_id.0,
-                    "action": "hard_delete",
-                }),
-            )
-            .await?;
-        }
-
-        let mut event_data = serde_json::json!({
-            "target_user_id": target_user_id.0,
-            "redacted_from_email": original_email,
-            "prior_lifecycle": prior_lifecycle,
-            "sessions_revoked": revoked,
-        });
-        if bypass_code_id.is_some() {
-            event_data["via"] = serde_json::Value::String("recovery_bypass".into());
-        }
-        audit::append(&mut tx, Some(&actor), None, "user_purged", event_data).await?;
-
-        if bypass_code_id.is_some() {
-            notifications::enqueue(
-                &mut tx,
-                notifications::Notification::PendingLifecycleApplied {
-                    recipient_email: original_email.clone(),
-                    target_display_name: target_display_name.clone(),
-                    initiator_display_name: initiator_display_name.clone(),
-                    action: notifications::LifecycleAction::HardDelete,
-                    via_recovery_bypass: true,
-                    transition_id: None,
-                },
-            )
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(revoked)
-    }
-    .await;
-
-    match result {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(?e, "purging user");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
-        }
+        Err(e) => lifecycle_error_to_response(e),
     }
 }
 
@@ -1022,151 +590,27 @@ pub async fn change_user_role(
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     Json(req): Json<ChangeRoleRequest>,
-) -> impl IntoResponse {
-    if admin.0.user.instance_role != InstanceRole::Owner {
-        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
-    }
-
-    let target = match state.users.find_any(UserId::new(target_id)).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return err(StatusCode::NOT_FOUND, "user_not_found").into_response(),
-        Err(e) => {
-            tracing::error!(?e, "lookup target user");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-        }
-    };
-
-    if target.id == admin.0.user.id {
-        return err(StatusCode::FORBIDDEN, "cannot_target_self").into_response();
-    }
-
-    match target.lifecycle {
-        UserLifecycle::Active | UserLifecycle::Deactivated => {}
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
-            return err(StatusCode::NOT_FOUND, "user_not_found").into_response();
-        }
-        UserLifecycle::PendingInvite => {
-            return err(StatusCode::CONFLICT, "not_active").into_response();
-        }
-    }
-
-    let from_role = target.instance_role;
-    let to_role = req.role;
-    if from_role == to_role {
-        return err(StatusCode::CONFLICT, "already_in_role").into_response();
-    }
-
-    // If target is an Owner, route through the pending flow unless the
-    // caller presents a valid recovery code.
-    let owner_on_owner = from_role == InstanceRole::Owner;
-
-    let bypass_code_id: Option<Uuid> = if owner_on_owner {
-        match &req.bypass_recovery_code {
-            Some(code) => match auth::recovery_code::verify(&state.db, code).await {
-                Ok(Some(id)) => Some(id),
-                Ok(None) => {
-                    return err(StatusCode::UNAUTHORIZED, "invalid_recovery_code")
-                        .into_response();
-                }
-                Err(e) => {
-                    tracing::error!(?e, "verifying recovery code");
-                    return err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response();
-                }
-            },
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    if owner_on_owner && bypass_code_id.is_none() {
-        return enqueue_pending_role_change(&state, &admin, &target, to_role).await;
-    }
-
-    // Immediate apply path (non-Owner target, or Owner with valid bypass).
-    let actor = admin.actor();
-    let target_user_id = target.id;
-    let target_email = target.email.clone();
-    let target_display_name = target.display_name.clone();
-    let initiator_display_name = admin.0.user.display_name.clone();
-
-    let result: anyhow::Result<User> = async {
-        let mut tx = state.db.begin().await?;
-        let updated = UserRepository::set_instance_role(&mut tx, target_user_id, to_role).await?;
-
-        if let Some(code_id) = bypass_code_id {
-            audit::append(
-                &mut tx,
-                Some(&actor),
-                None,
-                "recovery_code_used",
-                serde_json::json!({
-                    "code_id": code_id,
-                    "used_by": actor.user_id.0,
-                    "target_user_id": target_user_id.0,
-                    "action": "role_change",
-                }),
-            )
-            .await?;
-
-            audit::append(
-                &mut tx,
-                Some(&actor),
-                None,
-                "pending_role_change_applied",
-                serde_json::json!({
-                    "transition_id": serde_json::Value::Null,
-                    "via": "recovery_bypass",
-                    "initiator_user_id": actor.user_id.0,
-                    "target_user_id": target_user_id.0,
-                    "from_role": from_role,
-                    "applied_role": to_role,
-                }),
-            )
-            .await?;
-
-            notifications::enqueue(
-                &mut tx,
-                notifications::Notification::PendingRoleChangeApplied {
-                    recipient_email: target_email.clone(),
-                    target_display_name: target_display_name.clone(),
-                    initiator_display_name: initiator_display_name.clone(),
-                    applied_role: to_role,
-                    via_recovery_bypass: true,
-                    transition_id: None,
-                },
-            )
-            .await?;
-        } else {
-            audit::append(
-                &mut tx,
-                Some(&actor),
-                None,
-                "user_role_changed",
-                serde_json::json!({
-                    "target_user_id": target_user_id.0,
-                    "target_email": target_email,
-                    "from_role": from_role,
-                    "to_role": to_role,
-                }),
-            )
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(updated)
-    }
-    .await;
-
-    match result {
-        Ok(u) => (
+) -> Response {
+    match admin_logic::perform_change_role(
+        &state,
+        &admin,
+        target_id,
+        req.role,
+        req.bypass_recovery_code.as_deref(),
+    )
+    .await
+    {
+        Ok(Outcome::Applied { target }) => (
             StatusCode::OK,
-            Json(ChangeRoleResponse::Applied(LifecycleResponse::from(u))),
+            Json(ChangeRoleResponse::Applied(LifecycleResponse::from(target))),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!(?e, "changing user role");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
-        }
+        Ok(Outcome::Pending(row)) => (
+            StatusCode::ACCEPTED,
+            Json(ChangeRoleResponse::Pending(PendingTransitionView::from(row))),
+        )
+            .into_response(),
+        Err(e) => role_error_to_response(e),
     }
 }
 
@@ -1267,92 +711,6 @@ impl From<pending::TransitionRow> for PendingTransitionView {
             resolved_by_user_id: r.resolved_by_user_id,
             resolution: r.resolution,
             created_at: r.created_at,
-        }
-    }
-}
-
-/// Owner-only: enqueue a pending role change. Helper for `change_user_role`.
-/// All side effects (audit, notification) commit with the pending row.
-async fn enqueue_pending_role_change(
-    state: &AppState,
-    admin: &AdminUser,
-    target: &User,
-    to_role: InstanceRole,
-) -> axum::response::Response {
-    let initiator = admin.0.user.id;
-    let initiator_display_name = admin.0.user.display_name.clone();
-    let target_user_id = target.id;
-    let target_email = target.email.clone();
-    let target_display_name = target.display_name.clone();
-    let from_role = target.instance_role;
-    let actor = admin.actor();
-    let base = state.public_base_url.clone();
-
-    let result: anyhow::Result<pending::TransitionRow> = async {
-        let mut tx = state.db.begin().await?;
-        let (transition_id, effective_at) =
-            pending::enqueue_role_change(&mut tx, initiator, target_user_id, to_role).await?;
-
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "pending_role_change_initiated",
-            serde_json::json!({
-                "transition_id": transition_id,
-                "initiator_user_id": initiator.0,
-                "target_user_id": target_user_id.0,
-                "from_role": from_role,
-                "to_role": to_role,
-                "effective_at": effective_at,
-            }),
-        )
-        .await?;
-
-        notifications::enqueue(
-            &mut tx,
-            notifications::Notification::PendingRoleChangeInitiated {
-                recipient_email: target_email,
-                target_display_name,
-                initiator_display_name,
-                from_role,
-                to_role,
-                effective_at,
-                veto_url: format!("{base}/admin/pending-transitions/{transition_id}/veto"),
-                transition_id,
-            },
-        )
-        .await?;
-
-        let row: pending::TransitionRow = sqlx::query_as(
-            "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
-                    effective_at, resolved_at, resolved_by_user_id, resolution,
-                    created_at
-             FROM pending.transitions WHERE id = $1",
-        )
-        .bind(transition_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(row)
-    }
-    .await;
-
-    match result {
-        Ok(row) => (
-            StatusCode::ACCEPTED,
-            Json(ChangeRoleResponse::Pending(PendingTransitionView::from(row))),
-        )
-            .into_response(),
-        Err(e) => {
-            if let Some(pending_err) = e.downcast_ref::<pending::PendingError>()
-                && matches!(pending_err, pending::PendingError::PendingActionExists)
-            {
-                return err(StatusCode::CONFLICT, "pending_action_exists").into_response();
-            }
-            tracing::error!(?e, "enqueuing pending role change");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }
 }

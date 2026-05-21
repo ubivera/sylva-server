@@ -184,6 +184,10 @@ pub struct TestApp {
     /// — tests that need to observe failure paths swap it via
     /// [`TestApp::set_notifier`].
     pub notification_worker: std::sync::Mutex<notifications::Worker>,
+    /// The CSRF secret used by this app's `AppState`. Held here so tests
+    /// can compute valid tokens via [`TestApp::csrf_for`] without scraping
+    /// rendered HTML.
+    csrf_secret: std::sync::Arc<[u8; hearth::csrf::SECRET_LEN]>,
     #[allow(dead_code)] // retained so a future Drop impl can clean up the DB
     db_name: String,
 }
@@ -241,6 +245,7 @@ impl TestApp {
         // Compose the same shape as production: API under `/api`, the web
         // UI at root, plus `/health`. Mirrors the composition in
         // `hearth::serve` and `web::ui_router`.
+        let csrf_secret = std::sync::Arc::new(hearth::csrf::generate_secret());
         let app_state = app::AppState {
             started_at: Instant::now(),
             db: pool.clone(),
@@ -249,6 +254,7 @@ impl TestApp {
             invitations,
             public_base_url: "http://127.0.0.1:8443".to_string(),
             instance_name: "test-instance".to_string(),
+            csrf_secret: csrf_secret.clone(),
         };
         let health = axum::Router::new()
             .route(
@@ -268,8 +274,33 @@ impl TestApp {
             router,
             pool,
             notification_worker: std::sync::Mutex::new(worker),
+            csrf_secret,
             db_name,
         }
+    }
+
+    /// Compute a CSRF token valid for the given session id. Use this to
+    /// build `csrf_token` form values when posting to web endpoints from
+    /// tests; equivalent to scraping the value out of a rendered form.
+    pub fn csrf_for(&self, session_id: Uuid) -> String {
+        hearth::csrf::compute_token(&self.csrf_secret, session_id)
+    }
+
+    /// Look up the `auth.sessions.id` for a session whose token lives in
+    /// the given `hearth_session=<token>` cookie pair. The web login
+    /// helper returns the full `Set-Cookie` header; trim it down to just
+    /// `hearth_session=<token>` (e.g. via `cookie_name_value`) before
+    /// passing in.
+    pub async fn session_id_for_cookie(&self, cookie_value: &str) -> Uuid {
+        let token = cookie_value
+            .strip_prefix("hearth_session=")
+            .expect("cookie value must start with hearth_session=");
+        let token_hash = auth::hash_token(token);
+        sqlx::query_scalar("SELECT id FROM auth.sessions WHERE token_hash = $1")
+            .bind(&token_hash[..])
+            .fetch_one(&self.pool)
+            .await
+            .expect("looking up session by token hash")
     }
 
     /// Replace the notification worker's notifier (e.g. with
