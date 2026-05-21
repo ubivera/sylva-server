@@ -22,7 +22,7 @@ use crate::{
 };
 
 #[derive(Serialize)]
-pub struct AdminUserView {
+pub struct AdminMemberView {
     pub id: Uuid,
     pub email: String,
     pub display_name: String,
@@ -43,15 +43,15 @@ fn err(code: StatusCode, error: &'static str) -> (StatusCode, Json<ErrorResponse
 }
 
 /// `GET /admin/users` - list every non-purged user. Admin or Owner only.
-pub async fn list_users(
+pub async fn list_members(
     State(state): State<AppState>,
     _admin: AdminUser,
 ) -> impl IntoResponse {
     match state.users.list_all().await {
         Ok(users) => {
-            let views: Vec<AdminUserView> = users
+            let views: Vec<AdminMemberView> = users
                 .into_iter()
-                .map(|u| AdminUserView {
+                .map(|u| AdminMemberView {
                     id: u.id.0,
                     email: u.email,
                     display_name: u.display_name,
@@ -105,7 +105,7 @@ pub async fn create_invite(
     admin: AdminUser,
     Json(req): Json<CreateInviteRequest>,
 ) -> impl IntoResponse {
-    let target_role = req.instance_role.unwrap_or(InstanceRole::User);
+    let target_role = req.instance_role.unwrap_or(InstanceRole::Member);
 
     if req.email.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "email_required").into_response();
@@ -483,7 +483,7 @@ fn role_error_to_response(e: admin_logic::RoleError) -> Response {
 /// every active session; credentials stay so reactivation works without a
 /// password reset. For Owner-on-Owner: routes through the 72h pending
 /// veto flow unless `bypass_recovery_code` is supplied and valid.
-pub async fn deactivate_user(
+pub async fn deactivate_member(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
@@ -504,7 +504,7 @@ pub async fn deactivate_user(
 /// `POST /admin/users/{id}/reactivate` — Deactivated → Active. The user
 /// must sign in again to obtain a new session; their existing password
 /// hash is still valid.
-pub async fn reactivate_user(
+pub async fn reactivate_member(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
@@ -520,7 +520,7 @@ pub async fn reactivate_user(
 /// credentials row, redacts PII. Content the user authored that other
 /// users have access to is preserved (future content-cleanup hook drops
 /// orphans once the apps platform lands).
-pub async fn delete_user(
+pub async fn delete_member(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
@@ -541,7 +541,7 @@ pub async fn delete_user(
 /// effect matches `delete_user`; once content lives in the apps
 /// platform, the content-cleanup hook here drops *all* their content
 /// regardless of collaborators.
-pub async fn purge_user(
+pub async fn purge_member(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
@@ -585,7 +585,7 @@ pub enum ChangeRoleResponse {
 /// - Target is an Owner, `bypass_recovery_code` matches the active code:
 ///   applies immediately, audit-marked `via: "recovery_bypass"`. Returns 200.
 /// - Target is an Owner, `bypass_recovery_code` wrong: 401.
-pub async fn change_user_role(
+pub async fn change_member_role(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,

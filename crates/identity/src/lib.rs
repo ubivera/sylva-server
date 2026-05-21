@@ -69,7 +69,9 @@ pub enum UserLifecycle {
 }
 
 /// Server-level role. Mirrors `identity.instance_role` in SQL. Owner/Admin
-/// semantics are spelled out in `docs/design/authz.md`.
+/// semantics are spelled out in `docs/design/authz.md`. `Member` is the
+/// base role — the rebrand from the older `User` label reflects Hearth's
+/// community-oriented framing (see `hearth-web.md`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize,
 )]
@@ -78,7 +80,23 @@ pub enum UserLifecycle {
 pub enum InstanceRole {
     Owner,
     Admin,
-    User,
+    Member,
+}
+
+/// Distinguishes account-holding people (`Member`) from no-login
+/// share-link holders (`Guest`). Mirrors `identity.user_kind` in SQL.
+/// The Members directory at `/members` filters to `Kind::Member`; the
+/// Guests surface is reserved for the apps-platform checkpoint where
+/// resource-scoped share links materialize.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize, Default,
+)]
+#[sqlx(type_name = "identity.user_kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum UserKind {
+    #[default]
+    Member,
+    Guest,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
@@ -88,6 +106,7 @@ pub struct User {
     pub display_name: String,
     pub lifecycle: UserLifecycle,
     pub instance_role: InstanceRole,
+    pub kind: UserKind,
     pub locale: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -119,7 +138,7 @@ impl UserRepository {
     /// [`UserRepository::find_any`] instead.
     pub async fn find_by_id(&self, id: UserId) -> Result<Option<User>> {
         let user = sqlx::query_as::<_, User>(
-            "SELECT id, email, display_name, lifecycle, instance_role, \
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
                     locale, created_at, updated_at \
              FROM identity.users \
              WHERE id = $1 \
@@ -137,7 +156,7 @@ impl UserRepository {
     /// use this for auth/visibility decisions.
     pub async fn find_any(&self, id: UserId) -> Result<Option<User>> {
         let user = sqlx::query_as::<_, User>(
-            "SELECT id, email, display_name, lifecycle, instance_role, \
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
                     locale, created_at, updated_at \
              FROM identity.users \
              WHERE id = $1",
@@ -150,7 +169,7 @@ impl UserRepository {
 
     pub async fn find_by_email(&self, email: &str) -> Result<Option<User>> {
         let user = sqlx::query_as::<_, User>(
-            "SELECT id, email, display_name, lifecycle, instance_role, \
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
                     locale, created_at, updated_at \
              FROM identity.users \
              WHERE email_lower = lower($1) \
@@ -162,16 +181,20 @@ impl UserRepository {
         Ok(user)
     }
 
-    /// List manageable users (Active, Deactivated, PendingInvite), oldest
-    /// first. Soft- and hard-deleted accounts are hidden — those users are
-    /// "gone" from the directory's perspective; audit events that
-    /// reference them still display via the snapshot `actor_display_name`.
+    /// List manageable Members (Active, Deactivated, PendingInvite),
+    /// oldest first. Filters to `kind = 'member'` so the Members
+    /// directory at `/members` doesn't accidentally surface Guests when
+    /// the apps-platform checkpoint introduces them. Soft- and
+    /// hard-deleted accounts are hidden — those users are "gone" from
+    /// the directory's perspective; audit events that reference them
+    /// still display via the snapshot `actor_display_name`.
     pub async fn list_all(&self) -> Result<Vec<User>> {
         let users = sqlx::query_as::<_, User>(
-            "SELECT id, email, display_name, lifecycle, instance_role, \
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
                     locale, created_at, updated_at \
              FROM identity.users \
              WHERE lifecycle IN ('pending_invite', 'active', 'deactivated') \
+               AND kind = 'member' \
              ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -192,7 +215,7 @@ impl UserRepository {
             "UPDATE identity.users
              SET instance_role = $2, updated_at = now()
              WHERE id = $1
-             RETURNING id, email, display_name, lifecycle, instance_role,
+             RETURNING id, email, display_name, lifecycle, instance_role, kind,
                        locale, created_at, updated_at",
         )
         .bind(id)
@@ -218,7 +241,7 @@ impl UserRepository {
                  locale       = COALESCE($3, locale),
                  updated_at   = now()
              WHERE id = $1
-             RETURNING id, email, display_name, lifecycle, instance_role,
+             RETURNING id, email, display_name, lifecycle, instance_role, kind,
                        locale, created_at, updated_at",
         )
         .bind(id)
@@ -257,7 +280,7 @@ impl UserRepository {
             "UPDATE identity.users
              SET lifecycle = 'deactivated', updated_at = now()
              WHERE id = $1
-             RETURNING id, email, display_name, lifecycle, instance_role,
+             RETURNING id, email, display_name, lifecycle, instance_role, kind,
                        locale, created_at, updated_at",
         )
         .bind(id)
@@ -277,7 +300,7 @@ impl UserRepository {
             "UPDATE identity.users
              SET lifecycle = 'active', updated_at = now()
              WHERE id = $1
-             RETURNING id, email, display_name, lifecycle, instance_role,
+             RETURNING id, email, display_name, lifecycle, instance_role, kind,
                        locale, created_at, updated_at",
         )
         .bind(id)
@@ -334,7 +357,7 @@ async fn redact_and_terminate(
              lifecycle = $2,
              updated_at = now()
          WHERE id = $1
-         RETURNING id, email, display_name, lifecycle, instance_role,
+         RETURNING id, email, display_name, lifecycle, instance_role, kind,
                    locale, created_at, updated_at",
     )
     .bind(id)
@@ -594,7 +617,16 @@ mod tests {
     fn instance_role_serializes_snake_case() {
         assert_eq!(serde_json::to_string(&InstanceRole::Owner).unwrap(), "\"owner\"");
         assert_eq!(serde_json::to_string(&InstanceRole::Admin).unwrap(), "\"admin\"");
-        assert_eq!(serde_json::to_string(&InstanceRole::User).unwrap(), "\"user\"");
+        assert_eq!(
+            serde_json::to_string(&InstanceRole::Member).unwrap(),
+            "\"member\""
+        );
+    }
+
+    #[test]
+    fn user_kind_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&UserKind::Member).unwrap(), "\"member\"");
+        assert_eq!(serde_json::to_string(&UserKind::Guest).unwrap(), "\"guest\"");
     }
 
     #[test]

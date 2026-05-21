@@ -11,7 +11,12 @@ CREATE TYPE identity.user_lifecycle AS ENUM (
 CREATE TYPE identity.instance_role AS ENUM (
     'owner',
     'admin',
-    'user'
+    'member'
+);
+
+CREATE TYPE identity.user_kind AS ENUM (
+    'member',
+    'guest'
 );
 
 CREATE TABLE identity.users (
@@ -20,13 +25,15 @@ CREATE TABLE identity.users (
     email_lower   TEXT GENERATED ALWAYS AS (lower(email)) STORED,
     display_name  TEXT NOT NULL,
     lifecycle     identity.user_lifecycle NOT NULL DEFAULT 'pending_invite',
-    instance_role identity.instance_role NOT NULL DEFAULT 'user',
+    instance_role identity.instance_role NOT NULL DEFAULT 'member',
+    kind          identity.user_kind NOT NULL DEFAULT 'member',
     locale        TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE UNIQUE INDEX users_email_lower_uniq ON identity.users (email_lower);
+CREATE INDEX users_kind_idx ON identity.users (kind);
 
 CREATE TABLE identity.invitations (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -34,7 +41,7 @@ CREATE TABLE identity.invitations (
     email_lower        TEXT GENERATED ALWAYS AS (lower(email)) STORED,
     token_hash         BYTEA NOT NULL,
     invited_by_user_id UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
-    instance_role      identity.instance_role NOT NULL DEFAULT 'user',
+    instance_role      identity.instance_role NOT NULL DEFAULT 'member',
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at         TIMESTAMPTZ NOT NULL,
     accepted_at        TIMESTAMPTZ NULL,

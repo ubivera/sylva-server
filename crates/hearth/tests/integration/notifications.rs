@@ -224,7 +224,7 @@ async fn admin_notifications_supports_state_filter() {
 async fn non_admin_cannot_list_notifications() {
     let app = TestApp::new().await;
     let user = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let tok = app.login(&user.email, "pw").await;
 

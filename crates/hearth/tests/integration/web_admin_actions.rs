@@ -95,13 +95,13 @@ async fn deactivate_without_csrf_returns_403() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", target.id.0),
+        &format!("/members/{}/deactivate", target.id.0),
         &cookie,
         // Empty body → form deserialization fails OR csrf check fails
         String::new(),
@@ -124,13 +124,13 @@ async fn deactivate_with_wrong_csrf_returns_403() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", target.id.0),
+        &format!("/members/{}/deactivate", target.id.0),
         &cookie,
         "csrf_token=00000000000000000000000000000000".to_string(),
     )
@@ -145,17 +145,17 @@ async fn deactivate_with_wrong_csrf_returns_403() {
 #[tokio::test]
 async fn regular_user_cannot_invoke_row_actions() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let target = app
-        .seed_user("target@test.local", "T", "pw", InstanceRole::User)
+        .seed_user("target@test.local", "T", "pw", InstanceRole::Member)
         .await;
     let (cookie, session_id) = web_login_session(&app, "u@test.local", "pw").await;
     let csrf = app.csrf_for(session_id);
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", target.id.0),
+        &format!("/members/{}/deactivate", target.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
@@ -173,21 +173,21 @@ async fn admin_deactivates_user_redirects_with_banner_params() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", target.id.0),
+        &format!("/members/{}/deactivate", target.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = location(&resp);
-    assert!(loc.starts_with("/users?action=deactivated"), "got {loc}");
+    assert!(loc.starts_with("/members?action=deactivated"), "got {loc}");
     assert!(loc.contains("target=Alice"), "got {loc}");
 
     // Confirm DB-side state changed.
@@ -207,7 +207,7 @@ async fn admin_reactivates_deactivated_user() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
         .bind(target.id.0)
@@ -220,13 +220,13 @@ async fn admin_reactivates_deactivated_user() {
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/reactivate", target.id.0),
+        &format!("/members/{}/reactivate", target.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/users?action=reactivated"));
+    assert!(location(&resp).starts_with("/members?action=reactivated"));
 }
 
 #[tokio::test]
@@ -235,20 +235,20 @@ async fn admin_deletes_user() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/delete", target.id.0),
+        &format!("/members/{}/delete", target.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/users?action=deleted"));
+    assert!(location(&resp).starts_with("/members?action=deleted"));
 
     let lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle::text FROM identity.users WHERE id = $1",
@@ -266,20 +266,20 @@ async fn admin_purges_user() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/purge", target.id.0),
+        &format!("/members/{}/purge", target.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/users?action=purged"));
+    assert!(location(&resp).starts_with("/members?action=purged"));
 }
 
 #[tokio::test]
@@ -288,20 +288,20 @@ async fn owner_changes_user_role() {
     app.seed_user("owner@test.local", "Big", "ownerpw", InstanceRole::Owner)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, session_id) = web_login_session(&app, "owner@test.local", "ownerpw").await;
     let csrf = app.csrf_for(session_id);
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/role", target.id.0),
+        &format!("/members/{}/role", target.id.0),
         &cookie,
         format!("csrf_token={}&role=admin", urlencoding(&csrf)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/users?action=role_changed"));
+    assert!(location(&resp).starts_with("/members?action=role_changed"));
 
     let role: String = sqlx::query_scalar(
         "SELECT instance_role::text FROM identity.users WHERE id = $1",
@@ -319,14 +319,14 @@ async fn admin_cannot_change_role() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/role", target.id.0),
+        &format!("/members/{}/role", target.id.0),
         &cookie,
         format!("csrf_token={}&role=admin", urlencoding(&csrf)),
     )
@@ -352,7 +352,7 @@ async fn admin_cannot_target_owner() {
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", owner.id.0),
+        &format!("/members/{}/deactivate", owner.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
@@ -372,7 +372,7 @@ async fn cannot_target_self() {
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", admin.id.0),
+        &format!("/members/{}/deactivate", admin.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
@@ -398,13 +398,13 @@ async fn owner_on_owner_deactivate_routes_to_pending() {
 
     let resp = post_form(
         &app,
-        &format!("/users/{}/deactivate", other.id.0),
+        &format!("/members/{}/deactivate", other.id.0),
         &cookie,
         format!("csrf_token={}", urlencoding(&csrf)),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&resp), "/users?action=pending_deactivate");
+    assert_eq!(location(&resp), "/members?action=pending_deactivate");
 
     // Confirm target is still Active and a pending row exists.
     let lifecycle: String = sqlx::query_scalar(
@@ -440,7 +440,7 @@ async fn kebab_omitted_on_self_row() {
 
     let req = axum::http::Request::builder()
         .method(Method::GET)
-        .uri("/users")
+        .uri("/members")
         .header(header::COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap();
@@ -469,7 +469,7 @@ async fn kebab_omitted_for_admin_viewing_owner() {
 
     let req = axum::http::Request::builder()
         .method(Method::GET)
-        .uri("/users")
+        .uri("/members")
         .header(header::COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap();
@@ -482,11 +482,11 @@ async fn kebab_omitted_for_admin_viewing_owner() {
     // No action form should target the Owner's id.
     let owner_id = owner.id.0;
     assert!(
-        !body.contains(&format!("/users/{owner_id}/deactivate")),
+        !body.contains(&format!("/members/{owner_id}/deactivate")),
         "found owner deactivate action in admin view: {body}"
     );
-    assert!(!body.contains(&format!("/users/{owner_id}/delete")));
-    assert!(!body.contains(&format!("/users/{owner_id}/purge")));
+    assert!(!body.contains(&format!("/members/{owner_id}/delete")));
+    assert!(!body.contains(&format!("/members/{owner_id}/purge")));
 }
 
 #[tokio::test]
@@ -501,7 +501,7 @@ async fn kebab_shown_for_owner_viewing_other_owner() {
 
     let req = axum::http::Request::builder()
         .method(Method::GET)
-        .uri("/users")
+        .uri("/members")
         .header(header::COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap();
@@ -514,8 +514,8 @@ async fn kebab_shown_for_owner_viewing_other_owner() {
     // Other-owner actions should be present (they'll route to pending
     // when invoked, but the UI surface is identical).
     let other_id = other.id.0;
-    assert!(body.contains(&format!("/users/{other_id}/deactivate")));
-    assert!(body.contains(&format!("/users/{other_id}/role")));
+    assert!(body.contains(&format!("/members/{other_id}/deactivate")));
+    assert!(body.contains(&format!("/members/{other_id}/role")));
 }
 
 #[tokio::test]
@@ -527,7 +527,7 @@ async fn success_banner_renders_from_query_params() {
 
     let req = axum::http::Request::builder()
         .method(Method::GET)
-        .uri("/users?action=deactivated&target=Alice")
+        .uri("/members?action=deactivated&target=Alice")
         .header(header::COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap();
@@ -550,7 +550,7 @@ async fn error_banner_renders_from_query_params() {
 
     let req = axum::http::Request::builder()
         .method(Method::GET)
-        .uri("/users?error=cannot_target_peer_or_higher")
+        .uri("/members?error=cannot_target_peer_or_higher")
         .header(header::COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap();
@@ -570,13 +570,13 @@ async fn delete_dialog_renders_with_csrf_input() {
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
     let req = axum::http::Request::builder()
         .method(Method::GET)
-        .uri("/users")
+        .uri("/members")
         .header(header::COOKIE, cookie)
         .body(axum::body::Body::empty())
         .unwrap();
@@ -590,5 +590,5 @@ async fn delete_dialog_renders_with_csrf_input() {
     let target_id = target.id.0;
     assert!(body.contains(&format!(r#"id="dlg-delete-{target_id}""#)));
     assert!(body.contains(r#"name="csrf_token""#));
-    assert!(body.contains(&format!(r#"action="/users/{target_id}/delete""#)));
+    assert!(body.contains(&format!(r#"action="/members/{target_id}/delete""#)));
 }

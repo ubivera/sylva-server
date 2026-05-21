@@ -112,6 +112,7 @@ struct UserWithCredentials {
     display_name: String,
     lifecycle: UserLifecycle,
     instance_role: InstanceRole,
+    kind: identity::UserKind,
     locale: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -126,6 +127,7 @@ impl UserWithCredentials {
             display_name: self.display_name,
             lifecycle: self.lifecycle,
             instance_role: self.instance_role,
+            kind: self.kind,
             locale: self.locale,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -139,8 +141,8 @@ pub async fn verify_credentials(
     password: &str,
 ) -> Result<std::result::Result<User, CredentialOutcome>> {
     let row: Option<UserWithCredentials> = sqlx::query_as(
-        "SELECT u.id, u.email, u.display_name, u.lifecycle, u.instance_role, u.locale,
-                u.created_at, u.updated_at,
+        "SELECT u.id, u.email, u.display_name, u.lifecycle, u.instance_role, u.kind,
+                u.locale, u.created_at, u.updated_at,
                 c.password_hash
          FROM identity.users u
          JOIN auth.credentials c ON c.user_id = u.id

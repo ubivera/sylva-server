@@ -12,7 +12,7 @@ const PW: &str = "secret-pw";
 async fn app_with_user() -> (TestApp, SeededUser, String) {
     let app = TestApp::new().await;
     let user = app
-        .seed_user("u@test.local", "U Person", PW, InstanceRole::User)
+        .seed_user("u@test.local", "U Person", PW, InstanceRole::Member)
         .await;
     let token = app.login(&user.email, PW).await;
     (app, user, token)
@@ -292,10 +292,10 @@ async fn revoke_own_session_succeeds_and_kills_token() {
 async fn revoke_another_users_session_returns_404() {
     let app = TestApp::new().await;
     let alice = app
-        .seed_user("alice@test.local", "Alice", "alpw", InstanceRole::User)
+        .seed_user("alice@test.local", "Alice", "alpw", InstanceRole::Member)
         .await;
     let bob = app
-        .seed_user("bob@test.local", "Bob", "bopw", InstanceRole::User)
+        .seed_user("bob@test.local", "Bob", "bopw", InstanceRole::Member)
         .await;
     let alice_token = app.login(&alice.email, "alpw").await;
     let bob_token = app.login(&bob.email, "bopw").await;
@@ -354,10 +354,10 @@ struct ActivityEvent {
 async fn activity_scopes_to_caller() {
     let app = TestApp::new().await;
     let alice = app
-        .seed_user("a@test.local", "A", "ap", InstanceRole::User)
+        .seed_user("a@test.local", "A", "ap", InstanceRole::Member)
         .await;
     let _bob = app
-        .seed_user("b@test.local", "B", "bp", InstanceRole::User)
+        .seed_user("b@test.local", "B", "bp", InstanceRole::Member)
         .await;
     let a_token = app.login(&alice.email, "ap").await;
 

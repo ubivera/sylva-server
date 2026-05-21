@@ -78,12 +78,12 @@ struct AuditItem {
 async fn regular_user_blocked_from_admin_routes() {
     let app = TestApp::new().await;
     let u = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let tok = app.login(&u.email, "pw").await;
 
     for route in [
-        ("GET", "/api/admin/users"),
+        ("GET", "/api/admin/members"),
         ("GET", "/api/admin/invites"),
         ("POST", "/api/admin/invites"),
         ("GET", "/api/admin/audit"),
@@ -110,7 +110,7 @@ async fn regular_user_blocked_from_admin_routes() {
 #[tokio::test]
 async fn unauthenticated_admin_routes_return_401() {
     let app = TestApp::new().await;
-    let resp = app.get("/api/admin/users", None).await;
+    let resp = app.get("/api/admin/members", None).await;
     resp.assert_status(StatusCode::UNAUTHORIZED);
 }
 
@@ -121,7 +121,7 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
     let (app, owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
     // Deactivated user - still in the directory.
     let ghost = app
-        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
+        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::Member)
         .await;
     sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
         .bind(ghost.id)
@@ -130,7 +130,7 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
         .unwrap();
     // Soft-deleted user - hidden.
     let gone = app
-        .seed_user("gone@test.local", "Gone", "pw", InstanceRole::User)
+        .seed_user("gone@test.local", "Gone", "pw", InstanceRole::Member)
         .await;
     sqlx::query("UPDATE identity.users SET lifecycle = 'soft_deleted' WHERE id = $1")
         .bind(gone.id)
@@ -139,7 +139,7 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
         .unwrap();
     // Hard-deleted user - hidden.
     let purged = app
-        .seed_user("purged@test.local", "Purged", "pw", InstanceRole::User)
+        .seed_user("purged@test.local", "Purged", "pw", InstanceRole::Member)
         .await;
     sqlx::query("UPDATE identity.users SET lifecycle = 'hard_deleted' WHERE id = $1")
         .bind(purged.id)
@@ -147,7 +147,7 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
         .await
         .unwrap();
 
-    let resp = app.get("/api/admin/users", Some(&owner_tok)).await;
+    let resp = app.get("/api/admin/members", Some(&owner_tok)).await;
     resp.assert_status(StatusCode::OK);
     let users: Vec<AdminUserView> = resp.json();
     let emails: Vec<&str> = users.iter().map(|u| u.email.as_str()).collect();
@@ -180,7 +180,7 @@ async fn create_invite_emits_token_and_audit() {
     resp.assert_status(StatusCode::CREATED);
     let body: CreateInviteResp = resp.json();
     assert_eq!(body.email, "alice@test.local");
-    assert_eq!(body.instance_role, InstanceRole::User); // default
+    assert_eq!(body.instance_role, InstanceRole::Member); // default
     assert_eq!(body.token.len(), 64);
 
     // Audit event landed.
@@ -609,12 +609,12 @@ async fn seed_user_token(
 async fn deactivate_then_reactivate_cycle() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, user_tok) =
-        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
+        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::Member).await;
 
     // Deactivate.
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/deactivate"),
+            &format!("/api/admin/members/{user_id}/deactivate"),
             Some(&owner_tok),
             None,
         )
@@ -641,7 +641,7 @@ async fn deactivate_then_reactivate_cycle() {
     // Reactivate.
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/reactivate"),
+            &format!("/api/admin/members/{user_id}/reactivate"),
             Some(&owner_tok),
             None,
         )
@@ -664,10 +664,10 @@ async fn deactivate_then_reactivate_cycle() {
 async fn deactivate_already_deactivated_returns_409() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
-        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
+        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::Member).await;
 
     app.post(
-        &format!("/api/admin/users/{user_id}/deactivate"),
+        &format!("/api/admin/members/{user_id}/deactivate"),
         Some(&owner_tok),
         None,
     )
@@ -676,7 +676,7 @@ async fn deactivate_already_deactivated_returns_409() {
 
     let again = app
         .post(
-            &format!("/api/admin/users/{user_id}/deactivate"),
+            &format!("/api/admin/members/{user_id}/deactivate"),
             Some(&owner_tok),
             None,
         )
@@ -690,11 +690,11 @@ async fn deactivate_already_deactivated_returns_409() {
 async fn reactivate_already_active_returns_409() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
-        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::User).await;
+        seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::Member).await;
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/reactivate"),
+            &format!("/api/admin/members/{user_id}/reactivate"),
             Some(&owner_tok),
             None,
         )
@@ -709,7 +709,7 @@ async fn cannot_target_self_for_any_lifecycle_action() {
     for action in ["deactivate", "reactivate", "delete", "purge"] {
         let resp = app
             .post(
-                &format!("/api/admin/users/{}/{action}", owner.id.0),
+                &format!("/api/admin/members/{}/{action}", owner.id.0),
                 Some(&owner_tok),
                 None,
             )
@@ -739,7 +739,7 @@ async fn admin_cannot_act_on_peer_admin() {
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/deactivate", admin2.id.0),
+            &format!("/api/admin/members/{}/deactivate", admin2.id.0),
             Some(&tok1),
             None,
         )
@@ -753,7 +753,7 @@ async fn admin_cannot_act_on_owner() {
     let (app, owner, _owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/deactivate", owner.id.0),
+            &format!("/api/admin/members/{}/deactivate", owner.id.0),
             Some(&admin_tok),
             None,
         )
@@ -767,7 +767,7 @@ async fn owner_can_deactivate_admin() {
     let (app, _owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/deactivate", admin.id.0),
+            &format!("/api/admin/members/{}/deactivate", admin.id.0),
             Some(&owner_tok),
             None,
         )
@@ -782,7 +782,7 @@ async fn lifecycle_action_on_unknown_user_returns_404() {
     for action in ["deactivate", "reactivate", "delete", "purge"] {
         let resp = app
             .post(
-                &format!("/api/admin/users/{bogus}/{action}"),
+                &format!("/api/admin/members/{bogus}/{action}"),
                 Some(&owner_tok),
                 None,
             )
@@ -800,11 +800,11 @@ async fn lifecycle_action_on_unknown_user_returns_404() {
 async fn delete_redacts_pii_and_frees_email() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, user_tok) =
-        seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::User).await;
+        seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::Member).await;
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/delete"),
+            &format!("/api/admin/members/{user_id}/delete"),
             Some(&owner_tok),
             None,
         )
@@ -869,11 +869,11 @@ async fn delete_redacts_pii_and_frees_email() {
 async fn purge_can_target_already_soft_deleted_user() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
-        seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::User).await;
+        seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::Member).await;
 
     // Soft-delete first.
     app.post(
-        &format!("/api/admin/users/{user_id}/delete"),
+        &format!("/api/admin/members/{user_id}/delete"),
         Some(&owner_tok),
         None,
     )
@@ -883,7 +883,7 @@ async fn purge_can_target_already_soft_deleted_user() {
     // Purge a soft-deleted user.
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/purge"),
+            &format!("/api/admin/members/{user_id}/purge"),
             Some(&owner_tok),
             None,
         )
@@ -914,11 +914,11 @@ async fn purge_can_target_already_soft_deleted_user() {
 async fn purge_directly_from_active_works() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
-        seed_user_token(&app, "v@test.local", "V", "pw", InstanceRole::User).await;
+        seed_user_token(&app, "v@test.local", "V", "pw", InstanceRole::Member).await;
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/purge"),
+            &format!("/api/admin/members/{user_id}/purge"),
             Some(&owner_tok),
             None,
         )
@@ -938,10 +938,10 @@ async fn purge_directly_from_active_works() {
 async fn deleted_user_is_invisible_to_admin_list() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
-        seed_user_token(&app, "vanish@test.local", "Vanish", "pw", InstanceRole::User).await;
+        seed_user_token(&app, "vanish@test.local", "Vanish", "pw", InstanceRole::Member).await;
 
     app.post(
-        &format!("/api/admin/users/{user_id}/delete"),
+        &format!("/api/admin/members/{user_id}/delete"),
         Some(&owner_tok),
         None,
     )
@@ -949,7 +949,7 @@ async fn deleted_user_is_invisible_to_admin_list() {
     .assert_status(StatusCode::NO_CONTENT);
 
     let list: Vec<AdminUserView> = app
-        .get("/api/admin/users", Some(&owner_tok))
+        .get("/api/admin/members", Some(&owner_tok))
         .await
         .json();
     assert!(
@@ -962,11 +962,11 @@ async fn deleted_user_is_invisible_to_admin_list() {
 async fn reactivate_only_works_from_deactivated_state() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
-        seed_user_token(&app, "u@test.local", "U", "pw", InstanceRole::User).await;
+        seed_user_token(&app, "u@test.local", "U", "pw", InstanceRole::Member).await;
 
     // Soft-delete then attempt reactivate → 404 (account is gone).
     app.post(
-        &format!("/api/admin/users/{user_id}/delete"),
+        &format!("/api/admin/members/{user_id}/delete"),
         Some(&owner_tok),
         None,
     )
@@ -975,7 +975,7 @@ async fn reactivate_only_works_from_deactivated_state() {
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{user_id}/reactivate"),
+            &format!("/api/admin/members/{user_id}/reactivate"),
             Some(&owner_tok),
             None,
         )
@@ -988,14 +988,14 @@ async fn reactivate_only_works_from_deactivated_state() {
 async fn deactivate_revokes_all_sessions() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let user = app
-        .seed_user("multi@test.local", "Multi", "pw", InstanceRole::User)
+        .seed_user("multi@test.local", "Multi", "pw", InstanceRole::Member)
         .await;
     let t1 = app.login(&user.email, "pw").await;
     let t2 = app.login(&user.email, "pw").await;
     let t3 = app.login(&user.email, "pw").await;
 
     app.post(
-        &format!("/api/admin/users/{}/deactivate", user.id.0),
+        &format!("/api/admin/members/{}/deactivate", user.id.0),
         Some(&owner_tok),
         None,
     )
@@ -1027,12 +1027,12 @@ async fn deactivate_revokes_all_sessions() {
 async fn owner_promotes_user_to_admin() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let target = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/members/{}/role", target.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1053,14 +1053,14 @@ async fn owner_demotes_admin_to_user() {
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", admin.id.0),
+            &format!("/api/admin/members/{}/role", admin.id.0),
             Some(&owner_tok),
-            Some(json!({ "role": "user" })),
+            Some(json!({ "role": "member" })),
         )
         .await;
     resp.assert_status(StatusCode::OK);
     let body: LifecycleBody = resp.json();
-    assert_eq!(body.instance_role, InstanceRole::User);
+    assert_eq!(body.instance_role, InstanceRole::Member);
 
     // Audit recorded both ends.
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
@@ -1072,7 +1072,7 @@ async fn owner_demotes_admin_to_user() {
     .await
     .unwrap();
     assert_eq!(event_data["from_role"].as_str(), Some("admin"));
-    assert_eq!(event_data["to_role"].as_str(), Some("user"));
+    assert_eq!(event_data["to_role"].as_str(), Some("member"));
 }
 
 #[tokio::test]
@@ -1081,7 +1081,7 @@ async fn owner_can_promote_admin_to_owner_multi_owner() {
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", admin.id.0),
+            &format!("/api/admin/members/{}/role", admin.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "owner" })),
         )
@@ -1110,7 +1110,7 @@ async fn owner_can_demote_another_owner_via_recovery_bypass() {
     let recovery = app.seed_recovery_code().await;
 
     app.post(
-        &format!("/api/admin/users/{}/role", admin.id.0),
+        &format!("/api/admin/members/{}/role", admin.id.0),
         Some(&owner_tok),
         Some(json!({ "role": "owner" })),
     )
@@ -1119,7 +1119,7 @@ async fn owner_can_demote_another_owner_via_recovery_bypass() {
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", admin.id.0),
+            &format!("/api/admin/members/{}/role", admin.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin", "bypass_recovery_code": recovery })),
         )
@@ -1133,12 +1133,12 @@ async fn owner_can_demote_another_owner_via_recovery_bypass() {
 async fn admin_cannot_change_roles() {
     let (app, _owner, _owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
     let target = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/members/{}/role", target.id.0),
             Some(&admin_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1154,14 +1154,14 @@ async fn regular_user_cannot_change_roles() {
         .seed_user("owner@test.local", "Owner", "ownerpw", InstanceRole::Owner)
         .await;
     let user = app
-        .seed_user("u@test.local", "U", "upw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "upw", InstanceRole::Member)
         .await;
     let user_tok = app.login(&user.email, "upw").await;
 
     // The AdminUser extractor itself returns 403 here.
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", owner.id.0),
+            &format!("/api/admin/members/{}/role", owner.id.0),
             Some(&user_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1174,7 +1174,7 @@ async fn change_role_blocks_self_target() {
     let (app, owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", owner.id.0),
+            &format!("/api/admin/members/{}/role", owner.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1187,14 +1187,14 @@ async fn change_role_blocks_self_target() {
 async fn change_role_same_role_returns_409() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let target = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/members/{}/role", target.id.0),
             Some(&owner_tok),
-            Some(json!({ "role": "user" })),
+            Some(json!({ "role": "member" })),
         )
         .await;
     resp.assert_status(StatusCode::CONFLICT)
@@ -1205,12 +1205,12 @@ async fn change_role_same_role_returns_409() {
 async fn change_role_on_deleted_user_returns_404() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let target = app
-        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
+        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::Member)
         .await;
 
     // Soft-delete first.
     app.post(
-        &format!("/api/admin/users/{}/delete", target.id.0),
+        &format!("/api/admin/members/{}/delete", target.id.0),
         Some(&owner_tok),
         None,
     )
@@ -1219,7 +1219,7 @@ async fn change_role_on_deleted_user_returns_404() {
 
     let resp = app
         .post(
-            &format!("/api/admin/users/{}/role", target.id.0),
+            &format!("/api/admin/members/{}/role", target.id.0),
             Some(&owner_tok),
             Some(json!({ "role": "admin" })),
         )
@@ -1238,7 +1238,7 @@ async fn demoted_owner_loses_powers_on_next_request() {
     let recovery = app.seed_recovery_code().await;
 
     app.post(
-        &format!("/api/admin/users/{}/role", admin.id.0),
+        &format!("/api/admin/members/{}/role", admin.id.0),
         Some(&owner1_tok),
         Some(json!({ "role": "owner" })),
     )
@@ -1247,14 +1247,14 @@ async fn demoted_owner_loses_powers_on_next_request() {
 
     let owner2_tok = app.login(&admin.email, "adminpw").await;
 
-    app.get("/api/admin/users", Some(&owner2_tok))
+    app.get("/api/admin/members", Some(&owner2_tok))
         .await
         .assert_status(StatusCode::OK);
 
     app.post(
-        &format!("/api/admin/users/{}/role", admin.id.0),
+        &format!("/api/admin/members/{}/role", admin.id.0),
         Some(&owner1_tok),
-        Some(json!({ "role": "user", "bypass_recovery_code": recovery })),
+        Some(json!({ "role": "member", "bypass_recovery_code": recovery })),
     )
     .await
     .assert_status(StatusCode::OK);
@@ -1262,9 +1262,9 @@ async fn demoted_owner_loses_powers_on_next_request() {
     let me = app.get("/api/me", Some(&owner2_tok)).await;
     me.assert_status(StatusCode::OK);
     let me_body: serde_json::Value = me.json();
-    assert_eq!(me_body["instance_role"].as_str(), Some("user"));
+    assert_eq!(me_body["instance_role"].as_str(), Some("member"));
 
-    app.get("/api/admin/users", Some(&owner2_tok))
+    app.get("/api/admin/members", Some(&owner2_tok))
         .await
         .assert_status(StatusCode::FORBIDDEN);
 }

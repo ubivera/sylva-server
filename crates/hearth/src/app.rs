@@ -86,20 +86,20 @@ pub fn api_router(state: AppState) -> Router {
             "/account/sessions/{id}/revoke",
             post(account_routes::revoke_session),
         )
-        .route("/admin/users", get(admin_routes::list_users))
+        .route("/admin/members", get(admin_routes::list_members))
         .route(
-            "/admin/users/{id}/deactivate",
-            post(admin_routes::deactivate_user),
+            "/admin/members/{id}/deactivate",
+            post(admin_routes::deactivate_member),
         )
         .route(
-            "/admin/users/{id}/reactivate",
-            post(admin_routes::reactivate_user),
+            "/admin/members/{id}/reactivate",
+            post(admin_routes::reactivate_member),
         )
-        .route("/admin/users/{id}/delete", post(admin_routes::delete_user))
-        .route("/admin/users/{id}/purge", post(admin_routes::purge_user))
+        .route("/admin/members/{id}/delete", post(admin_routes::delete_member))
+        .route("/admin/members/{id}/purge", post(admin_routes::purge_member))
         .route(
-            "/admin/users/{id}/role",
-            post(admin_routes::change_user_role),
+            "/admin/members/{id}/role",
+            post(admin_routes::change_member_role),
         )
         .route(
             "/admin/invites",

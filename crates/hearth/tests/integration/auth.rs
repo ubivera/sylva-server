@@ -74,7 +74,7 @@ async fn login_unknown_email_returns_same_generic_401() {
 async fn login_deactivated_user_treated_as_unknown() {
     let app = TestApp::new().await;
     let user = app
-        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
+        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::Member)
         .await;
     sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
         .bind(user.id)
@@ -176,7 +176,7 @@ async fn seed_pending_invite(
 async fn accept_invite_creates_user_and_issues_session() {
     let (app, owner) = app_with_owner().await;
     let (_inv_id, token) =
-        seed_pending_invite(&app.pool, owner.id, "alice@test.local", InstanceRole::User).await;
+        seed_pending_invite(&app.pool, owner.id, "alice@test.local", InstanceRole::Member).await;
 
     let resp = app
         .post(
@@ -196,7 +196,7 @@ async fn accept_invite_creates_user_and_issues_session() {
     // The returned session should authenticate.
     let me: MeBody = app.get("/api/me", Some(&body.token)).await.json();
     assert_eq!(me.email, "alice@test.local");
-    assert_eq!(me.instance_role, InstanceRole::User);
+    assert_eq!(me.instance_role, InstanceRole::Member);
 }
 
 #[tokio::test]
@@ -221,7 +221,7 @@ async fn accept_invite_rejects_invalid_token() {
 async fn accept_invite_rejects_expired_token() {
     let (app, owner) = app_with_owner().await;
     let (inv_id, token) =
-        seed_pending_invite(&app.pool, owner.id, "exp@test.local", InstanceRole::User).await;
+        seed_pending_invite(&app.pool, owner.id, "exp@test.local", InstanceRole::Member).await;
 
     // Forcibly expire it.
     sqlx::query("UPDATE identity.invitations SET expires_at = now() - interval '1 hour' WHERE id = $1")
@@ -249,7 +249,7 @@ async fn accept_invite_rejects_expired_token() {
 async fn accept_invite_rejects_revoked_token() {
     let (app, owner) = app_with_owner().await;
     let (inv_id, token) =
-        seed_pending_invite(&app.pool, owner.id, "rev@test.local", InstanceRole::User).await;
+        seed_pending_invite(&app.pool, owner.id, "rev@test.local", InstanceRole::Member).await;
 
     sqlx::query("UPDATE identity.invitations SET revoked_at = now() WHERE id = $1")
         .bind(inv_id)
@@ -276,7 +276,7 @@ async fn accept_invite_rejects_revoked_token() {
 async fn accept_invite_rejects_already_accepted_token() {
     let (app, owner) = app_with_owner().await;
     let (_inv_id, token) =
-        seed_pending_invite(&app.pool, owner.id, "twice@test.local", InstanceRole::User).await;
+        seed_pending_invite(&app.pool, owner.id, "twice@test.local", InstanceRole::Member).await;
 
     // First accept succeeds.
     let first = app
@@ -313,7 +313,7 @@ async fn accept_invite_rejects_already_accepted_token() {
 async fn accept_invite_validates_display_name_and_password() {
     let (app, owner) = app_with_owner().await;
     let (_inv_id, token) =
-        seed_pending_invite(&app.pool, owner.id, "v@test.local", InstanceRole::User).await;
+        seed_pending_invite(&app.pool, owner.id, "v@test.local", InstanceRole::Member).await;
 
     let r1 = app
         .post(
@@ -378,7 +378,7 @@ async fn token_hash_is_what_lives_in_the_db_not_raw() {
     // Defense-in-depth: the raw token must never appear in identity.invitations.
     let (app, owner) = app_with_owner().await;
     let (inv_id, token) =
-        seed_pending_invite(&app.pool, owner.id, "h@test.local", InstanceRole::User).await;
+        seed_pending_invite(&app.pool, owner.id, "h@test.local", InstanceRole::Member).await;
     let expected_hash = hash_invite_token(&token);
 
     let stored: Vec<u8> =

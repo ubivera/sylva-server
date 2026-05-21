@@ -27,7 +27,7 @@ pub fn csrf_input(token: &str) -> Markup {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PageId {
     Profile,
-    Users,
+    Members,
 }
 
 /// Sortable column on `/users`. Default is `Joined` ascending, which
@@ -200,7 +200,7 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
             nav class="nav-links" {
                 (nav_link("/me", "Profile", current == PageId::Profile))
                 @if is_admin {
-                    (nav_link("/users", "Users", current == PageId::Users))
+                    (nav_link("/members", "Members", current == PageId::Members))
                 }
             }
 
@@ -273,7 +273,7 @@ fn role_class(role: InstanceRole) -> &'static str {
     match role {
         InstanceRole::Owner => "role-badge role-owner",
         InstanceRole::Admin => "role-badge role-admin",
-        InstanceRole::User => "role-badge role-user",
+        InstanceRole::Member => "role-badge role-member",
     }
 }
 
@@ -281,7 +281,7 @@ fn role_label(role: InstanceRole) -> &'static str {
     match role {
         InstanceRole::Owner => "Owner",
         InstanceRole::Admin => "Admin",
-        InstanceRole::User => "User",
+        InstanceRole::Member => "Member",
     }
 }
 
@@ -368,26 +368,26 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
 
 /// Banner inputs surfaced from `?action=...&target=...` (success) or
 /// `?error=...` (failure) query params after a row-action redirect.
-pub struct UsersBanner<'a> {
+pub struct MembersBanner<'a> {
     pub action: Option<&'a str>,
     pub target: Option<&'a str>,
     pub error: Option<&'a str>,
 }
 
-/// `GET /users` page — admin-only directory of every non-purged account.
-/// Renders as a table; soft/hard-deleted users are filtered out by
-/// [`identity::UserRepository::list_all`]. Each row carries a kebab
-/// (`<details>`) menu whose contents depend on the viewer's role and the
-/// target's lifecycle (see [`available_actions`]).
+/// `GET /members` page — admin-only directory of every non-purged Member.
+/// Renders as a table; soft/hard-deleted accounts and Guests are filtered
+/// out by [`identity::UserRepository::list_all`]. Each row carries a
+/// kebab (`<details>`) menu whose contents depend on the viewer's role
+/// and the target's lifecycle (see [`available_actions`]).
 ///
 /// `sort` controls server-side row ordering (the handler in `routes.rs`
 /// pre-sorts the slice before passing it in). The table headers render
 /// as links that flip direction when clicked on the active column or
 /// reset to ascending on a new column.
-pub fn users_page(
+pub fn members_page(
     ctx: &ChromeContext,
-    users: &[User],
-    banner: UsersBanner<'_>,
+    members: &[User],
+    banner: MembersBanner<'_>,
     sort: SortState,
 ) -> Markup {
     let content = html! {
@@ -395,18 +395,18 @@ pub fn users_page(
         div class="users-toolbar" {
             input type="search" id="users-search" class="users-search"
                   placeholder="Search by name or email…" autocomplete="off"
-                  aria-label="Search users";
+                  aria-label="Search members";
         }
-        @if users.is_empty() {
+        @if members.is_empty() {
             div class="card" {
-                p class="muted" { "No users yet." }
+                p class="muted" { "No members yet." }
             }
         } @else {
             div class="card users-card" {
                 table class="users-table" {
                     thead {
                         tr {
-                            (sortable_th("User", SortColumn::Name, sort, ""))
+                            (sortable_th("Member", SortColumn::Name, sort, ""))
                             (sortable_th("Role", SortColumn::Role, sort, ""))
                             (sortable_th("Status", SortColumn::Status, sort, ""))
                             (sortable_th("Joined", SortColumn::Joined, sort, "col-date"))
@@ -414,8 +414,8 @@ pub fn users_page(
                         }
                     }
                     tbody {
-                        @for u in users {
-                            (user_row(ctx.user, u, ctx.csrf_token))
+                        @for u in members {
+                            (member_row(ctx.user, u, ctx.csrf_token))
                         }
                     }
                 }
@@ -426,10 +426,10 @@ pub fn users_page(
         // input. No framework, no XHR; sort still happens server-side
         // via the header links above. ~12 lines.
         script {
-            (maud::PreEscaped(USERS_SEARCH_JS))
+            (maud::PreEscaped(MEMBERS_SEARCH_JS))
         }
     };
-    shell_app(ctx, "Users", PageId::Users, content)
+    shell_app(ctx, "Members", PageId::Members, content)
 }
 
 /// Render one sortable column header. Active column gets an asc/desc
@@ -443,7 +443,7 @@ fn sortable_th(label: &str, column: SortColumn, sort: SortState, extra_class: &s
     } else {
         SortDirection::Asc
     };
-    let href = format!("/users?sort={}&dir={}", column.as_str(), next_dir.as_str());
+    let href = format!("/members?sort={}&dir={}", column.as_str(), next_dir.as_str());
     let mut classes = String::from("col-sortable");
     if is_active {
         classes.push(' ');
@@ -471,7 +471,7 @@ fn sortable_th(label: &str, column: SortColumn, sort: SortState, extra_class: &s
     }
 }
 
-const USERS_SEARCH_JS: &str = r#"
+const MEMBERS_SEARCH_JS: &str = r#"
 (function() {
     var input = document.getElementById('users-search');
     if (!input) return;
@@ -486,7 +486,7 @@ const USERS_SEARCH_JS: &str = r#"
 })();
 "#;
 
-fn user_row(viewer: &User, target: &User, csrf_token: &str) -> Markup {
+fn member_row(viewer: &User, target: &User, csrf_token: &str) -> Markup {
     let is_self = viewer.id == target.id;
     let initial = display_initial(&target.display_name);
     let color = avatar_color(&target.id.0);
@@ -562,8 +562,8 @@ fn available_actions(
     // anyone; Owner-on-Owner ops route through the pending flow at the
     // backend, but the UI surface is identical.
     let can_act = match viewer {
-        InstanceRole::User => false,
-        InstanceRole::Admin => matches!(target_role, InstanceRole::User),
+        InstanceRole::Member => false,
+        InstanceRole::Admin => matches!(target_role, InstanceRole::Member),
         InstanceRole::Owner => true,
     };
     if !can_act {
@@ -630,13 +630,13 @@ fn render_action_item(action: RowAction, target: &User, csrf_token: &str) -> Mar
     let id = target.id.0;
     match action {
         RowAction::Deactivate => html! {
-            form method="post" action=(format!("/users/{id}/deactivate")) class="row-action-form" {
+            form method="post" action=(format!("/members/{id}/deactivate")) class="row-action-form" {
                 (csrf_input(csrf_token))
                 button type="submit" class="row-action-item" { "Deactivate" }
             }
         },
         RowAction::Reactivate => html! {
-            form method="post" action=(format!("/users/{id}/reactivate")) class="row-action-form" {
+            form method="post" action=(format!("/members/{id}/reactivate")) class="row-action-form" {
                 (csrf_input(csrf_token))
                 button type="submit" class="row-action-item" { "Reactivate" }
             }
@@ -667,7 +667,7 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
     match action {
         RowAction::ChangeRole => html! {
             dialog id=(format!("dlg-role-{id}")) class="action-dialog" {
-                form method="post" action=(format!("/users/{id}/role")) {
+                form method="post" action=(format!("/members/{id}/role")) {
                     h2 { "Change role for " (name) }
                     p class="dialog-note" {
                         "If the target is an Owner, a 72-hour veto window "
@@ -677,9 +677,9 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                         span { "New role" }
                         select name="role" required {
                             @let current = target.instance_role;
-                            option value="user"  selected[current == InstanceRole::User]  { "User" }
-                            option value="admin" selected[current == InstanceRole::Admin] { "Admin" }
-                            option value="owner" selected[current == InstanceRole::Owner] { "Owner" }
+                            option value="member" selected[current == InstanceRole::Member] { "Member" }
+                            option value="admin"  selected[current == InstanceRole::Admin]  { "Admin" }
+                            option value="owner"  selected[current == InstanceRole::Owner]  { "Owner" }
                         }
                     }
                     (csrf_input(csrf_token))
@@ -692,7 +692,7 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
         },
         RowAction::Delete => html! {
             dialog id=(format!("dlg-delete-{id}")) class="action-dialog" {
-                form method="post" action=(format!("/users/{id}/delete")) {
+                form method="post" action=(format!("/members/{id}/delete")) {
                     h2 { "Delete " (name) "?" }
                     p {
                         "Revokes all sessions, removes their credentials, and "
@@ -713,7 +713,7 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
         },
         RowAction::Purge => html! {
             dialog id=(format!("dlg-purge-{id}")) class="action-dialog" {
-                form method="post" action=(format!("/users/{id}/purge")) {
+                form method="post" action=(format!("/members/{id}/purge")) {
                     h2 { "Purge " (name) "?" }
                     p {
                         "Same row-level effect as delete today; once the apps "
@@ -740,7 +740,7 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
 // Banners
 // ────────────────────────────────────────────────────────────────────────
 
-fn render_banner(banner: &UsersBanner<'_>) -> Markup {
+fn render_banner(banner: &MembersBanner<'_>) -> Markup {
     if let Some(error_code) = banner.error {
         return error_banner(error_code);
     }
@@ -751,7 +751,7 @@ fn render_banner(banner: &UsersBanner<'_>) -> Markup {
 }
 
 fn action_banner(action: &str, target: Option<&str>) -> Markup {
-    let name = target.unwrap_or("This user");
+    let name = target.unwrap_or("This member");
     let msg = match action {
         "deactivated" => format!("{name} has been deactivated."),
         "reactivated" => format!("{name} has been reactivated."),
@@ -773,13 +773,13 @@ fn error_banner(error: &str) -> Markup {
     let msg = match error {
         "cannot_target_self" => "You can't target yourself.",
         "cannot_target_peer_or_higher" => "You can't target a peer or higher role.",
-        "already_deactivated" => "That user is already deactivated.",
-        "already_active" => "That user is already active.",
-        "already_in_role" => "That user is already in that role.",
-        "user_not_found" => "User not found.",
-        "not_active" => "That user is in pending invite state and can't be acted on.",
-        "not_deactivated" => "That user isn't deactivated.",
-        "pending_action_exists" => "An action is already pending against that user.",
+        "already_deactivated" => "That member is already deactivated.",
+        "already_active" => "That member is already active.",
+        "already_in_role" => "That member is already in that role.",
+        "user_not_found" => "Member not found.",
+        "not_active" => "That member is in pending invite state and can't be acted on.",
+        "not_deactivated" => "That member isn't deactivated.",
+        "pending_action_exists" => "An action is already pending against that member.",
         "forbidden" => "Only Owners can change roles.",
         "invalid_recovery_code" => "Invalid recovery code.",
         _ => "Something went wrong.",

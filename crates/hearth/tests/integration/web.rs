@@ -77,7 +77,7 @@ async fn login_post_with_valid_creds_redirects_and_sets_cookie() {
 #[tokio::test]
 async fn login_post_with_wrong_password_renders_error() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "rightpw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "rightpw", InstanceRole::Member)
         .await;
 
     let body = "email=u%40test.local&password=wrongpw".to_string();
@@ -197,7 +197,7 @@ async fn login_page_uses_public_shell_not_app_shell() {
 #[tokio::test]
 async fn role_badge_class_matches_user_role() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "Reg User", "userpw", InstanceRole::User)
+    app.seed_user("u@test.local", "Reg User", "userpw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "userpw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
@@ -213,7 +213,7 @@ async fn role_badge_class_matches_user_role() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body_bytes);
-    assert!(body.contains("role-user"));
+    assert!(body.contains("role-member"));
     assert!(!body.contains("role-owner"));
     assert!(!body.contains("role-admin"));
 }
@@ -221,7 +221,7 @@ async fn role_badge_class_matches_user_role() {
 #[tokio::test]
 async fn active_nav_link_is_marked_on_me_page() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
@@ -248,7 +248,7 @@ async fn active_nav_link_is_marked_on_me_page() {
 async fn logout_clears_cookie_and_revokes_session() {
     let app = TestApp::new().await;
     let user = app
-        .seed_user("u@test.local", "U", "pw", InstanceRole::User)
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
@@ -294,7 +294,7 @@ async fn logout_clears_cookie_and_revokes_session() {
 #[tokio::test]
 async fn root_redirects_based_on_auth() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
 
     // Unauthed → /login
@@ -334,7 +334,7 @@ async fn cookie_auth_works_on_json_api_routes() {
     // fallback doesn't only work on web routes — the API surface is
     // also usable from a browser session if you ever want to.
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
@@ -352,7 +352,7 @@ async fn cookie_auth_works_on_json_api_routes() {
 #[tokio::test]
 async fn already_authed_login_page_redirects_to_me() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
@@ -394,19 +394,19 @@ async fn get_with_cookie(app: &TestApp, path: &str, cookie: Option<&str>) -> (St
 #[tokio::test]
 async fn users_page_without_cookie_redirects_to_login() {
     let app = TestApp::new().await;
-    let (status, _) = get_with_cookie(&app, "/users", None).await;
+    let (status, _) = get_with_cookie(&app, "/members", None).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
 async fn users_page_forbidden_for_regular_user() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(
         body.contains("Admins only"),
@@ -419,14 +419,14 @@ async fn users_page_lists_all_users_for_admin() {
     let app = TestApp::new().await;
     app.seed_user("admin@test.local", "Adm In", "pw", InstanceRole::Admin)
         .await;
-    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
-    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::User)
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
 
     // All three seeded users render with email + display name.
@@ -442,7 +442,7 @@ async fn users_page_lists_all_users_for_admin() {
     }
     // Role + status badges rendered.
     assert!(body.contains("role-admin"));
-    assert!(body.contains("role-user"));
+    assert!(body.contains("role-member"));
     assert!(body.contains("status-active"));
     // The viewing admin is tagged as "you".
     assert!(body.contains("row-self-tag"));
@@ -451,14 +451,14 @@ async fn users_page_lists_all_users_for_admin() {
 #[tokio::test]
 async fn users_nav_link_hidden_for_regular_user() {
     let app = TestApp::new().await;
-    app.seed_user("u@test.local", "U", "pw", InstanceRole::User)
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
     let (_, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
     assert!(
-        !body.contains(r#"href="/users""#),
+        !body.contains(r#"href="/members""#),
         "Users nav link should NOT appear for regular users: {body}"
     );
 }
@@ -473,7 +473,7 @@ async fn users_nav_link_visible_for_admin() {
 
     let (_, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
     assert!(
-        body.contains(r#"href="/users""#),
+        body.contains(r#"href="/members""#),
         "Users nav link should appear for admins: {body}"
     );
 }
@@ -486,10 +486,10 @@ async fn active_nav_link_is_marked_on_users_page() {
     let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains(r#"<a class="nav-link active" href="/users""#),
+        body.contains(r#"<a class="nav-link active" href="/members""#),
         "Users nav link should be marked active on /users: {body}"
     );
 }
@@ -499,12 +499,12 @@ async fn users_page_renders_search_input_and_data_search_attributes() {
     let app = TestApp::new().await;
     app.seed_user("admin@test.local", "Adm In", "pw", InstanceRole::Admin)
         .await;
-    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     // The search input is present.
     assert!(body.contains(r#"id="users-search""#));
@@ -523,15 +523,15 @@ async fn users_page_sort_default_is_joined_ascending() {
         .await;
     // Seed the userss in a non-alphabetical insert order so a default
     // "by joined ASC" sort can be observed.
-    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
-    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::User)
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::Member)
         .await;
 
     let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (_, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    let (_, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     // Default sort is `joined`, asc → first-seeded user appears before
     // later-seeded users in the rendered body.
     let admin_pos = body.find("admin@test.local").expect("admin row");
@@ -552,15 +552,15 @@ async fn users_page_sort_by_name_desc_reverses_order() {
     let app = TestApp::new().await;
     app.seed_user("admin@test.local", "M Admin", "pw", InstanceRole::Admin)
         .await;
-    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
-    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::User)
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::Member)
         .await;
 
     let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (_, body) = get_with_cookie(&app, "/users?sort=name&dir=desc", Some(&cookie)).await;
+    let (_, body) = get_with_cookie(&app, "/members?sort=name&dir=desc", Some(&cookie)).await;
     // name desc → "M Admin" < "Bob" < "Alice" reverse-alphabetical
     // (case-insensitive comparison: alice < bob < m admin → reversed)
     let admin_pos = body.find("admin@test.local").expect("admin row");
@@ -581,11 +581,11 @@ async fn users_page_sort_header_link_flips_direction_on_active_column() {
     // Visit with sort=name&dir=asc — the "User" column should be active
     // (asc) and its link should flip to desc on the next click. Maud
     // HTML-escapes `&` in attribute values, so we match `&amp;`.
-    let (_, body) = get_with_cookie(&app, "/users?sort=name&dir=asc", Some(&cookie)).await;
-    assert!(body.contains(r#"href="/users?sort=name&amp;dir=desc""#));
+    let (_, body) = get_with_cookie(&app, "/members?sort=name&dir=asc", Some(&cookie)).await;
+    assert!(body.contains(r#"href="/members?sort=name&amp;dir=desc""#));
     // Other columns reset to asc when clicked from a different sort.
-    assert!(body.contains(r#"href="/users?sort=role&amp;dir=asc""#));
-    assert!(body.contains(r#"href="/users?sort=joined&amp;dir=asc""#));
+    assert!(body.contains(r#"href="/members?sort=role&amp;dir=asc""#));
+    assert!(body.contains(r#"href="/members?sort=joined&amp;dir=asc""#));
 }
 
 #[tokio::test]
@@ -598,7 +598,7 @@ async fn users_page_invalid_sort_param_falls_back_to_default() {
 
     let (status, body) = get_with_cookie(
         &app,
-        "/users?sort=nonsense&dir=sideways",
+        "/members?sort=nonsense&dir=sideways",
         Some(&cookie),
     )
     .await;
@@ -613,7 +613,7 @@ async fn users_page_renders_deactivated_status_badge() {
     app.seed_user("owner@test.local", "Big Boss", "pw", InstanceRole::Owner)
         .await;
     let deactivated = app
-        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::User)
+        .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::Member)
         .await;
 
     // Flip the lifecycle directly to skip the audit + session side effects
@@ -627,7 +627,7 @@ async fn users_page_renders_deactivated_status_badge() {
     let set_cookie = web_login(&app, "owner@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("status-active"));
     assert!(

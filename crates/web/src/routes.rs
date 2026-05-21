@@ -168,7 +168,7 @@ pub async fn me_page(
 /// ordering. All optional — missing values get sensible defaults
 /// (`SortColumn::Joined`, `SortDirection::Asc`, no banner).
 #[derive(Deserialize, Default)]
-pub struct UsersPageQuery {
+pub struct MembersPageQuery {
     pub action: Option<String>,
     pub target: Option<String>,
     pub error: Option<String>,
@@ -203,7 +203,7 @@ fn sort_users(users: &mut [identity::User], sort: views::SortState) {
         match r {
             identity::InstanceRole::Owner => 0,
             identity::InstanceRole::Admin => 1,
-            identity::InstanceRole::User => 2,
+            identity::InstanceRole::Member => 2,
         }
     }
     fn status_rank(l: identity::UserLifecycle) -> u8 {
@@ -237,14 +237,15 @@ fn sort_users(users: &mut [identity::User], sort: views::SortState) {
     });
 }
 
-/// `GET /users` — admin-only directory of every non-purged user.
-/// Mirrors the JSON `/api/admin/users` endpoint shape. Regular users
-/// (role = `User`) get a 403 error page; the Users nav link is hidden
-/// from them in the chrome too, so this gate is the defense in depth.
-pub async fn users_page(
+/// `GET /members` — admin-only directory of every non-purged Member.
+/// Mirrors the JSON `/api/admin/members` endpoint shape. Regular members
+/// (role = `Member`) get a 403 error page; the Members nav link is
+/// hidden from them in the chrome too, so this gate is the defense in
+/// depth.
+pub async fn members_page(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
-    Query(query): Query<UsersPageQuery>,
+    Query(query): Query<MembersPageQuery>,
 ) -> Response {
     if !matches!(
         auth.user.instance_role,
@@ -253,27 +254,27 @@ pub async fn users_page(
         return error_response(StatusCode::FORBIDDEN, "Admins only.");
     }
     match state.users.list_all().await {
-        Ok(mut users) => {
+        Ok(mut members) => {
             let sort = views::SortState {
                 column: parse_sort_column(query.sort.as_deref()),
                 direction: parse_sort_direction(query.dir.as_deref()),
             };
-            sort_users(&mut users, sort);
+            sort_users(&mut members, sort);
             let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
             let ctx = views::ChromeContext {
                 instance_name: &state.instance_name,
                 user: &auth.user,
                 csrf_token: &csrf_token,
             };
-            let banner = views::UsersBanner {
+            let banner = views::MembersBanner {
                 action: query.action.as_deref(),
                 target: query.target.as_deref(),
                 error: query.error.as_deref(),
             };
-            Html(views::users_page(&ctx, &users, banner, sort).into_string()).into_response()
+            Html(views::members_page(&ctx, &members, banner, sort).into_string()).into_response()
         }
         Err(err) => {
-            tracing::error!(?err, "listing users for /users page");
+            tracing::error!(?err, "listing members for /members page");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
         }
     }
