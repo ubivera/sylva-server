@@ -495,6 +495,119 @@ async fn active_nav_link_is_marked_on_users_page() {
 }
 
 #[tokio::test]
+async fn users_page_renders_search_input_and_data_search_attributes() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm In", "pw", InstanceRole::Admin)
+        .await;
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    // The search input is present.
+    assert!(body.contains(r#"id="users-search""#));
+    assert!(body.contains("Search by name or email"));
+    // Each row carries a lowercased data-search haystack of name + email.
+    assert!(body.contains(r#"data-search="alice alice@test.local""#));
+    assert!(body.contains(r#"data-search="adm in admin@test.local""#));
+    // The inline filter script is on the page.
+    assert!(body.contains("users-search"));
+}
+
+#[tokio::test]
+async fn users_page_sort_default_is_joined_ascending() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Z Admin", "pw", InstanceRole::Admin)
+        .await;
+    // Seed the userss in a non-alphabetical insert order so a default
+    // "by joined ASC" sort can be observed.
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .await;
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::User)
+        .await;
+
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (_, body) = get_with_cookie(&app, "/users", Some(&cookie)).await;
+    // Default sort is `joined`, asc → first-seeded user appears before
+    // later-seeded users in the rendered body.
+    let admin_pos = body.find("admin@test.local").expect("admin row");
+    let alice_pos = body.find("alice@test.local").expect("alice row");
+    let bob_pos = body.find("bob@test.local").expect("bob row");
+    assert!(admin_pos < alice_pos, "admin should appear before alice");
+    assert!(alice_pos < bob_pos, "alice should appear before bob");
+
+    // Joined column header should be marked `aria-sort=ascending`.
+    assert!(
+        body.contains(r#"aria-sort="ascending""#),
+        "expected joined column to be ascending: {body}"
+    );
+}
+
+#[tokio::test]
+async fn users_page_sort_by_name_desc_reverses_order() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "M Admin", "pw", InstanceRole::Admin)
+        .await;
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::User)
+        .await;
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::User)
+        .await;
+
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (_, body) = get_with_cookie(&app, "/users?sort=name&dir=desc", Some(&cookie)).await;
+    // name desc → "M Admin" < "Bob" < "Alice" reverse-alphabetical
+    // (case-insensitive comparison: alice < bob < m admin → reversed)
+    let admin_pos = body.find("admin@test.local").expect("admin row");
+    let alice_pos = body.find("alice@test.local").expect("alice row");
+    let bob_pos = body.find("bob@test.local").expect("bob row");
+    assert!(admin_pos < bob_pos, "M Admin should come before Bob when name desc");
+    assert!(bob_pos < alice_pos, "Bob should come before Alice when name desc");
+}
+
+#[tokio::test]
+async fn users_page_sort_header_link_flips_direction_on_active_column() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    // Visit with sort=name&dir=asc — the "User" column should be active
+    // (asc) and its link should flip to desc on the next click. Maud
+    // HTML-escapes `&` in attribute values, so we match `&amp;`.
+    let (_, body) = get_with_cookie(&app, "/users?sort=name&dir=asc", Some(&cookie)).await;
+    assert!(body.contains(r#"href="/users?sort=name&amp;dir=desc""#));
+    // Other columns reset to asc when clicked from a different sort.
+    assert!(body.contains(r#"href="/users?sort=role&amp;dir=asc""#));
+    assert!(body.contains(r#"href="/users?sort=joined&amp;dir=asc""#));
+}
+
+#[tokio::test]
+async fn users_page_invalid_sort_param_falls_back_to_default() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(
+        &app,
+        "/users?sort=nonsense&dir=sideways",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Garbage params shouldn't crash; we fall back to joined asc.
+    assert!(body.contains(r#"aria-sort="ascending""#));
+}
+
+#[tokio::test]
 async fn users_page_renders_deactivated_status_badge() {
     let app = TestApp::new().await;
     app.seed_user("owner@test.local", "Big Boss", "pw", InstanceRole::Owner)

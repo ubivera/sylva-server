@@ -30,6 +30,59 @@ pub enum PageId {
     Users,
 }
 
+/// Sortable column on `/users`. Default is `Joined` ascending, which
+/// matches the historical behavior of `UserRepository::list_all`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortColumn {
+    Name,
+    Role,
+    Status,
+    #[default]
+    Joined,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SortState {
+    pub column: SortColumn,
+    pub direction: SortDirection,
+}
+
+impl SortColumn {
+    /// URL token for `?sort=...`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortColumn::Name => "name",
+            SortColumn::Role => "role",
+            SortColumn::Status => "status",
+            SortColumn::Joined => "joined",
+        }
+    }
+}
+
+impl SortDirection {
+    /// URL token for `?dir=...`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortDirection::Asc => "asc",
+            SortDirection::Desc => "desc",
+        }
+    }
+
+    pub fn flip(self) -> Self {
+        match self {
+            SortDirection::Asc => SortDirection::Desc,
+            SortDirection::Desc => SortDirection::Asc,
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Public shell (login, error, install wizard)
 // ────────────────────────────────────────────────────────────────────────
@@ -326,9 +379,24 @@ pub struct UsersBanner<'a> {
 /// [`identity::UserRepository::list_all`]. Each row carries a kebab
 /// (`<details>`) menu whose contents depend on the viewer's role and the
 /// target's lifecycle (see [`available_actions`]).
-pub fn users_page(ctx: &ChromeContext, users: &[User], banner: UsersBanner<'_>) -> Markup {
+///
+/// `sort` controls server-side row ordering (the handler in `routes.rs`
+/// pre-sorts the slice before passing it in). The table headers render
+/// as links that flip direction when clicked on the active column or
+/// reset to ascending on a new column.
+pub fn users_page(
+    ctx: &ChromeContext,
+    users: &[User],
+    banner: UsersBanner<'_>,
+    sort: SortState,
+) -> Markup {
     let content = html! {
         (render_banner(&banner))
+        div class="users-toolbar" {
+            input type="search" id="users-search" class="users-search"
+                  placeholder="Search by name or email…" autocomplete="off"
+                  aria-label="Search users";
+        }
         @if users.is_empty() {
             div class="card" {
                 p class="muted" { "No users yet." }
@@ -338,10 +406,10 @@ pub fn users_page(ctx: &ChromeContext, users: &[User], banner: UsersBanner<'_>) 
                 table class="users-table" {
                     thead {
                         tr {
-                            th { "User" }
-                            th { "Role" }
-                            th { "Status" }
-                            th class="col-date" { "Joined" }
+                            (sortable_th("User", SortColumn::Name, sort, ""))
+                            (sortable_th("Role", SortColumn::Role, sort, ""))
+                            (sortable_th("Status", SortColumn::Status, sort, ""))
+                            (sortable_th("Joined", SortColumn::Joined, sort, "col-date"))
                             th class="col-actions" aria-label="Actions" { "" }
                         }
                     }
@@ -353,9 +421,70 @@ pub fn users_page(ctx: &ChromeContext, users: &[User], banner: UsersBanner<'_>) 
                 }
             }
         }
+        // Tiny client-side filter — hides rows whose `data-search`
+        // attribute (lowercased "<name> <email>") doesn't contain the
+        // input. No framework, no XHR; sort still happens server-side
+        // via the header links above. ~12 lines.
+        script {
+            (maud::PreEscaped(USERS_SEARCH_JS))
+        }
     };
     shell_app(ctx, "Users", PageId::Users, content)
 }
+
+/// Render one sortable column header. Active column gets an asc/desc
+/// indicator + `aria-sort`; inactive columns get a neutral indicator.
+/// Clicking the active column flips direction; clicking an inactive
+/// column resets to ascending.
+fn sortable_th(label: &str, column: SortColumn, sort: SortState, extra_class: &str) -> Markup {
+    let is_active = column == sort.column;
+    let next_dir = if is_active {
+        sort.direction.flip()
+    } else {
+        SortDirection::Asc
+    };
+    let href = format!("/users?sort={}&dir={}", column.as_str(), next_dir.as_str());
+    let mut classes = String::from("col-sortable");
+    if is_active {
+        classes.push(' ');
+        classes.push_str(match sort.direction {
+            SortDirection::Asc => "col-sort-asc",
+            SortDirection::Desc => "col-sort-desc",
+        });
+    }
+    if !extra_class.is_empty() {
+        classes.push(' ');
+        classes.push_str(extra_class);
+    }
+    let aria_sort = if is_active {
+        match sort.direction {
+            SortDirection::Asc => "ascending",
+            SortDirection::Desc => "descending",
+        }
+    } else {
+        "none"
+    };
+    html! {
+        th class=(classes) aria-sort=(aria_sort) {
+            a href=(href) class="col-sort-link" { (label) }
+        }
+    }
+}
+
+const USERS_SEARCH_JS: &str = r#"
+(function() {
+    var input = document.getElementById('users-search');
+    if (!input) return;
+    var rows = document.querySelectorAll('.users-table tbody tr');
+    input.addEventListener('input', function() {
+        var q = input.value.toLowerCase().trim();
+        rows.forEach(function(tr) {
+            var hay = tr.getAttribute('data-search') || '';
+            tr.style.display = (q === '' || hay.indexOf(q) !== -1) ? '' : 'none';
+        });
+    });
+})();
+"#;
 
 fn user_row(viewer: &User, target: &User, csrf_token: &str) -> Markup {
     let is_self = viewer.id == target.id;
@@ -369,9 +498,16 @@ fn user_row(viewer: &User, target: &User, csrf_token: &str) -> Markup {
         target.lifecycle,
         is_self,
     );
+    // Combined haystack the inline search JS scans against. Lowercased
+    // once on the server so the client-side filter is plain substring.
+    let search_hay = format!(
+        "{} {}",
+        target.display_name.to_lowercase(),
+        target.email.to_lowercase()
+    );
 
     html! {
-        tr class="user-row" {
+        tr class="user-row" data-search=(search_hay) {
             td class="user-row-cell" {
                 div class="user-row-id" {
                     span class="avatar avatar-sm" style=(format!("background:{color}")) {

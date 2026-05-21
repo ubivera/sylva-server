@@ -163,15 +163,78 @@ pub async fn me_page(
     Html(views::me_page(&ctx).into_string()).into_response()
 }
 
-/// Query params surfaced on the `/users` page after a row-action
-/// redirect. Either `action` (success) or `error` (failure) will be set,
-/// never both; `target` is the display name to interpolate into the
-/// success banner.
+/// Query params on `/users`. `action` / `target` / `error` carry the
+/// post-action banner state; `sort` / `dir` drive server-side row
+/// ordering. All optional — missing values get sensible defaults
+/// (`SortColumn::Joined`, `SortDirection::Asc`, no banner).
 #[derive(Deserialize, Default)]
 pub struct UsersPageQuery {
     pub action: Option<String>,
     pub target: Option<String>,
     pub error: Option<String>,
+    pub sort: Option<String>,
+    pub dir: Option<String>,
+}
+
+fn parse_sort_column(s: Option<&str>) -> views::SortColumn {
+    match s {
+        Some("name") => views::SortColumn::Name,
+        Some("role") => views::SortColumn::Role,
+        Some("status") => views::SortColumn::Status,
+        // "joined" — and anything unrecognised — falls back to the default.
+        _ => views::SortColumn::Joined,
+    }
+}
+
+fn parse_sort_direction(s: Option<&str>) -> views::SortDirection {
+    match s {
+        Some("desc") => views::SortDirection::Desc,
+        _ => views::SortDirection::Asc,
+    }
+}
+
+/// Sort `users` in place per the requested column + direction. Stable
+/// secondary key is `created_at` so equally-ranked users have a
+/// deterministic order between page loads.
+fn sort_users(users: &mut [identity::User], sort: views::SortState) {
+    use views::{SortColumn, SortDirection};
+
+    fn role_rank(r: identity::InstanceRole) -> u8 {
+        match r {
+            identity::InstanceRole::Owner => 0,
+            identity::InstanceRole::Admin => 1,
+            identity::InstanceRole::User => 2,
+        }
+    }
+    fn status_rank(l: identity::UserLifecycle) -> u8 {
+        // Surface live accounts first, then dormant, then terminal —
+        // matches what an operator usually wants to see at a glance.
+        match l {
+            identity::UserLifecycle::Active => 0,
+            identity::UserLifecycle::PendingInvite => 1,
+            identity::UserLifecycle::Deactivated => 2,
+            identity::UserLifecycle::SoftDeleted => 3,
+            identity::UserLifecycle::HardDeleted => 4,
+        }
+    }
+
+    users.sort_by(|a, b| {
+        let primary = match sort.column {
+            SortColumn::Name => a
+                .display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase()),
+            SortColumn::Role => role_rank(a.instance_role).cmp(&role_rank(b.instance_role)),
+            SortColumn::Status => status_rank(a.lifecycle).cmp(&status_rank(b.lifecycle)),
+            SortColumn::Joined => a.created_at.cmp(&b.created_at),
+        };
+        let primary = if sort.direction == SortDirection::Desc {
+            primary.reverse()
+        } else {
+            primary
+        };
+        primary.then_with(|| a.created_at.cmp(&b.created_at))
+    });
 }
 
 /// `GET /users` — admin-only directory of every non-purged user.
@@ -190,7 +253,12 @@ pub async fn users_page(
         return error_response(StatusCode::FORBIDDEN, "Admins only.");
     }
     match state.users.list_all().await {
-        Ok(users) => {
+        Ok(mut users) => {
+            let sort = views::SortState {
+                column: parse_sort_column(query.sort.as_deref()),
+                direction: parse_sort_direction(query.dir.as_deref()),
+            };
+            sort_users(&mut users, sort);
             let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
             let ctx = views::ChromeContext {
                 instance_name: &state.instance_name,
@@ -202,7 +270,7 @@ pub async fn users_page(
                 target: query.target.as_deref(),
                 error: query.error.as_deref(),
             };
-            Html(views::users_page(&ctx, &users, banner).into_string()).into_response()
+            Html(views::users_page(&ctx, &users, banner, sort).into_string()).into_response()
         }
         Err(err) => {
             tracing::error!(?err, "listing users for /users page");
