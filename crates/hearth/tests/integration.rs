@@ -22,3 +22,5 @@ mod notifications;
 mod pending_transitions;
 #[path = "integration/web.rs"]
 mod web;
+#[path = "integration/web_admin_actions.rs"]
+mod web_admin_actions;

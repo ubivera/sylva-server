@@ -14,6 +14,11 @@ pub struct Config {
     /// emails (e.g., invitation accept URLs). Distinct from `listen_addr`
     /// because production sits behind a reverse proxy on a different host.
     pub public_base_url: String,
+    /// Operator-chosen display name for this Hearth instance. Shown in the
+    /// admin UI brand line ("Sylva · {instance_name}") and in page titles.
+    /// Lets an operator running multiple Hearths tell them apart at a
+    /// glance. Defaults to `"Hearth"` when unset.
+    pub instance_name: String,
     pub notifications: NotificationsConfig,
 }
 
@@ -58,6 +63,7 @@ const DEFAULT_LOG_FILTER: &str = "info,hearth=debug";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_POSTGRES_URL: &str = "postgresql://hearth@127.0.0.1:15432/hearth";
 const DEFAULT_PUBLIC_BASE_URL: &str = "http://127.0.0.1:8443";
+const DEFAULT_INSTANCE_NAME: &str = "Hearth";
 const DEFAULT_NOTIFICATIONS_MODE: &str = "disabled";
 const DEFAULT_SMTP_PORT: u16 = 587;
 const DEFAULT_SMTP_TLS: &str = "starttls";
@@ -109,6 +115,11 @@ impl Config {
             .trim_end_matches('/')
             .to_string();
 
+        let instance_name = get("HEARTH_INSTANCE_NAME")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_string());
+
         let notifications = parse_notifications(&get)?;
 
         Ok(Self {
@@ -118,6 +129,7 @@ impl Config {
             data_dir,
             postgres_url,
             public_base_url,
+            instance_name,
             notifications,
         })
     }

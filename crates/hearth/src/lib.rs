@@ -1,8 +1,10 @@
 pub mod account_routes;
+pub mod admin_logic;
 pub mod admin_routes;
 pub mod app;
 pub mod auth_routes;
 pub mod config;
+pub mod csrf;
 pub mod db;
 pub mod health;
 #[cfg(windows)]
@@ -66,6 +68,15 @@ async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
     .await
     .context("starting bundled postgres")?;
 
+    // Postgres opens its TCP listener before the SQL layer accepts queries
+    // (especially after an unclean prior shutdown — crash recovery + fsync
+    // of the data dir can take 20+ seconds). Without this gate, the very
+    // first pool acquire below races and times out.
+    db::wait_until_ready(&config.postgres_url)
+        .await
+        .context("waiting for postgres SQL layer to come up")?;
+    tracing::info!("bundled postgres SQL layer ready");
+
     let serve_result = serve(&config, started_at, ui_router).await;
 
     if let Err(err) = postgres.stop().await {
@@ -113,6 +124,8 @@ async fn serve(
         sessions,
         invitations,
         public_base_url: config.public_base_url.clone(),
+        instance_name: config.instance_name.clone(),
+        csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
     };
 
     let health = axum::Router::new()

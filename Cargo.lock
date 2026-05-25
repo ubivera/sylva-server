@@ -612,12 +612,16 @@ dependencies = [
  "authz",
  "axum",
  "chrono",
+ "hmac",
  "identity",
  "notifications",
  "pending",
+ "rand",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
+ "subtle",
  "thiserror",
  "tokio",
  "tower",
@@ -2438,6 +2442,7 @@ dependencies = [
  "audit",
  "auth",
  "axum",
+ "chrono",
  "hearth",
  "identity",
  "maud",
@@ -2445,6 +2450,7 @@ dependencies = [
  "serde_json",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

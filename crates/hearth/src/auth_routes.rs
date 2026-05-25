@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{FromRequestParts, State},
     http::{StatusCode, header::AUTHORIZATION, request::Parts},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use identity::{InstanceRole, User, UserId};
@@ -345,71 +345,77 @@ pub struct AcceptInviteRequest {
     pub password: String,
 }
 
-/// `POST /auth/accept-invite` - public endpoint. Given a valid one-time
-/// invitation token plus a display name and password, creates the user,
-/// stores their password hash, marks the invitation accepted, and issues
-/// a session in a single transaction. Returns the same shape as `/auth/login`
-/// so the client can drop the response straight into its auth state.
-pub async fn accept_invite(
-    State(state): State<AppState>,
-    Json(req): Json<AcceptInviteRequest>,
-) -> impl IntoResponse {
-    if req.display_name.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "display_name_required",
-            }),
-        )
-            .into_response();
+/// What `perform_accept_invite` returns on success: the new user id,
+/// the issued session row, and the raw session token to hand to the
+/// caller (cookie for web, JSON for API). The session row is included
+/// for `expires_at` so JSON callers can mirror the `/auth/login` shape.
+pub struct AcceptInviteOutcome {
+    pub user_id: UserId,
+    pub session: auth::Session,
+    pub raw_session_token: String,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AcceptInviteError {
+    #[error("display_name_required")]
+    DisplayNameRequired,
+    #[error("password_required")]
+    PasswordRequired,
+    #[error("invalid_or_expired_token")]
+    InvalidOrExpiredToken,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Materialize an account from a one-time invitation token. Creates the
+/// user, stores the password hash, marks the invitation accepted, and
+/// issues a session — all in a single transaction so a partial accept
+/// can't leave the invitation row inconsistent with the user/credential
+/// rows. Shared by the JSON [`accept_invite`] handler and the web
+/// `/invite/{token}` flow.
+pub async fn perform_accept_invite(
+    state: &AppState,
+    raw_invite_token: &str,
+    display_name: &str,
+    password: &str,
+) -> Result<AcceptInviteOutcome, AcceptInviteError> {
+    let trimmed_name = display_name.trim();
+    if trimmed_name.is_empty() {
+        return Err(AcceptInviteError::DisplayNameRequired);
     }
-    if req.password.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "password_required",
-            }),
-        )
-            .into_response();
+    if password.is_empty() {
+        return Err(AcceptInviteError::PasswordRequired);
     }
 
-    let invitation = match state.invitations.find_active(&req.token).await {
-        Ok(Some(inv)) => inv,
-        Ok(None) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "invalid_or_expired_token",
-                }),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            tracing::error!(?err, "looking up invitation");
-            return internal_error().into_response();
-        }
-    };
+    let invitation = state
+        .invitations
+        .find_active(raw_invite_token)
+        .await
+        .map_err(|e| AcceptInviteError::Internal(e.into()))?
+        .ok_or(AcceptInviteError::InvalidOrExpiredToken)?;
 
-    let password_hash = match auth::hash_password(&req.password) {
-        Ok(h) => h,
-        Err(err) => {
-            tracing::error!(?err, "hashing password");
-            return internal_error().into_response();
-        }
-    };
+    let password_hash =
+        auth::hash_password(password).map_err(|e| AcceptInviteError::Internal(e.into()))?;
 
-    let result: anyhow::Result<LoginResponse> = async {
+    let display_name_owned = trimmed_name.to_string();
+    let invitation_id = invitation.id;
+    let invitation_email = invitation.email.clone();
+    let invitation_role = invitation.instance_role;
+
+    let result: anyhow::Result<AcceptInviteOutcome> = async {
         let mut tx = state.db.begin().await?;
 
-        // Create the user with the role embedded in the invitation.
+        // Create the user with the role embedded in the invitation. The
+        // `kind` column defaults to `'member'` per the migration so we
+        // don't need to set it explicitly.
         let new_user_id: Uuid = sqlx::query_scalar(
             "INSERT INTO identity.users (email, display_name, lifecycle, instance_role)
              VALUES ($1, $2, 'active', $3)
              RETURNING id",
         )
-        .bind(&invitation.email)
-        .bind(req.display_name.trim())
-        .bind(invitation.instance_role)
+        .bind(&invitation_email)
+        .bind(&display_name_owned)
+        .bind(invitation_role)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -423,12 +429,12 @@ pub async fn accept_invite(
 
         identity::InvitationRepository::mark_accepted(
             &mut tx,
-            invitation.id,
+            invitation_id,
             UserId::new(new_user_id),
         )
         .await?;
 
-        let (session, raw_token) = SessionRepository::create(
+        let (session, raw_session_token) = SessionRepository::create(
             &mut tx,
             UserId::new(new_user_id),
             auth::DEFAULT_SESSION_TTL,
@@ -437,7 +443,7 @@ pub async fn accept_invite(
 
         let actor = Actor {
             user_id: UserId::new(new_user_id),
-            display_name: req.display_name.trim().to_string(),
+            display_name: display_name_owned.clone(),
         };
         audit::append(
             &mut tx,
@@ -445,9 +451,9 @@ pub async fn accept_invite(
             None,
             "invite_accepted",
             serde_json::json!({
-                "invitation_id": invitation.id.0,
-                "email": invitation.email,
-                "instance_role": invitation.instance_role,
+                "invitation_id": invitation_id.0,
+                "email": invitation_email,
+                "instance_role": invitation_role,
                 "session_id": session.id,
             }),
         )
@@ -455,17 +461,51 @@ pub async fn accept_invite(
 
         tx.commit().await?;
 
-        Ok(LoginResponse {
-            token: raw_token,
-            expires_at: session.expires_at,
-            user_id: new_user_id,
+        Ok(AcceptInviteOutcome {
+            user_id: UserId::new(new_user_id),
+            session,
+            raw_session_token,
         })
     }
     .await;
 
-    match result {
-        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Err(err) => {
+    result.map_err(AcceptInviteError::Internal)
+}
+
+/// `POST /auth/accept-invite` - public endpoint. Given a valid one-time
+/// invitation token plus a display name and password, creates the user,
+/// stores their password hash, marks the invitation accepted, and issues
+/// a session in a single transaction. Returns the same shape as `/auth/login`
+/// so the client can drop the response straight into its auth state.
+pub async fn accept_invite(
+    State(state): State<AppState>,
+    Json(req): Json<AcceptInviteRequest>,
+) -> Response {
+    match perform_accept_invite(&state, &req.token, &req.display_name, &req.password).await {
+        Ok(outcome) => {
+            let resp = LoginResponse {
+                token: outcome.raw_session_token,
+                expires_at: outcome.session.expires_at,
+                user_id: outcome.user_id.0,
+            };
+            (StatusCode::CREATED, Json(resp)).into_response()
+        }
+        Err(AcceptInviteError::DisplayNameRequired) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "display_name_required" }),
+        )
+            .into_response(),
+        Err(AcceptInviteError::PasswordRequired) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: "password_required" }),
+        )
+            .into_response(),
+        Err(AcceptInviteError::InvalidOrExpiredToken) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse { error: "invalid_or_expired_token" }),
+        )
+            .into_response(),
+        Err(AcceptInviteError::Internal(err)) => {
             tracing::error!(?err, "accepting invitation");
             internal_error().into_response()
         }

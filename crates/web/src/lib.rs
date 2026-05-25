@@ -1,3 +1,4 @@
+pub mod admin_routes;
 pub mod routes;
 pub mod views;
 
@@ -20,7 +21,25 @@ pub fn ui_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::root_redirect))
         .route("/login", get(routes::login_page).post(routes::login_submit))
+        .route(
+            "/invite/{token}",
+            get(routes::accept_invite_form).post(routes::accept_invite_submit),
+        )
         .route("/me", get(routes::me_page))
+        .route("/members", get(routes::members_page))
+        .route(
+            "/members/invite",
+            get(admin_routes::invite_form).post(admin_routes::invite_submit),
+        )
+        .route(
+            "/members/invitations/{id}/revoke",
+            post(admin_routes::revoke_invitation),
+        )
+        .route("/members/{id}/deactivate", post(admin_routes::deactivate_member))
+        .route("/members/{id}/reactivate", post(admin_routes::reactivate_member))
+        .route("/members/{id}/delete", post(admin_routes::delete_member))
+        .route("/members/{id}/purge", post(admin_routes::purge_member))
+        .route("/members/{id}/role", post(admin_routes::change_member_role))
         .route("/logout", post(routes::logout_submit))
         .nest_service("/assets", ServeDir::new(assets_dir()))
         .with_state(state)

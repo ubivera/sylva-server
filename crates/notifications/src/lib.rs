@@ -176,7 +176,7 @@ impl Notification {
                 let role_label = match instance_role {
                     InstanceRole::Owner => "Owner",
                     InstanceRole::Admin => "Admin",
-                    InstanceRole::User => "User",
+                    InstanceRole::Member => "User",
                 };
                 let subject = format!("{inviter_display_name} invited you to Sylva Hearth");
                 let body_text = format!(
@@ -533,7 +533,7 @@ fn role_label(r: InstanceRole) -> &'static str {
     match r {
         InstanceRole::Owner => "Owner",
         InstanceRole::Admin => "Admin",
-        InstanceRole::User => "User",
+        InstanceRole::Member => "User",
     }
 }
 
@@ -1002,7 +1002,7 @@ mod tests {
             inviter_display_name: "<script>alert(1)</script>".into(),
             accept_url: "https://x.test/".into(),
             expires_at: Utc::now(),
-            instance_role: InstanceRole::User,
+            instance_role: InstanceRole::Member,
             invitation_id: Uuid::nil(),
         }
         .render();

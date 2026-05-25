@@ -40,7 +40,7 @@ pub fn outranks(actor: InstanceRole, target: InstanceRole) -> bool {
 
 fn rank(role: InstanceRole) -> u8 {
     match role {
-        InstanceRole::User => 0,
+        InstanceRole::Member => 0,
         InstanceRole::Admin => 1,
         InstanceRole::Owner => 2,
     }
@@ -55,21 +55,21 @@ mod tests {
     fn owner_satisfies_every_role() {
         assert!(satisfies(InstanceRole::Owner, InstanceRole::Owner));
         assert!(satisfies(InstanceRole::Owner, InstanceRole::Admin));
-        assert!(satisfies(InstanceRole::Owner, InstanceRole::User));
+        assert!(satisfies(InstanceRole::Owner, InstanceRole::Member));
     }
 
     #[test]
     fn admin_satisfies_admin_and_user_but_not_owner() {
         assert!(!satisfies(InstanceRole::Admin, InstanceRole::Owner));
         assert!(satisfies(InstanceRole::Admin, InstanceRole::Admin));
-        assert!(satisfies(InstanceRole::Admin, InstanceRole::User));
+        assert!(satisfies(InstanceRole::Admin, InstanceRole::Member));
     }
 
     #[test]
     fn user_satisfies_only_user() {
-        assert!(!satisfies(InstanceRole::User, InstanceRole::Owner));
-        assert!(!satisfies(InstanceRole::User, InstanceRole::Admin));
-        assert!(satisfies(InstanceRole::User, InstanceRole::User));
+        assert!(!satisfies(InstanceRole::Member, InstanceRole::Owner));
+        assert!(!satisfies(InstanceRole::Member, InstanceRole::Admin));
+        assert!(satisfies(InstanceRole::Member, InstanceRole::Member));
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn require_returns_forbidden_when_role_insufficient() {
         assert!(matches!(
-            require(InstanceRole::User, InstanceRole::Admin),
+            require(InstanceRole::Member, InstanceRole::Admin),
             Err(AuthorizationError::Forbidden)
         ));
         assert!(matches!(
@@ -95,17 +95,17 @@ mod tests {
     fn outranks_is_strict() {
         // Owner outranks Admin and User; not another Owner.
         assert!(outranks(InstanceRole::Owner, InstanceRole::Admin));
-        assert!(outranks(InstanceRole::Owner, InstanceRole::User));
+        assert!(outranks(InstanceRole::Owner, InstanceRole::Member));
         assert!(!outranks(InstanceRole::Owner, InstanceRole::Owner));
 
         // Admin outranks User; not Owner or another Admin.
-        assert!(outranks(InstanceRole::Admin, InstanceRole::User));
+        assert!(outranks(InstanceRole::Admin, InstanceRole::Member));
         assert!(!outranks(InstanceRole::Admin, InstanceRole::Admin));
         assert!(!outranks(InstanceRole::Admin, InstanceRole::Owner));
 
         // User outranks nobody.
-        assert!(!outranks(InstanceRole::User, InstanceRole::User));
-        assert!(!outranks(InstanceRole::User, InstanceRole::Admin));
-        assert!(!outranks(InstanceRole::User, InstanceRole::Owner));
+        assert!(!outranks(InstanceRole::Member, InstanceRole::Member));
+        assert!(!outranks(InstanceRole::Member, InstanceRole::Admin));
+        assert!(!outranks(InstanceRole::Member, InstanceRole::Owner));
     }
 }

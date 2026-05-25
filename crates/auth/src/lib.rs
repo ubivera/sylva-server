@@ -112,6 +112,7 @@ struct UserWithCredentials {
     display_name: String,
     lifecycle: UserLifecycle,
     instance_role: InstanceRole,
+    kind: identity::UserKind,
     locale: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -126,6 +127,7 @@ impl UserWithCredentials {
             display_name: self.display_name,
             lifecycle: self.lifecycle,
             instance_role: self.instance_role,
+            kind: self.kind,
             locale: self.locale,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -139,8 +141,8 @@ pub async fn verify_credentials(
     password: &str,
 ) -> Result<std::result::Result<User, CredentialOutcome>> {
     let row: Option<UserWithCredentials> = sqlx::query_as(
-        "SELECT u.id, u.email, u.display_name, u.lifecycle, u.instance_role, u.locale,
-                u.created_at, u.updated_at,
+        "SELECT u.id, u.email, u.display_name, u.lifecycle, u.instance_role, u.kind,
+                u.locale, u.created_at, u.updated_at,
                 c.password_hash
          FROM identity.users u
          JOIN auth.credentials c ON c.user_id = u.id
@@ -371,6 +373,38 @@ impl SessionRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(sessions)
+    }
+
+    /// For each user id in `ids`, return the timestamp of their most
+    /// recent session row's `created_at` (proxy for "last sign-in" /
+    /// last activity). Users with no sessions are absent from the
+    /// returned map — callers should treat that as "never seen".
+    ///
+    /// One round trip via `WHERE user_id = ANY($1)` with a `GROUP BY`,
+    /// rather than N+1 lookups. Includes revoked + expired sessions
+    /// because they still reflect *when* the user last engaged — we're
+    /// not gating live access on this value.
+    pub async fn last_activity_by_user(
+        &self,
+        ids: &[UserId],
+    ) -> Result<std::collections::HashMap<UserId, chrono::DateTime<Utc>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let raw: Vec<uuid::Uuid> = ids.iter().map(|u| u.0).collect();
+        let rows: Vec<(uuid::Uuid, chrono::DateTime<Utc>)> = sqlx::query_as(
+            "SELECT user_id, MAX(created_at)
+             FROM auth.sessions
+             WHERE user_id = ANY($1)
+             GROUP BY user_id",
+        )
+        .bind(&raw[..])
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(uid, ts)| (UserId::new(uid), ts))
+            .collect())
     }
 
     /// Look up a single session row by id (no token-hash check). Returns
