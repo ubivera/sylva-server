@@ -375,6 +375,38 @@ impl SessionRepository {
         Ok(sessions)
     }
 
+    /// For each user id in `ids`, return the timestamp of their most
+    /// recent session row's `created_at` (proxy for "last sign-in" /
+    /// last activity). Users with no sessions are absent from the
+    /// returned map — callers should treat that as "never seen".
+    ///
+    /// One round trip via `WHERE user_id = ANY($1)` with a `GROUP BY`,
+    /// rather than N+1 lookups. Includes revoked + expired sessions
+    /// because they still reflect *when* the user last engaged — we're
+    /// not gating live access on this value.
+    pub async fn last_activity_by_user(
+        &self,
+        ids: &[UserId],
+    ) -> Result<std::collections::HashMap<UserId, chrono::DateTime<Utc>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let raw: Vec<uuid::Uuid> = ids.iter().map(|u| u.0).collect();
+        let rows: Vec<(uuid::Uuid, chrono::DateTime<Utc>)> = sqlx::query_as(
+            "SELECT user_id, MAX(created_at)
+             FROM auth.sessions
+             WHERE user_id = ANY($1)
+             GROUP BY user_id",
+        )
+        .bind(&raw[..])
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(uid, ts)| (UserId::new(uid), ts))
+            .collect())
+    }
+
     /// Look up a single session row by id (no token-hash check). Returns
     /// the session regardless of revoked/expired state so callers can
     /// produce specific error messages.

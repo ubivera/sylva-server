@@ -202,6 +202,31 @@ impl UserRepository {
         Ok(users)
     }
 
+    /// Members in a specific lifecycle state, oldest first. Used by the
+    /// Members page's "Deleted" filter, which surfaces SoftDeleted rows
+    /// that [`list_all`] intentionally hides. Always filters to
+    /// `kind = 'member'`; hard-deleted accounts are never returned (we
+    /// expose them via this method only to round-trip the lifecycle
+    /// filter UX, and `HardDeleted` is the one terminal state with no
+    /// useful directory representation).
+    pub async fn list_with_lifecycle(
+        &self,
+        lifecycle: UserLifecycle,
+    ) -> Result<Vec<User>> {
+        let users = sqlx::query_as::<_, User>(
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
+                    locale, created_at, updated_at \
+             FROM identity.users \
+             WHERE lifecycle = $1 \
+               AND kind = 'member' \
+             ORDER BY created_at",
+        )
+        .bind(lifecycle)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(users)
+    }
+
     /// Set a user's `instance_role` within the caller's transaction.
     /// Bumps `updated_at`. The caller is responsible for the authz check
     /// (only Owner can change roles) and for refusing same-role no-ops

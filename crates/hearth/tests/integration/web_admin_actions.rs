@@ -1,7 +1,3 @@
-//! Integration tests for the per-row admin action endpoints
-//! (`/users/{id}/deactivate`, `/reactivate`, `/delete`, `/purge`,
-//! `/role`) and the surrounding CSRF + kebab UI behavior.
-
 use axum::http::{Method, StatusCode, header};
 use identity::InstanceRole;
 use uuid::Uuid;
@@ -432,9 +428,10 @@ async fn owner_on_owner_deactivate_routes_to_pending() {
 // ────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn kebab_omitted_on_self_row() {
+async fn self_row_kebab_renders_locked_items_only() {
     let app = TestApp::new().await;
-    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+    let admin = app
+        .seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
@@ -450,11 +447,30 @@ async fn kebab_omitted_on_self_row() {
         .unwrap();
     let body = String::from_utf8_lossy(&body_bytes);
 
-    // Admin is the only user → only their own row exists → no kebab
-    // forms should appear anywhere on the page.
-    assert!(!body.contains("/deactivate"));
-    assert!(!body.contains("/delete"));
-    assert!(!body.contains("/purge"));
+    // Admin viewing themselves: the kebab IS rendered (so they see
+    // what would be possible on a non-self target) but every item is
+    // locked — no form `action=` URLs targeting their own user id.
+    assert!(
+        body.contains("row-actions-trigger"),
+        "self-row kebab trigger should be rendered"
+    );
+    assert!(
+        body.contains("row-action-locked"),
+        "self-row items should carry the locked class"
+    );
+    // The page renders the invite modal too (action="/members/invite"),
+    // so we narrow the negative assertion to the self user's per-row
+    // action URLs: those must not appear.
+    let self_id = admin.id.0;
+    for verb in ["deactivate", "reactivate", "delete", "purge", "role"] {
+        let url = format!(r#"action="/members/{self_id}/{verb}""#);
+        assert!(
+            !body.contains(&url),
+            "expected no {verb} form for self-row: {url} present in body"
+        );
+    }
+    // Lock-icon SVG sits inside each locked item.
+    assert!(body.contains("row-action-icon"));
 }
 
 #[tokio::test]
@@ -591,4 +607,455 @@ async fn delete_dialog_renders_with_csrf_input() {
     assert!(body.contains(&format!(r#"id="dlg-delete-{target_id}""#)));
     assert!(body.contains(r#"name="csrf_token""#));
     assert!(body.contains(&format!(r#"action="/members/{target_id}/delete""#)));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /members/invite — invite a new member
+// ────────────────────────────────────────────────────────────────────────
+
+async fn get(app: &TestApp, path: &str, cookie: &str) -> axum::response::Response {
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(header::COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap()
+}
+
+async fn body_text(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[tokio::test]
+async fn invite_form_renders_for_admin() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members/invite", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(body.contains(r#"action="/members/invite""#));
+    assert!(body.contains(r#"name="email""#));
+    assert!(body.contains(r#"name="role""#));
+    assert!(body.contains(r#"name="csrf_token""#));
+    // Per the modal redesign, admins no longer see role choice in the
+    // UI — they get a hidden role=member input. The segmented control
+    // with Admin/Owner segments only appears for Owner viewers.
+    assert!(
+        body.contains(r#"type="hidden" name="role" value="member""#),
+        "admin form should pin role=member via hidden input: {body}"
+    );
+    assert!(!body.contains(r#"value="admin""#));
+    assert!(!body.contains(r#"value="owner""#));
+}
+
+#[tokio::test]
+async fn invite_form_offers_all_roles_to_owner() {
+    let app = TestApp::new().await;
+    app.seed_user("owner@test.local", "Owner", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, "owner@test.local", "pw").await;
+
+    let resp = get(&app, "/members/invite", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(body.contains(r#"value="member""#));
+    assert!(body.contains(r#"value="admin""#));
+    assert!(body.contains(r#"value="owner""#));
+}
+
+#[tokio::test]
+async fn invite_form_forbidden_for_regular_member() {
+    let app = TestApp::new().await;
+    app.seed_user("m@test.local", "M", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, _) = web_login_session(&app, "m@test.local", "pw").await;
+
+    let resp = get(&app, "/members/invite", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn invite_form_without_cookie_redirects_to_login() {
+    let app = TestApp::new().await;
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/members/invite")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn invite_submit_happy_path_renders_token_inline() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&role=member",
+        urlencoding(&csrf),
+        urlencoding("newbie@test.local"),
+    );
+    let resp = post_form(&app, "/members/invite", &cookie, body).await;
+    // Direct render — no 303 redirect (keeps token out of URL bar).
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(body.contains("Invitation sent"));
+    assert!(body.contains("newbie@test.local"));
+    // The accept URL contains "/invite/<token>" — token is rendered inline.
+    assert!(
+        body.contains("/invite/"),
+        "expected /invite/<token> in body: {body}"
+    );
+    assert!(body.contains(r#"id="invite-url""#));
+
+    // DB-side: an invitation row exists for the invited email.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM identity.invitations \
+         WHERE email = $1 AND revoked_at IS NULL AND accepted_at IS NULL",
+    )
+    .bind("newbie@test.local")
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn invite_submit_empty_email_rerenders_form_with_error() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!("csrf_token={}&email=&role=member", urlencoding(&csrf));
+    let resp = post_form(&app, "/members/invite", &cookie, body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    // The form is re-rendered (not redirected) with a banner.
+    assert!(body.contains("banner-error"));
+    assert!(body.contains("Enter an email address"));
+    assert!(body.contains(r#"action="/members/invite""#));
+}
+
+#[tokio::test]
+async fn invite_submit_duplicate_email_returns_form_error() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    app.seed_user("existing@test.local", "Existing", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&role=member",
+        urlencoding(&csrf),
+        urlencoding("existing@test.local"),
+    );
+    let resp = post_form(&app, "/members/invite", &cookie, body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(body.contains("banner-error"));
+    assert!(body.contains("already exists"));
+    // The form preserves the entered email.
+    assert!(body.contains(r#"value="existing@test.local""#));
+}
+
+#[tokio::test]
+async fn invite_submit_admin_cannot_invite_owner() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&role=owner",
+        urlencoding(&csrf),
+        urlencoding("would-be-owner@test.local"),
+    );
+    let resp = post_form(&app, "/members/invite", &cookie, body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(body.contains("banner-error"));
+    assert!(body.contains("higher role"));
+}
+
+#[tokio::test]
+async fn invite_submit_without_csrf_returns_403() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let body = format!(
+        "csrf_token=00000000000000000000000000000000&email={}&role=member",
+        urlencoding("x@test.local")
+    );
+    let resp = post_form(&app, "/members/invite", &cookie, body).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /invite/{token} — public acceptance page (closes the invite loop)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Seed an admin and create an invitation via the actual web flow.
+/// Returns the raw acceptance token so tests can hit `/invite/{token}`.
+async fn seed_pending_invite(app: &TestApp, target_email: &str) -> String {
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+    let body = format!(
+        "csrf_token={}&email={}&role=member",
+        urlencoding(&csrf),
+        urlencoding(target_email),
+    );
+    let resp = post_form(app, "/members/invite", &cookie, body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&body_bytes);
+    // Token is rendered in the value="/invite/<token>" input on the
+    // result page. Pull it out.
+    let needle = "/invite/";
+    let start = body.find(needle).expect("invite URL in result page") + needle.len();
+    let end = start
+        + body[start..]
+            .find('"')
+            .expect("closing quote after token");
+    body[start..end].to_string()
+}
+
+#[tokio::test]
+async fn accept_invite_form_renders_for_valid_token() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "newbie@test.local").await;
+
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/invite/{token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(body.contains("Accept invitation"));
+    assert!(body.contains("newbie@test.local"));
+    assert!(body.contains(&format!(r#"action="/invite/{token}""#)));
+    assert!(body.contains(r#"name="display_name""#));
+    assert!(body.contains(r#"name="password""#));
+    // Public shell — no sidebar / user card.
+    assert!(!body.contains(r#"class="sidebar""#));
+}
+
+#[tokio::test]
+async fn accept_invite_form_unknown_token_shows_unavailable_page() {
+    let app = TestApp::new().await;
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/invite/notarealtokenatall000000000000000000000000")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_text(resp).await;
+    assert!(body.contains("Invitation unavailable"));
+    assert!(!body.contains(r#"name="password""#));
+}
+
+#[tokio::test]
+async fn accept_invite_submit_creates_account_and_sets_session_cookie() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "newbie@test.local").await;
+
+    let body = format!(
+        "display_name={}&password={}",
+        urlencoding("Newbie"),
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/me")
+    );
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert!(set_cookie.starts_with("hearth_session="));
+    assert!(set_cookie.contains("HttpOnly"));
+
+    // DB: user row exists and is active.
+    let row: (String, String) = sqlx::query_as(
+        "SELECT email, lifecycle::text FROM identity.users WHERE display_name = $1",
+    )
+    .bind("Newbie")
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "newbie@test.local");
+    assert_eq!(row.1, "active");
+}
+
+#[tokio::test]
+async fn accept_invite_submit_empty_display_name_rerenders_form_with_error() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "newbie@test.local").await;
+
+    let body = format!(
+        "display_name=&password={}",
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(body.contains("banner-error"));
+    assert!(body.contains("display name"));
+    // The form is re-rendered (same action URL with the token).
+    assert!(body.contains(&format!(r#"action="/invite/{token}""#)));
+}
+
+#[tokio::test]
+async fn accept_invite_submit_second_time_returns_unavailable() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "newbie@test.local").await;
+
+    // First accept — success.
+    let body = format!(
+        "display_name={}&password={}",
+        urlencoding("Newbie"),
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    // Second accept with the same token — invalid (marked accepted).
+    let body = format!(
+        "display_name={}&password={}",
+        urlencoding("Replay"),
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_text(resp).await;
+    assert!(body.contains("Invitation unavailable"));
+}
+
+#[tokio::test]
+async fn invite_submit_htmx_returns_success_partial_not_full_page() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&role=member",
+        urlencoding(&csrf),
+        urlencoding("htmx@test.local"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/members/invite")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+
+    // Partial response — no <html>/<body> chrome, no sidebar.
+    assert!(!body.contains("<!DOCTYPE html>"));
+    assert!(!body.contains(r#"class="sidebar""#));
+    // Success content visible: title, accept URL, Done + Invite-another.
+    assert!(body.contains("Invitation sent"));
+    assert!(body.contains("/invite/"));
+    assert!(body.contains("dialog-icon-success"));
+    // "Invite another" wired via HTMX to GET the form partial.
+    assert!(body.contains(r#"hx-get="/members/invite""#));
+}
+
+#[tokio::test]
+async fn invite_submit_htmx_error_returns_form_partial_with_banner() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    // Empty email → validation error.
+    let body = format!("csrf_token={}&email=&role=member", urlencoding(&csrf));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/members/invite")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    // Partial (no full-page chrome) with the form + error banner.
+    assert!(!body.contains("<!DOCTYPE html>"));
+    assert!(body.contains("banner-error"));
+    assert!(body.contains("Enter an email address"));
+    // Form is still HTMX-enabled for the next attempt.
+    assert!(body.contains(r#"hx-post="/members/invite""#));
+}
+
+#[tokio::test]
+async fn members_page_renders_invite_cta_and_modal() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    // CTA is now a button that opens the always-rendered <dialog>.
+    assert!(body.contains(r#"data-open-dialog="dlg-invite""#));
+    assert!(body.contains("Invite member"));
+    // The dialog itself renders inline on /members.
+    assert!(body.contains(r#"id="dlg-invite""#));
+    // The dialog's form still POSTs to the same endpoint.
+    assert!(body.contains(r#"action="/members/invite""#));
 }

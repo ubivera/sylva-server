@@ -1,5 +1,8 @@
 use auth::SessionRepository;
-use identity::{InstanceRole, User, UserId, UserLifecycle, UserRepository};
+use identity::{
+    DEFAULT_INVITATION_TTL, InstanceRole, Invitation, InvitationRepository, User, UserId,
+    UserLifecycle, UserRepository,
+};
 use uuid::Uuid;
 
 use crate::{app::AppState, auth_routes::AdminUser};
@@ -833,4 +836,188 @@ async fn enqueue_pending_role_change(
             Err(RoleError::Internal(e))
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Invitations
+// ────────────────────────────────────────────────────────────────────────
+
+/// What `perform_create_invite` hands back on success. `raw_token` is
+/// the one-time acceptance token; the caller is responsible for showing
+/// it to the operator exactly once and not persisting it anywhere
+/// (URLs, logs, history). The DB only ever stores `sha256(raw_token)`.
+pub struct CreateInviteOutcome {
+    pub invitation: Invitation,
+    pub raw_token: String,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum CreateInviteError {
+    #[error("email_required")]
+    EmailRequired,
+    /// Inviter's role doesn't outrank the target role (e.g. Admin
+    /// trying to invite an Owner).
+    #[error("cannot_invite_higher_role")]
+    CannotInviteHigherRole,
+    /// A live (non-deleted) Member already owns this email address.
+    #[error("email_already_in_use")]
+    EmailAlreadyInUse,
+    /// An invitation for this email exists and is still valid (not
+    /// expired, accepted, or revoked).
+    #[error("active_invite_exists")]
+    ActiveInviteExists,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Create an invitation. Validates the inviter's authority over the
+/// target role, refuses duplicates against existing accounts and pending
+/// invites, then commits the invitation row + audit event + outbound
+/// email enqueue in a single transaction so we never get an invite
+/// without a delivery attempt (or vice versa).
+pub async fn perform_create_invite(
+    state: &AppState,
+    admin: &AdminUser,
+    email: &str,
+    target_role: InstanceRole,
+) -> Result<CreateInviteOutcome, CreateInviteError> {
+    let trimmed = email.trim();
+    if trimmed.is_empty() {
+        return Err(CreateInviteError::EmailRequired);
+    }
+    if !authz::satisfies(admin.0.user.instance_role, target_role) {
+        return Err(CreateInviteError::CannotInviteHigherRole);
+    }
+
+    if state
+        .users
+        .email_in_use(trimmed)
+        .await
+        .map_err(|e| CreateInviteError::Internal(e.into()))?
+    {
+        return Err(CreateInviteError::EmailAlreadyInUse);
+    }
+    if state
+        .invitations
+        .email_has_active_invite(trimmed)
+        .await
+        .map_err(|e| CreateInviteError::Internal(e.into()))?
+    {
+        return Err(CreateInviteError::ActiveInviteExists);
+    }
+
+    let actor = admin.actor();
+    let inviter_id = admin.0.user.id;
+    let inviter_display_name = admin.0.user.display_name.clone();
+    let base = state.public_base_url.clone();
+    let email_owned = trimmed.to_string();
+
+    let result: anyhow::Result<CreateInviteOutcome> = async {
+        let mut tx = state.db.begin().await?;
+        let (invitation, raw_token) = InvitationRepository::create(
+            &mut tx,
+            inviter_id,
+            &email_owned,
+            target_role,
+            DEFAULT_INVITATION_TTL,
+        )
+        .await?;
+
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "invite_created",
+            serde_json::json!({
+                "invitation_id": invitation.id.0,
+                "invited_email": invitation.email,
+                "instance_role": invitation.instance_role,
+            }),
+        )
+        .await?;
+
+        // Commit the delivery email in the same transaction so we never
+        // create an invitation without queuing its email (or vice versa).
+        let full_accept_url = format!("{base}/invite/{raw_token}");
+        notifications::enqueue(
+            &mut tx,
+            notifications::Notification::Invitation {
+                recipient_email: invitation.email.clone(),
+                inviter_display_name: inviter_display_name.clone(),
+                accept_url: full_accept_url,
+                expires_at: invitation.expires_at,
+                instance_role: invitation.instance_role,
+                invitation_id: invitation.id.0,
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(CreateInviteOutcome { invitation, raw_token })
+    }
+    .await;
+
+    result.map_err(CreateInviteError::Internal)
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RevokeInviteError {
+    /// Invitation didn't exist, or was already revoked. Returned as the
+    /// same error for both cases so the response doesn't double as an
+    /// existence oracle for prior invite IDs.
+    #[error("invite_not_found")]
+    NotFound,
+    /// The invitee already accepted — revoking would orphan the
+    /// resulting `identity.users` row from any cleanup intent.
+    #[error("invite_already_accepted")]
+    AlreadyAccepted,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Revoke a pending invitation. No-op if already revoked / never
+/// existed (returns `NotFound`); refuses if already accepted (returns
+/// `AlreadyAccepted`). Mark + audit commit together so the invite
+/// can't move to revoked without an audit trail.
+pub async fn perform_revoke_invite(
+    state: &AppState,
+    admin: &AdminUser,
+    invitation_id: identity::InvitationId,
+) -> Result<(), RevokeInviteError> {
+    let invitation = state
+        .invitations
+        .find_by_id(invitation_id)
+        .await
+        .map_err(|e| RevokeInviteError::Internal(e.into()))?
+        .ok_or(RevokeInviteError::NotFound)?;
+
+    if invitation.accepted_at.is_some() {
+        return Err(RevokeInviteError::AlreadyAccepted);
+    }
+    if invitation.revoked_at.is_some() {
+        return Err(RevokeInviteError::NotFound);
+    }
+
+    let actor = admin.actor();
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        InvitationRepository::revoke(&mut tx, invitation_id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "invite_revoked",
+            serde_json::json!({
+                "invitation_id": invitation_id.0,
+                "invited_email": invitation.email,
+                "instance_role": invitation.instance_role,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    result.map_err(RevokeInviteError::Internal)
 }

@@ -149,6 +149,121 @@ pub async fn login_submit(
     response
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// /invite/{token} — public acceptance page
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct AcceptInviteForm {
+    pub display_name: String,
+    pub password: String,
+}
+
+/// `GET /invite/{token}` — render the acceptance form. Public. We look
+/// up the invitation first to confirm the token is still active; if not
+/// (expired, revoked, accepted, unknown), render a generic
+/// "unavailable" page rather than the form. We don't distinguish those
+/// four cases to avoid leaking which tokens ever existed.
+pub async fn accept_invite_form(
+    State(state): State<AppState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    match state.invitations.find_active(&token).await {
+        Ok(Some(invitation)) => Html(
+            views::accept_invite_page(
+                &token,
+                &invitation.email,
+                invitation.instance_role,
+                "",
+                None,
+            )
+            .into_string(),
+        )
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Html(views::accept_invite_invalid_page().into_string()),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(?err, "looking up invitation for accept form");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
+/// `POST /invite/{token}` — accept the invitation. On success, sets the
+/// `hearth_session` cookie and redirects to `/me`. On validation
+/// failure (missing display_name / password), re-renders the form with
+/// the entered display_name preserved. On invalid token (raced expiry,
+/// concurrent acceptance), renders the "unavailable" page.
+pub async fn accept_invite_submit(
+    State(state): State<AppState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+    Form(form): Form<AcceptInviteForm>,
+) -> Response {
+    use hearth::auth_routes::{AcceptInviteError, perform_accept_invite};
+
+    match perform_accept_invite(&state, &token, &form.display_name, &form.password).await {
+        Ok(outcome) => {
+            let mut response = Redirect::to("/me").into_response();
+            set_cookie_header(
+                &mut response,
+                &cookie_value(
+                    SESSION_COOKIE_NAME,
+                    &outcome.raw_session_token,
+                    /* clearing = */ false,
+                ),
+            );
+            response
+        }
+        Err(AcceptInviteError::InvalidOrExpiredToken) => (
+            StatusCode::NOT_FOUND,
+            Html(views::accept_invite_invalid_page().into_string()),
+        )
+            .into_response(),
+        Err(e) => {
+            // For display_name_required / password_required we need to
+            // re-fetch the invitation so we can show the email + role
+            // in the rendered form. Cheap — one indexed lookup.
+            let code = match e {
+                AcceptInviteError::DisplayNameRequired => "display_name_required",
+                AcceptInviteError::PasswordRequired => "password_required",
+                AcceptInviteError::InvalidOrExpiredToken => unreachable!(),
+                AcceptInviteError::Internal(err) => {
+                    tracing::error!(?err, "accept invite internal error (web)");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal error",
+                    );
+                }
+            };
+            match state.invitations.find_active(&token).await {
+                Ok(Some(invitation)) => Html(
+                    views::accept_invite_page(
+                        &token,
+                        &invitation.email,
+                        invitation.instance_role,
+                        form.display_name.trim(),
+                        Some(code),
+                    )
+                    .into_string(),
+                )
+                .into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Html(views::accept_invite_invalid_page().into_string()),
+                )
+                    .into_response(),
+                Err(err) => {
+                    tracing::error!(?err, "re-fetching invitation for form rerender");
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+                }
+            }
+        }
+    }
+}
+
 /// `GET /me` — render the authenticated user's account page.
 pub async fn me_page(
     State(state): State<AppState>,
@@ -163,10 +278,11 @@ pub async fn me_page(
     Html(views::me_page(&ctx).into_string()).into_response()
 }
 
-/// Query params on `/users`. `action` / `target` / `error` carry the
+/// Query params on `/members`. `action` / `target` / `error` carry the
 /// post-action banner state; `sort` / `dir` drive server-side row
-/// ordering. All optional — missing values get sensible defaults
-/// (`SortColumn::Joined`, `SortDirection::Asc`, no banner).
+/// ordering; `filter` narrows the directory by role or lifecycle. All
+/// optional — missing values get sensible defaults (`SortColumn::Joined`,
+/// `SortDirection::Asc`, `MemberFilter::All`, no banner).
 #[derive(Deserialize, Default)]
 pub struct MembersPageQuery {
     pub action: Option<String>,
@@ -174,6 +290,21 @@ pub struct MembersPageQuery {
     pub error: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
+    pub filter: Option<String>,
+    /// 1-based page index. Out-of-range values get clamped to
+    /// `1..=total_pages` server-side once row count is known.
+    pub page: Option<u32>,
+    /// Rows per page. Anything outside [`views::ROWS_PER_PAGE_OPTIONS`]
+    /// falls back to the default so the dropdown's options always
+    /// round-trip cleanly.
+    pub rows: Option<u32>,
+}
+
+fn parse_rows_per_page(s: Option<u32>) -> u32 {
+    match s {
+        Some(n) if views::ROWS_PER_PAGE_OPTIONS.contains(&n) => n,
+        _ => views::DEFAULT_ROWS_PER_PAGE,
+    }
 }
 
 fn parse_sort_column(s: Option<&str>) -> views::SortColumn {
@@ -253,31 +384,125 @@ pub async fn members_page(
     ) {
         return error_response(StatusCode::FORBIDDEN, "Admins only.");
     }
-    match state.users.list_all().await {
-        Ok(mut members) => {
-            let sort = views::SortState {
-                column: parse_sort_column(query.sort.as_deref()),
-                direction: parse_sort_direction(query.dir.as_deref()),
-            };
-            sort_users(&mut members, sort);
-            let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
-            let ctx = views::ChromeContext {
-                instance_name: &state.instance_name,
-                user: &auth.user,
-                csrf_token: &csrf_token,
-            };
-            let banner = views::MembersBanner {
-                action: query.action.as_deref(),
-                target: query.target.as_deref(),
-                error: query.error.as_deref(),
-            };
-            Html(views::members_page(&ctx, &members, banner, sort).into_string()).into_response()
+    let filter = query
+        .filter
+        .as_deref()
+        .map(views::MemberFilter::parse_token)
+        .unwrap_or_default();
+
+    // Two parallel data sets per filter:
+    //   members        — rows from identity.users (existing accounts)
+    //   pending_invites — rows from identity.invitations not yet
+    //                     accepted/revoked/expired
+    //
+    // Pending invitations don't materialise as `identity.users` rows
+    // until accepted, so they need a separate fetch. The filter values
+    // decide which set(s) contribute: `All` shows both, `Status(Pending)`
+    // shows only pending invites (no member rows), every other filter
+    // shows members only.
+    let fetch_members = !matches!(
+        filter,
+        views::MemberFilter::Status(identity::UserLifecycle::PendingInvite)
+    );
+    let fetch_invites = matches!(
+        filter,
+        views::MemberFilter::All
+            | views::MemberFilter::Status(identity::UserLifecycle::PendingInvite)
+    );
+
+    let members_result = if fetch_members {
+        match filter {
+            views::MemberFilter::Status(lc) => state.users.list_with_lifecycle(lc).await,
+            _ => state.users.list_all().await,
         }
-        Err(err) => {
+    } else {
+        Ok(Vec::new())
+    };
+
+    let pending_invites_result = if fetch_invites {
+        state.invitations.list_pending().await
+    } else {
+        Ok(Vec::new())
+    };
+
+    let (mut members, pending_invites) = match (members_result, pending_invites_result) {
+        (Ok(m), Ok(i)) => (m, i),
+        (Err(err), _) => {
             tracing::error!(?err, "listing members for /members page");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
+        (_, Err(err)) => {
+            tracing::error!(?err, "listing pending invitations for /members page");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    if let views::MemberFilter::Role(role) = filter {
+        members.retain(|u| u.instance_role == role);
     }
+    let sort = views::SortState {
+        column: parse_sort_column(query.sort.as_deref()),
+        direction: parse_sort_direction(query.dir.as_deref()),
+    };
+    sort_users(&mut members, sort);
+
+    // Pull last-activity timestamps in a single round-trip covering
+    // only the filtered+sorted rows. The Members table renders "—" for
+    // users absent from the map (never signed in, or never seeded a
+    // session). Pending-invite rows always render "—" since they have
+    // no user_id to look up.
+    let member_ids: Vec<identity::UserId> = members.iter().map(|u| u.id).collect();
+    let last_activity = match state.sessions.last_activity_by_user(&member_ids).await {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::error!(?err, "fetching last_activity for members");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    // Combine the two row sources into one sequence so pagination
+    // operates on the unified view. Members come first (sorted), then
+    // pending invitations. The MemberRow enum gives the renderer a
+    // single iteration target with per-variant dispatch.
+    let combined: Vec<views::MemberRow> = members
+        .iter()
+        .map(|u| views::MemberRow::Member {
+            user: u,
+            last_activity: last_activity.get(&u.id).copied(),
+        })
+        .chain(pending_invites.iter().map(views::MemberRow::PendingInvite))
+        .collect();
+    let total_rows = combined.len() as u32;
+    let rows_per_page = parse_rows_per_page(query.rows);
+    let total_pages = total_rows.div_ceil(rows_per_page).max(1);
+    let current_page = query.page.unwrap_or(1).clamp(1, total_pages);
+    let start = ((current_page - 1) * rows_per_page) as usize;
+    let end = (start + rows_per_page as usize).min(combined.len());
+    let page_slice = &combined[start..end];
+
+    let pagination = views::PaginationState {
+        current_page,
+        total_pages,
+        rows_per_page,
+        total_rows,
+    };
+
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+    };
+    let banner = views::MembersBanner {
+        action: query.action.as_deref(),
+        target: query.target.as_deref(),
+        error: query.error.as_deref(),
+    };
+    Html(
+        views::members_page(&ctx, page_slice, banner, sort, filter, pagination)
+            .into_string(),
+    )
+    .into_response()
 }
 
 #[derive(Deserialize)]

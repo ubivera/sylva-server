@@ -440,10 +440,11 @@ async fn users_page_lists_all_users_for_admin() {
     ] {
         assert!(body.contains(needle), "expected {needle:?} in: {body}");
     }
-    // Role + status badges rendered.
+    // Role badges rendered. Status is now communicated by a dot on the
+    // avatar (see `.avatar-status` in CSS) rather than a column.
     assert!(body.contains("role-admin"));
     assert!(body.contains("role-member"));
-    assert!(body.contains("status-active"));
+    assert!(body.contains("avatar-status-active"));
     // The viewing admin is tagged as "you".
     assert!(body.contains("row-self-tag"));
 }
@@ -580,12 +581,14 @@ async fn users_page_sort_header_link_flips_direction_on_active_column() {
 
     // Visit with sort=name&dir=asc — the "User" column should be active
     // (asc) and its link should flip to desc on the next click. Maud
-    // HTML-escapes `&` in attribute values, so we match `&amp;`.
+    // HTML-escapes `&` in attribute values, so we match `&amp;`. The
+    // href now also carries `&filter=all` so flipping sort doesn't drop
+    // any active filter.
     let (_, body) = get_with_cookie(&app, "/members?sort=name&dir=asc", Some(&cookie)).await;
-    assert!(body.contains(r#"href="/members?sort=name&amp;dir=desc""#));
+    assert!(body.contains(r#"href="/members?sort=name&amp;dir=desc&amp;filter=all""#));
     // Other columns reset to asc when clicked from a different sort.
-    assert!(body.contains(r#"href="/members?sort=role&amp;dir=asc""#));
-    assert!(body.contains(r#"href="/members?sort=joined&amp;dir=asc""#));
+    assert!(body.contains(r#"href="/members?sort=role&amp;dir=asc&amp;filter=all""#));
+    assert!(body.contains(r#"href="/members?sort=joined&amp;dir=asc&amp;filter=all""#));
 }
 
 #[tokio::test]
@@ -608,7 +611,7 @@ async fn users_page_invalid_sort_param_falls_back_to_default() {
 }
 
 #[tokio::test]
-async fn users_page_renders_deactivated_status_badge() {
+async fn users_page_renders_deactivated_avatar_status_dot() {
     let app = TestApp::new().await;
     app.seed_user("owner@test.local", "Big Boss", "pw", InstanceRole::Owner)
         .await;
@@ -629,10 +632,110 @@ async fn users_page_renders_deactivated_status_badge() {
 
     let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("status-active"));
+    // Status is rendered as a colored dot on the avatar, not a column.
+    assert!(body.contains("avatar-status-active"));
     assert!(
-        body.contains("status-deactivated"),
-        "expected status-deactivated badge in: {body}"
+        body.contains("avatar-status-deactivated"),
+        "expected deactivated dot in: {body}"
     );
     assert!(body.contains("Ghost"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pagination
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn members_pagination_bar_renders_even_with_one_page() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    // Always-on pagination bar: page-jump input, "of 1", rows trigger.
+    assert!(body.contains(r#"id="page-jump""#));
+    assert!(body.contains("Rows per page"));
+    // Current page is 1, total is 1 → first/last/prev/next disabled.
+    assert!(body.contains("pagination-step-disabled"));
+}
+
+#[tokio::test]
+async fn members_pagination_slices_to_requested_page() {
+    let app = TestApp::new().await;
+    // 12 members + 1 admin viewer = 13 rows total. With rows=10, page 2
+    // should show exactly 3 rows.
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    for i in 0..12 {
+        let email = format!("u{i}@test.local");
+        let name = format!("User {i}");
+        app.seed_user(&email, &name, "pw", InstanceRole::Member).await;
+    }
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    // Page 1: 10 rows. With default sort=joined asc, admin is first,
+    // then u0..u8.
+    let (_, body) = get_with_cookie(&app, "/members?page=1&rows=10", Some(&cookie)).await;
+    assert!(body.contains("admin@test.local"));
+    assert!(body.contains("u8@test.local"));
+    assert!(
+        !body.contains("u9@test.local"),
+        "u9 should be on page 2, not page 1"
+    );
+
+    // Page 2: 3 rows (u9, u10, u11).
+    let (_, body) = get_with_cookie(&app, "/members?page=2&rows=10", Some(&cookie)).await;
+    assert!(body.contains("u9@test.local"));
+    assert!(body.contains("u11@test.local"));
+    assert!(
+        !body.contains("u0@test.local"),
+        "u0 should be on page 1, not page 2"
+    );
+}
+
+#[tokio::test]
+async fn members_pagination_out_of_range_page_clamps_to_max() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+
+    let (status, body) = get_with_cookie(&app, "/members?page=99&rows=10", Some(&cookie_from(&app).await)).await;
+    assert_eq!(status, StatusCode::OK);
+    // Should clamp to page 1 (which is the only page); admin row visible.
+    assert!(body.contains("admin@test.local"));
+}
+
+async fn cookie_from(app: &TestApp) -> String {
+    let set_cookie = web_login(app, "admin@test.local", "pw").await.unwrap();
+    cookie_name_value(&set_cookie)
+}
+
+#[tokio::test]
+async fn members_pagination_rows_per_page_respects_url_param() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adm", "pw", InstanceRole::Admin)
+        .await;
+    for i in 0..30 {
+        let email = format!("u{i}@test.local");
+        app.seed_user(&email, "User", "pw", InstanceRole::Member).await;
+    }
+    let set_cookie = web_login(&app, "admin@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    // rows=25 → 31 total / 25 = 2 pages. Page-jump input max should be 2.
+    let (_, body) = get_with_cookie(&app, "/members?rows=25", Some(&cookie)).await;
+    assert!(
+        body.contains(r#"max="2""#),
+        "expected max=2 on page-jump input for rows=25"
+    );
+    // Invalid rows value clamps to default (10).
+    let (_, body) = get_with_cookie(&app, "/members?rows=99", Some(&cookie)).await;
+    assert!(
+        body.contains(r#"max="4""#),
+        "expected max=4 on page-jump input when rows clamps to 10"
+    );
 }
