@@ -512,6 +512,32 @@ pub async fn members_page(
 
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let pending_count = pending_count_for(&state, auth.user.instance_role).await;
+
+    // Fetch active pending transitions that target any of the
+    // currently-displayed members so member_row can render a
+    // "Pending …" pill. One bulk query keyed by the displayed user
+    // ids — Owner-on-Owner pendings are rare, so this typically
+    // returns zero rows on any given page load.
+    let displayed_target_ids: Vec<uuid::Uuid> = page_slice
+        .iter()
+        .filter_map(|row| match row {
+            views::MemberRow::Member { user, .. } => Some(user.id.0),
+            views::MemberRow::PendingInvite(_) => None,
+        })
+        .collect();
+    let pending_rows = match pending::active_by_target_ids(&state.db, &displayed_target_ids).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(?err, "fetching active pendings for /members row badges");
+            Vec::new()
+        }
+    };
+    let pending_by_target: std::collections::HashMap<uuid::Uuid, &pending::TransitionRow> =
+        pending_rows
+            .iter()
+            .filter_map(|r| r.target_user_id.map(|tid| (tid, r)))
+            .collect();
+
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -524,8 +550,16 @@ pub async fn members_page(
         error: query.error.as_deref(),
     };
     Html(
-        views::members_page(&ctx, page_slice, banner, sort, filter, pagination)
-            .into_string(),
+        views::members_page(
+            &ctx,
+            page_slice,
+            banner,
+            sort,
+            filter,
+            pagination,
+            &pending_by_target,
+        )
+        .into_string(),
     )
     .into_response()
 }

@@ -1569,6 +1569,116 @@ async fn pending_veto_non_owner_returns_403() {
 }
 
 #[tokio::test]
+async fn pending_page_history_section_renders_vetoed_row_after_veto() {
+    // After an Owner vetoes a pending action, /pending should show
+    // the row under "History" with a "Vetoed" badge and the resolver's
+    // name. The active table is empty since we just vetoed the only
+    // pending row.
+    let app = TestApp::new().await;
+    let (cookie, _target, transition_id, csrf) =
+        seed_pending_owner_deactivate(&app).await;
+
+    // Drive the veto via the web wrapper so the resolver is set.
+    let resp = post_form(
+        &app,
+        &format!("/pending/{transition_id}/veto"),
+        &cookie,
+        format!("csrf_token={}&password=pw", urlencoding(&csrf)),
+    )
+    .await;
+    // Non-HTMX POST → SEE_OTHER to /pending?action=vetoed.
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let resp = get(&app, "/pending", &cookie).await;
+    let body = body_text(resp).await;
+    // The History section is rendered.
+    assert!(
+        body.contains("pending-history-header"),
+        "history section missing: {body}"
+    );
+    // Resolution badge shows "Vetoed".
+    assert!(
+        body.contains("resolution-vetoed"),
+        "vetoed badge missing"
+    );
+    // The active table is empty → empty-state copy is present.
+    assert!(body.contains("Nothing pending"));
+}
+
+#[tokio::test]
+async fn pending_page_no_history_section_when_no_resolved_rows() {
+    // Fresh instance with no resolved rows → no "History" header at all.
+    let app = TestApp::new().await;
+    app.seed_user("o@test.local", "O", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, "o@test.local", "pw").await;
+
+    let resp = get(&app, "/pending", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(!body.contains("pending-history-header"));
+}
+
+#[tokio::test]
+async fn pending_page_active_row_has_anchor_id() {
+    // The active row needs id="row-{transition_id}" so the
+    // /members pending pill can deep-link to it via fragment.
+    let app = TestApp::new().await;
+    let (cookie, _target, transition_id, _csrf) =
+        seed_pending_owner_deactivate(&app).await;
+
+    let resp = get(&app, "/pending", &cookie).await;
+    let body = body_text(resp).await;
+    let expected = format!(r#"id="row-{transition_id}""#);
+    assert!(
+        body.contains(&expected),
+        "expected anchor id on active row: {body}"
+    );
+}
+
+#[tokio::test]
+async fn members_page_shows_pending_pill_for_owner_with_active_pending() {
+    // After seeding an Owner-on-Owner pending action, the target's
+    // row on /members should carry the amber "Pending: …" chip
+    // linking to the matching row on /pending.
+    let app = TestApp::new().await;
+    let (cookie, target, transition_id, _csrf) =
+        seed_pending_owner_deactivate(&app).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    // The pill renders.
+    assert!(
+        body.contains("member-pending-pill"),
+        "expected member-pending-pill on the row: {body}"
+    );
+    // Action verb is correct.
+    assert!(body.contains("Pending: Deactivate"));
+    // Link points at the matching transition row on /pending.
+    let expected_href = format!(r#"href="/pending#row-{transition_id}""#);
+    assert!(
+        body.contains(&expected_href),
+        "expected deep-link to /pending#row-{transition_id}: {body}"
+    );
+    // Sanity: target's row is on the page (display name appears).
+    assert!(body.contains(&target.display_name));
+}
+
+#[tokio::test]
+async fn members_page_no_pending_pill_when_no_pending() {
+    // No pending actions → no pill on any row.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(!body.contains("member-pending-pill"));
+}
+
+#[tokio::test]
 async fn pending_invite_row_renders_revoke_dialog_with_csrf() {
     let app = TestApp::new().await;
     let _ = seed_pending_invite(&app, "viewable@test.local").await;

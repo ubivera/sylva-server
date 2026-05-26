@@ -1127,6 +1127,11 @@ pub fn members_page(
     sort: SortState,
     filter: MemberFilter,
     pagination: PaginationState,
+    // Bucketed view of active pending transitions keyed by target
+    // user id. Empty map → no decoration; lookup returns the row's
+    // pending transition (if any) for rendering the "Pending …" pill
+    // on the affected row.
+    pending_by_target: &std::collections::HashMap<uuid::Uuid, &pending::TransitionRow>,
 ) -> Markup {
     let content = html! {
         (render_banner(&banner))
@@ -1168,7 +1173,13 @@ pub fn members_page(
                     @for row in rows {
                         @match row {
                             MemberRow::Member { user, last_activity } => {
-                                (member_row(ctx.user, user, *last_activity, ctx.csrf_token))
+                                (member_row(
+                                    ctx.user,
+                                    user,
+                                    *last_activity,
+                                    ctx.csrf_token,
+                                    pending_by_target.get(&user.id.0).copied(),
+                                ))
                             }
                             MemberRow::PendingInvite(inv) => {
                                 (pending_invite_row(inv, ctx.csrf_token))
@@ -1831,6 +1842,7 @@ fn member_row(
     target: &User,
     last_activity: Option<chrono::DateTime<chrono::Utc>>,
     csrf_token: &str,
+    pending: Option<&pending::TransitionRow>,
 ) -> Markup {
     let is_self = viewer.id == target.id;
     let initial = display_initial(&target.display_name);
@@ -1886,6 +1898,13 @@ fn member_row(
                             }
                         }
                         span class="user-email" { (target.email) }
+                        // Pending-action pill — only renders when this
+                        // member is the target of a currently-pending
+                        // Owner-on-Owner transition. Links to the
+                        // matching row on /pending via fragment.
+                        @if let Some(p) = pending {
+                            (member_pending_pill(p))
+                        }
                     }
                 }
             }
@@ -2662,7 +2681,8 @@ fn render_pending_banner(banner: &PendingBanner<'_>) -> Markup {
 ///   banners after a race with another Owner / the 72h sweeper.
 pub fn pending_page(
     ctx: &ChromeContext,
-    rows: &[pending::TransitionRow],
+    active: &[pending::TransitionRow],
+    history: &[pending::TransitionRow],
     users: &[identity::User],
     banner: PendingBanner<'_>,
 ) -> Markup {
@@ -2677,7 +2697,7 @@ pub fn pending_page(
         // structure used by the /members page.
         (reauth_modal(ctx))
 
-        @if rows.is_empty() {
+        @if active.is_empty() {
             (pending_empty_state())
         } @else {
             div class="card pending-card" {
@@ -2692,8 +2712,33 @@ pub fn pending_page(
                         }
                     }
                     tbody {
-                        @for row in rows {
-                            (pending_row(ctx, row, &by_id))
+                        @for row in active {
+                            (pending_active_row(ctx, row, &by_id))
+                        }
+                    }
+                }
+            }
+        }
+
+        // History section — recently-resolved transitions. Hidden
+        // entirely when empty so a fresh install doesn't show an
+        // empty "History" header for no reason.
+        @if !history.is_empty() {
+            h2 class="pending-history-header" { "History" }
+            div class="card pending-card" {
+                table class="users-table pending-table pending-history-table" {
+                    thead {
+                        tr {
+                            th class="col-pending-target" { "Target" }
+                            th class="col-pending-action" { "Action" }
+                            th class="col-pending-resolution" { "Resolution" }
+                            th class="col-pending-initiator" { "Resolved by" }
+                            th class="col-pending-remaining" { "Resolved" }
+                        }
+                    }
+                    tbody {
+                        @for row in history {
+                            (pending_history_row(row, &by_id))
                         }
                     }
                 }
@@ -2727,11 +2772,13 @@ fn pending_empty_state() -> Markup {
     }
 }
 
-/// One row of the /pending table. Renders the target and initiator
-/// using the standard avatar + name treatment, the action verb (e.g.
-/// "Promote to Owner", "Delete"), a time-remaining pill, and a Veto
-/// button that opens a per-row confirmation dialog.
-fn pending_row(
+/// One row of the active /pending table. Renders the target and
+/// initiator using the standard avatar + name treatment, the action
+/// verb (e.g. "Promote to Owner", "Delete"), a time-remaining pill,
+/// and a Veto button that opens a per-row confirmation dialog. The
+/// row has `id="row-{transition_id}"` so the member-row badge on
+/// `/members` can deep-link straight to it via fragment.
+fn pending_active_row(
     ctx: &ChromeContext,
     row: &pending::TransitionRow,
     by_id: &std::collections::HashMap<uuid::Uuid, &identity::User>,
@@ -2744,21 +2791,10 @@ fn pending_row(
     let action_label = pending_action_label(row);
 
     html! {
-        tr class="pending-row" {
+        tr class="pending-row" id=(format!("row-{}", row.id)) {
             td class="col-pending-target" {
                 @if let Some(u) = target {
-                    div class="user-row-id" {
-                        span class="avatar-wrapper" {
-                            span class="avatar avatar-sm"
-                                 style=(format!("background:{}", avatar_color(&u.id.0))) {
-                                (display_initial(&u.display_name))
-                            }
-                        }
-                        div class="user-row-text" {
-                            span class="user-name" { (u.display_name) }
-                            span class="user-email" { (u.email) }
-                        }
-                    }
+                    (user_cell(u))
                 } @else {
                     span class="muted-dash" { "(unknown member)" }
                 }
@@ -2780,6 +2816,117 @@ fn pending_row(
                     "Veto"
                 }
                 (veto_pending_dialog(row.id, target_name, &action_label, ctx.csrf_token))
+            }
+        }
+    }
+}
+
+/// One row of the /pending History table — terminal rows (vetoed,
+/// cancelled, or applied by the 72h sweeper). Shares avatar + action
+/// styling with the active row but swaps the "time remaining" pill
+/// for a resolution badge + when-resolved timestamp, and drops the
+/// Veto column entirely (the row is already final).
+fn pending_history_row(
+    row: &pending::TransitionRow,
+    by_id: &std::collections::HashMap<uuid::Uuid, &identity::User>,
+) -> Markup {
+    use pending::TransitionState;
+    let target = row.target_user_id.and_then(|id| by_id.get(&id).copied());
+    let resolver = row.resolved_by_user_id.and_then(|id| by_id.get(&id).copied());
+    let action_label = pending_action_label(row);
+    let (resolution_label, resolution_class) = match row.state {
+        TransitionState::Vetoed => ("Vetoed", "resolution-badge resolution-vetoed"),
+        TransitionState::Cancelled => ("Cancelled", "resolution-badge resolution-cancelled"),
+        TransitionState::Applied => ("Applied", "resolution-badge resolution-applied"),
+        // Active rows never reach this helper, but render a sensible
+        // fallback rather than panicking if the data layer hands one
+        // through.
+        TransitionState::Pending => ("Pending", "resolution-badge"),
+    };
+
+    html! {
+        tr class="pending-row pending-history-row" {
+            td class="col-pending-target" {
+                @if let Some(u) = target {
+                    (user_cell(u))
+                } @else {
+                    span class="muted-dash" { "(unknown member)" }
+                }
+            }
+            td class="col-pending-action" { (action_label) }
+            td class="col-pending-resolution" {
+                span class=(resolution_class) { (resolution_label) }
+            }
+            td class="col-pending-initiator" {
+                @match (row.state, resolver) {
+                    // System-applied (72h timer) has no human resolver
+                    // — render a neutral label instead of a blank.
+                    (TransitionState::Applied, None) => {
+                        span class="muted-dash" { "Timer (72h)" }
+                    }
+                    (_, Some(u)) => span class="user-name" { (u.display_name) }
+                    _ => span class="muted-dash" { "—" }
+                }
+            }
+            td class="col-pending-remaining" {
+                @if let Some(ts) = row.resolved_at {
+                    span class="muted" { (short_date(ts)) }
+                } @else {
+                    span class="muted-dash" { "—" }
+                }
+            }
+        }
+    }
+}
+
+/// Small chip rendered on `/members` rows whose target has a
+/// currently-pending Owner-on-Owner transition. Links to the matching
+/// row on `/pending` via `#row-{transition_id}` fragment so Owners can
+/// jump straight to the Veto button. Time-remaining suffix borrows
+/// the same compact format used in the active /pending table.
+fn member_pending_pill(p: &pending::TransitionRow) -> Markup {
+    let action = pending_action_label(p);
+    let remaining = time_remaining_short(p.effective_at);
+    let href = format!("/pending#row-{}", p.id);
+    let label = format!("Pending: {action} · {remaining}");
+    html! {
+        a class="member-pending-pill"
+          href=(href)
+          title=("View on Pending review") {
+            (label)
+        }
+    }
+}
+
+/// Compact "47h" / "8m" / "soon" rendering used in the inline
+/// member-row pill. Drops the "left" suffix that the full table uses
+/// since the chip is already labeled "Pending: …".
+fn time_remaining_short(effective_at: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let delta = effective_at - now;
+    if delta.num_seconds() <= 0 {
+        "soon".to_string()
+    } else if delta.num_hours() >= 1 {
+        format!("{}h", delta.num_hours())
+    } else {
+        format!("{}m", delta.num_minutes().max(1))
+    }
+}
+
+/// Avatar + name + email cell shared between the active and history
+/// tables. Factored out so the two row renderers stay symmetric.
+fn user_cell(u: &identity::User) -> Markup {
+    html! {
+        div class="user-row-id" {
+            span class="avatar-wrapper" {
+                span class="avatar avatar-sm"
+                     style=(format!("background:{}", avatar_color(&u.id.0))) {
+                    (display_initial(&u.display_name))
+                }
+            }
+            div class="user-row-text" {
+                span class="user-name" { (u.display_name) }
+                span class="user-email" { (u.email) }
             }
         }
     }

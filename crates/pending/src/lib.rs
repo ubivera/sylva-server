@@ -262,6 +262,55 @@ pub async fn count_active(pool: &PgPool) -> Result<u32> {
     Ok(count.max(0) as u32)
 }
 
+/// Most-recently-resolved transitions, newest first. Used by the
+/// History section on `/pending` so Owners can audit what actually
+/// went through (or got cancelled) without bouncing to the full audit
+/// log. `limit` clamps the result set so very busy instances don't
+/// drown the page — the active table is the urgent view; older
+/// resolved rows live in the audit log proper.
+pub async fn list_recent_resolved(pool: &PgPool, limit: i64) -> Result<Vec<TransitionRow>> {
+    let rows: Vec<TransitionRow> = sqlx::query_as(
+        "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
+                effective_at, resolved_at, resolved_by_user_id, resolution,
+                created_at
+         FROM pending.transitions
+         WHERE state <> 'pending'
+         ORDER BY resolved_at DESC NULLS LAST
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Active pending transitions whose `target_user_id` is in `target_ids`.
+/// Used by the `/members` page to decorate rows with a "Pending …"
+/// pill — fetched in a single round-trip rather than one query per
+/// row. Returns the raw rows; the caller is expected to bucket them
+/// by `target_user_id` for rendering.
+pub async fn active_by_target_ids(
+    pool: &PgPool,
+    target_ids: &[Uuid],
+) -> Result<Vec<TransitionRow>> {
+    if target_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<TransitionRow> = sqlx::query_as(
+        "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
+                effective_at, resolved_at, resolved_by_user_id, resolution,
+                created_at
+         FROM pending.transitions
+         WHERE state = 'pending'
+           AND target_user_id = ANY($1)
+         ORDER BY effective_at ASC",
+    )
+    .bind(target_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Veto a pending transition. The caller is responsible for the authz
 /// check (Owner role) and for emitting the audit + notification side
 /// effects in the same transaction. Returns the row in its post-update

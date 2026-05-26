@@ -41,10 +41,11 @@ pub async fn pending_page(
     }
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
 
-    // Fetch the active rows + the user records they reference in two
-    // round-trips: one for the transitions, one bulk lookup for every
-    // unique user mentioned (initiator + target across all rows).
-    let rows = match pending::list_active(&state.db).await {
+    // Fetch active + recent-history rows + the user records they
+    // reference. Three round-trips total: one for each row set, one
+    // bulk user lookup over the union of every user mentioned
+    // (initiator, target, resolver across all rows).
+    let active = match pending::list_active(&state.db).await {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(?err, "listing active pending transitions for /pending");
@@ -54,14 +55,32 @@ pub async fn pending_page(
             );
         }
     };
-    let mut user_ids: Vec<identity::UserId> = rows
+    let history = match pending::list_recent_resolved(&state.db, HISTORY_LIMIT).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(?err, "listing resolved pending transitions for /pending");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+
+    // Collect every user id referenced in either set. Resolver shows
+    // up only in history (active rows haven't been resolved yet).
+    let mut user_ids: Vec<identity::UserId> = active
         .iter()
+        .chain(history.iter())
         .flat_map(|r| {
-            [r.initiator_user_id, r.target_user_id]
-                .into_iter()
-                .flatten()
-                .map(identity::UserId::new)
-                .collect::<Vec<_>>()
+            [
+                r.initiator_user_id,
+                r.target_user_id,
+                r.resolved_by_user_id,
+            ]
+            .into_iter()
+            .flatten()
+            .map(identity::UserId::new)
+            .collect::<Vec<_>>()
         })
         .collect();
     user_ids.sort_by_key(|u| u.0);
@@ -78,7 +97,7 @@ pub async fn pending_page(
         }
     };
 
-    let pending_count = Some(rows.len() as u32);
+    let pending_count = Some(active.len() as u32);
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -89,8 +108,16 @@ pub async fn pending_page(
         action: query.action.as_deref(),
         error: query.error.as_deref(),
     };
-    Html(views::pending_page(&ctx, &rows, &users, banner).into_string()).into_response()
+    Html(views::pending_page(&ctx, &active, &history, &users, banner).into_string())
+        .into_response()
 }
+
+/// How many resolved transitions to surface in the History section.
+/// Tradeoff: enough to give recent context for "what did we just
+/// veto/apply?" without inflating the page for high-activity instances.
+/// Older rows still live in the audit log and can be reached via
+/// future filters there.
+const HISTORY_LIMIT: i64 = 50;
 
 /// `POST /pending/{id}/veto` — web wrapper around the shared
 /// [`admin_logic::perform_veto_pending`] helper.
