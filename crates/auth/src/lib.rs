@@ -52,6 +52,28 @@ pub fn verify_password(password: &str, phc: &str) -> Result<bool> {
     }
 }
 
+/// Re-verify the password of a user identified by id (rather than by
+/// email, the way [`verify_credentials`] does). Returns `Ok(true)` on
+/// match, `Ok(false)` on mismatch or when the user has no credentials
+/// row at all (e.g. deleted account that somehow still has a live
+/// session). Used by `/members` destructive actions to require the
+/// current operator to re-enter their password before the change
+/// applies.
+pub async fn verify_user_password(
+    pool: &PgPool,
+    user_id: UserId,
+    password: &str,
+) -> Result<bool> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT password_hash FROM auth.credentials WHERE user_id = $1",
+    )
+    .bind(user_id.0)
+    .fetch_optional(pool)
+    .await?;
+    let Some((hash,)) = row else { return Ok(false); };
+    verify_password(password, &hash)
+}
+
 /// Length of a session token in bytes (256 bits of entropy).
 const TOKEN_BYTES: usize = 32;
 

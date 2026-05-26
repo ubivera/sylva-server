@@ -9,8 +9,74 @@ use axum::{
 /// `HX-Request: true` on every htmx-driven request). Handlers branch
 /// on this to return either a fragment or a full page so non-JS
 /// fallback still works.
-fn is_htmx(headers: &HeaderMap) -> bool {
+pub(crate) fn is_htmx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
+}
+
+/// Either a full-page `303 See Other` (non-HTMX) or an empty `200 OK`
+/// with `HX-Redirect: <url>` so HTMX does a client-side navigation.
+/// Used after every destructive action completes (success path) so
+/// the operator lands back on /members with a banner instead of
+/// seeing the partial swap into the modal.
+pub(crate) fn redirect_or_hx_redirect(url: &str, htmx: bool) -> Response {
+    if htmx {
+        let mut resp = (axum::http::StatusCode::OK, "").into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(url) {
+            resp.headers_mut().insert("HX-Redirect", v);
+        }
+        resp
+    } else {
+        Redirect::to(url).into_response()
+    }
+}
+
+/// Reauth gate. Verifies the operator's current password against
+/// `auth.credentials`. On `Ok(true)` returns control to the caller.
+/// On `Ok(false)`:
+///  * HTMX → return the reauth modal content with `invalid_password`
+///    banner so the modal stays open and the operator can retry.
+///  * non-HTMX → fall back to a redirect to /members with the same
+///    error code (banner renders above the table).
+///
+/// On internal error → 500 page.
+pub(crate) async fn require_password(
+    state: &AppState,
+    admin: &hearth::auth_routes::AdminUser,
+    password: &str,
+    htmx: bool,
+    action_url: &str,
+    staged_params: &[(&str, &str)],
+) -> Result<(), Response> {
+    let ok = match auth::verify_user_password(&state.db, admin.0.user.id, password).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(?err, "verifying operator password for reauth");
+            return Err(error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            ));
+        }
+    };
+    if ok {
+        return Ok(());
+    }
+    if htmx {
+        let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
+        let ctx = views::ChromeContext {
+            instance_name: &state.instance_name,
+            user: &admin.0.user,
+            csrf_token: &csrf_token,
+            // Reauth modal partial — sidebar isn't rendered.
+            pending_count: None,
+        };
+        Err(Html(
+            views::reauth_modal_content(&ctx, action_url, staged_params, Some("invalid_password"))
+                .into_string(),
+        )
+        .into_response())
+    } else {
+        Err(Redirect::to("/members?error=invalid_password").into_response())
+    }
 }
 use hearth::{
     admin_logic::{self, CreateInviteError, LifecycleError, Outcome, RevokeInviteError, RoleError},
@@ -22,19 +88,41 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    routes::{BrowserAuth, check_csrf_token, error_response, require_admin, url_encode},
+    routes::{
+        BrowserAuth, check_csrf_token, error_response, pending_count_for, require_admin,
+        url_encode,
+    },
     views,
 };
 
 #[derive(Deserialize)]
 pub struct LifecycleActionForm {
     pub csrf_token: String,
+    /// Operator's current password — re-verified before the action
+    /// applies. The reauth modal collects this; the action dialog
+    /// (delete / purge / deactivate) hands its params off to the
+    /// reauth modal via JS, and the actual POST that lands here
+    /// carries both the original params + the operator password.
+    pub password: String,
 }
 
 #[derive(Deserialize)]
 pub struct RoleChangeForm {
     pub csrf_token: String,
     pub role: InstanceRole,
+    /// Same re-auth gate as the lifecycle forms above. See
+    /// [`LifecycleActionForm::password`].
+    pub password: String,
+}
+
+/// Reactivate now requires re-auth too (folded into the same gate as
+/// the destructive actions). Kept as its own struct so the handler
+/// can use a different success banner verb without sharing the
+/// `LifecycleActionForm`'s richer Pending-handling.
+#[derive(Deserialize)]
+pub struct ReactivateForm {
+    pub csrf_token: String,
+    pub password: String,
 }
 
 #[derive(Deserialize)]
@@ -42,14 +130,21 @@ pub struct InviteForm {
     pub csrf_token: String,
     pub email: String,
     pub role: InstanceRole,
+    /// Operator's current password — re-verified before the invite
+    /// row + audit + outbound email commit. Inlined into the invite
+    /// modal rather than chained through `dlg-reauth` because invite's
+    /// success path renders into the same modal (`#invite-modal-content`),
+    /// which is awkward to coordinate across two modals via HTMX.
+    pub password: String,
 }
 
 /// `POST /members/{id}/deactivate` — form handler for the Deactivate kebab
 /// action. Owner-on-Owner routes through pending; bypass codes are not
-/// exposed in the UI so the form sends none.
+/// exposed in the UI so the form sends none. Requires re-auth.
 pub async fn deactivate_member(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
     Path(target_id): Path<Uuid>,
     Form(form): Form<LifecycleActionForm>,
 ) -> Response {
@@ -60,25 +155,38 @@ pub async fn deactivate_member(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/{target_id}/deactivate");
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+    {
+        return resp;
+    }
     match admin_logic::perform_deactivate(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => {
-            redirect_users(&format!(
+        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
+            &format!(
                 "/members?action=deactivated&target={}",
                 url_encode(&target.display_name)
-            ))
+            ),
+            htmx,
+        ),
+        Ok(Outcome::Pending(_)) => {
+            redirect_or_hx_redirect("/members?action=pending_deactivate", htmx)
         }
-        Ok(Outcome::Pending(_)) => redirect_users("/members?action=pending_deactivate"),
-        Err(e) => lifecycle_error_to_redirect(e),
+        Err(e) => lifecycle_error_to_response(e, htmx),
     }
 }
 
 /// `POST /members/{id}/reactivate` — form handler. No pending path —
-/// reactivation is always immediate.
+/// reactivation is always immediate. Requires re-auth (the reactivate
+/// confirmation dialog chains into the shared reauth modal like the
+/// destructive actions do).
 pub async fn reactivate_member(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
     Path(target_id): Path<Uuid>,
-    Form(form): Form<LifecycleActionForm>,
+    Form(form): Form<ReactivateForm>,
 ) -> Response {
     if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
         return resp;
@@ -87,19 +195,31 @@ pub async fn reactivate_member(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/{target_id}/reactivate");
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+    {
+        return resp;
+    }
     match admin_logic::perform_reactivate(&state, &admin, target_id).await {
-        Ok(user) => redirect_users(&format!(
-            "/members?action=reactivated&target={}",
-            url_encode(&user.display_name)
-        )),
-        Err(e) => lifecycle_error_to_redirect(e),
+        Ok(user) => redirect_or_hx_redirect(
+            &format!(
+                "/members?action=reactivated&target={}",
+                url_encode(&user.display_name)
+            ),
+            htmx,
+        ),
+        Err(e) => lifecycle_error_to_response(e, htmx),
     }
 }
 
 /// `POST /members/{id}/delete` — soft delete (terminal "account removed").
+/// Requires re-auth.
 pub async fn delete_member(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
     Path(target_id): Path<Uuid>,
     Form(form): Form<LifecycleActionForm>,
 ) -> Response {
@@ -110,13 +230,23 @@ pub async fn delete_member(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/{target_id}/delete");
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+    {
+        return resp;
+    }
     match admin_logic::perform_soft_delete(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => redirect_users(&format!(
-            "/members?action=deleted&target={}",
-            url_encode(&target.display_name)
-        )),
-        Ok(Outcome::Pending(_)) => redirect_users("/members?action=pending_delete"),
-        Err(e) => lifecycle_error_to_redirect(e),
+        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
+            &format!(
+                "/members?action=deleted&target={}",
+                url_encode(&target.display_name)
+            ),
+            htmx,
+        ),
+        Ok(Outcome::Pending(_)) => redirect_or_hx_redirect("/members?action=pending_delete", htmx),
+        Err(e) => lifecycle_error_to_response(e, htmx),
     }
 }
 
@@ -124,6 +254,7 @@ pub async fn delete_member(
 pub async fn purge_member(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
     Path(target_id): Path<Uuid>,
     Form(form): Form<LifecycleActionForm>,
 ) -> Response {
@@ -134,22 +265,34 @@ pub async fn purge_member(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/{target_id}/purge");
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+    {
+        return resp;
+    }
     match admin_logic::perform_hard_delete(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => redirect_users(&format!(
-            "/members?action=purged&target={}",
-            url_encode(&target.display_name)
-        )),
-        Ok(Outcome::Pending(_)) => redirect_users("/members?action=pending_purge"),
-        Err(e) => lifecycle_error_to_redirect(e),
+        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
+            &format!(
+                "/members?action=purged&target={}",
+                url_encode(&target.display_name)
+            ),
+            htmx,
+        ),
+        Ok(Outcome::Pending(_)) => redirect_or_hx_redirect("/members?action=pending_purge", htmx),
+        Err(e) => lifecycle_error_to_response(e, htmx),
     }
 }
 
 /// `POST /members/{id}/role` — change a user's instance role.
 /// Owner-only (admin_logic enforces). Owner-on-Owner routes through
 /// pending unless a recovery code is supplied (UI doesn't expose this).
+/// Requires re-auth.
 pub async fn change_member_role(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
     Path(target_id): Path<Uuid>,
     Form(form): Form<RoleChangeForm>,
 ) -> Response {
@@ -160,13 +303,33 @@ pub async fn change_member_role(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/{target_id}/role");
+    // Stage the role value back into the reauth modal if the password
+    // is wrong, so the operator's choice survives the partial swap.
+    let role_value = match form.role {
+        InstanceRole::Owner => "owner",
+        InstanceRole::Admin => "admin",
+        InstanceRole::Member => "member",
+    };
+    let staged: &[(&str, &str)] = &[("role", role_value)];
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, staged).await
+    {
+        return resp;
+    }
     match admin_logic::perform_change_role(&state, &admin, target_id, form.role, None).await {
-        Ok(Outcome::Applied { target }) => redirect_users(&format!(
-            "/members?action=role_changed&target={}",
-            url_encode(&target.display_name)
-        )),
-        Ok(Outcome::Pending(_)) => redirect_users("/members?action=pending_role_change"),
-        Err(e) => role_error_to_redirect(e),
+        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
+            &format!(
+                "/members?action=role_changed&target={}",
+                url_encode(&target.display_name)
+            ),
+            htmx,
+        ),
+        Ok(Outcome::Pending(_)) => {
+            redirect_or_hx_redirect("/members?action=pending_role_change", htmx)
+        }
+        Err(e) => role_error_to_response(e, htmx),
     }
 }
 
@@ -174,11 +337,7 @@ pub async fn change_member_role(
 // Outcome → response mapping
 // ────────────────────────────────────────────────────────────────────────
 
-fn redirect_users(location: &str) -> Response {
-    Redirect::to(location).into_response()
-}
-
-fn lifecycle_error_to_redirect(e: LifecycleError) -> Response {
+fn lifecycle_error_to_response(e: LifecycleError, htmx: bool) -> Response {
     let code = match e {
         LifecycleError::NotFound => "user_not_found",
         LifecycleError::SelfTarget => "cannot_target_self",
@@ -194,10 +353,10 @@ fn lifecycle_error_to_redirect(e: LifecycleError) -> Response {
             );
         }
     };
-    redirect_users(&format!("/members?error={code}"))
+    redirect_or_hx_redirect(&format!("/members?error={code}"), htmx)
 }
 
-fn role_error_to_redirect(e: RoleError) -> Response {
+fn role_error_to_response(e: RoleError, htmx: bool) -> Response {
     let code = match e {
         RoleError::Forbidden => "forbidden",
         RoleError::NotFound => "user_not_found",
@@ -214,7 +373,7 @@ fn role_error_to_redirect(e: RoleError) -> Response {
             );
         }
     };
-    redirect_users(&format!("/members?error={code}"))
+    redirect_or_hx_redirect(&format!("/members?error={code}"), htmx)
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -237,10 +396,12 @@ pub async fn invite_form(
         return error_response(axum::http::StatusCode::FORBIDDEN, "Admins only.");
     }
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
         csrf_token: &csrf_token,
+        pending_count,
     };
     if is_htmx(&headers) {
         Html(
@@ -275,30 +436,81 @@ pub async fn invite_submit(
     let htmx = is_htmx(&headers);
 
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
+    let pending_count = pending_count_for(&state, admin.0.user.instance_role).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &admin.0.user,
         csrf_token: &csrf_token,
+        pending_count,
     };
+
+    // Re-auth gate — verify password before doing anything.
+    //
+    // The invite chain works like this: the invite modal's Send button
+    // doesn't submit directly; it stages email+role into the shared
+    // reauth modal (dlg-reauth) via REAUTH_CHAIN_JS, the reauth modal
+    // POSTs here with HX-Target=#reauth-modal-content.
+    //
+    //  * Wrong password (HTMX) → return reauth-modal content with the
+    //    `invalid_password` banner; the default target swap keeps the
+    //    reauth modal open and just refreshes its body.
+    //  * Right password (HTMX) → continue to the invite logic, then
+    //    use `HX-Retarget: #invite-modal-content` to flip the swap
+    //    target to the invite modal's body, plus `HX-Trigger` events
+    //    to switch which modal is visible (close reauth, reopen
+    //    invite) and to flag the invite list for refresh on close.
+    match auth::verify_user_password(&state.db, admin.0.user.id, &form.password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return if htmx {
+                Html(
+                    views::reauth_modal_content(
+                        &ctx,
+                        "/members/invite",
+                        &[
+                            ("email", form.email.as_str()),
+                            ("role", role_url_token(form.role)),
+                        ],
+                        Some("invalid_password"),
+                    )
+                    .into_string(),
+                )
+                .into_response()
+            } else {
+                Html(
+                    views::members_invite_form_page(
+                        &ctx,
+                        &form.email,
+                        form.role,
+                        Some("invalid_password"),
+                    )
+                    .into_string(),
+                )
+                .into_response()
+            };
+        }
+        Err(err) => {
+            tracing::error!(?err, "verifying operator password for invite");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    }
 
     match admin_logic::perform_create_invite(&state, &admin, &form.email, form.role).await {
         Ok(outcome) => {
             let accept_url = format!("{}/invite/{}", state.public_base_url, outcome.raw_token);
             if htmx {
-                // HTMX swap: just the inner modal content. The dialog
-                // stays open, transitioning visually from the form to
-                // the success view in place.
-                Html(
-                    views::invite_modal_content_success(
-                        &ctx,
-                        &outcome.invitation.email,
-                        outcome.invitation.instance_role,
-                        &accept_url,
-                        outcome.invitation.expires_at,
-                    )
-                    .into_string(),
+                let body = views::invite_modal_content_success(
+                    &ctx,
+                    &outcome.invitation.email,
+                    outcome.invitation.instance_role,
+                    &accept_url,
+                    outcome.invitation.expires_at,
                 )
-                .into_response()
+                .into_string();
+                invite_modal_swap_response(body, /* succeeded = */ true)
             } else {
                 // No-JS / HTMX-absent fallback: full result page.
                 Html(
@@ -329,11 +541,14 @@ pub async fn invite_submit(
                 }
             };
             if htmx {
-                Html(
-                    views::invite_modal_content_form(&ctx, &form.email, form.role, Some(code))
-                        .into_string(),
+                let body = views::invite_modal_content_form(
+                    &ctx,
+                    &form.email,
+                    form.role,
+                    Some(code),
                 )
-                .into_response()
+                .into_string();
+                invite_modal_swap_response(body, /* succeeded = */ false)
             } else {
                 Html(
                     views::members_invite_form_page(&ctx, &form.email, form.role, Some(code))
@@ -345,13 +560,61 @@ pub async fn invite_submit(
     }
 }
 
+/// URL token for an `InstanceRole` — `member` / `admin` / `owner`.
+/// Used when staging the form's role value back into the reauth modal
+/// after a wrong-password attempt.
+fn role_url_token(role: InstanceRole) -> &'static str {
+    match role {
+        InstanceRole::Owner => "owner",
+        InstanceRole::Admin => "admin",
+        InstanceRole::Member => "member",
+    }
+}
+
+/// HTMX response for the invite chain's post-reauth swap. The reauth
+/// modal's default `hx-target` is `#reauth-modal-content`; here we
+/// retarget to `#invite-modal-content` so the body swap lands in the
+/// invite modal, and fire `HX-Trigger` events to:
+///   * `switch-to-invite-modal` — JS closes dlg-reauth, opens dlg-invite
+///   * `invite-success` (only on success) — JS flags the page so the
+///     dlg-invite close handler triggers a window reload, surfacing
+///     the new pending invite row in the table.
+fn invite_modal_swap_response(body: String, succeeded: bool) -> Response {
+    let mut resp = Html(body).into_response();
+    let headers = resp.headers_mut();
+    // `from_static` returns the HeaderValue directly (panics on invalid
+    // input at compile time for &'static str literals).
+    headers.insert(
+        "HX-Retarget",
+        axum::http::HeaderValue::from_static("#invite-modal-content"),
+    );
+    let trigger_value = if succeeded {
+        "switch-to-invite-modal, invite-success"
+    } else {
+        "switch-to-invite-modal"
+    };
+    headers.insert(
+        "HX-Trigger",
+        axum::http::HeaderValue::from_static(trigger_value),
+    );
+    resp
+}
+
 /// `POST /members/invitations/{id}/revoke` — kebab action on a pending
 /// invite row. Calls into `admin_logic::perform_revoke_invite` (the
 /// same shared transaction the JSON `/api/admin/invites/{id}/revoke`
 /// uses) and redirects back to /members with a banner.
+///
+/// Reuses the destructive-action reauth pattern: the kebab opens a
+/// confirmation dialog whose Continue button chains into `dlg-reauth`,
+/// the operator types their password, and the actual POST lands here
+/// with `password` populated. Without the password the request would
+/// fail Form deserialization (LifecycleActionForm makes password
+/// required) — the dialog is the only legitimate caller.
 pub async fn revoke_invitation(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
     Path(invitation_id): Path<Uuid>,
     Form(form): Form<LifecycleActionForm>,
 ) -> Response {
@@ -362,14 +625,21 @@ pub async fn revoke_invitation(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/invitations/{invitation_id}/revoke");
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+    {
+        return resp;
+    }
     let id = InvitationId::new(invitation_id);
     match admin_logic::perform_revoke_invite(&state, &admin, id).await {
-        Ok(()) => Redirect::to("/members?action=invite_revoked").into_response(),
+        Ok(()) => redirect_or_hx_redirect("/members?action=invite_revoked", htmx),
         Err(RevokeInviteError::NotFound) => {
-            Redirect::to("/members?error=invite_not_found").into_response()
+            redirect_or_hx_redirect("/members?error=invite_not_found", htmx)
         }
         Err(RevokeInviteError::AlreadyAccepted) => {
-            Redirect::to("/members?error=invite_already_accepted").into_response()
+            redirect_or_hx_redirect("/members?error=invite_already_accepted", htmx)
         }
         Err(RevokeInviteError::Internal(err)) => {
             tracing::error!(?err, "revoke invite internal error (web)");

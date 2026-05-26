@@ -229,6 +229,39 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<TransitionRow>> {
     Ok(rows)
 }
 
+/// Currently-pending transitions only, oldest-expiry first. Used by
+/// the `/pending` admin page's "Active" section — the resolved rows
+/// (vetoed / cancelled / applied) belong to a separate history view.
+/// Ordering by `effective_at ASC` puts the most-urgent rows first so
+/// the operator sees the imminent ones at the top of the table.
+pub async fn list_active(pool: &PgPool) -> Result<Vec<TransitionRow>> {
+    let rows: Vec<TransitionRow> = sqlx::query_as(
+        "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
+                effective_at, resolved_at, resolved_by_user_id, resolution,
+                created_at
+         FROM pending.transitions
+         WHERE state = 'pending'
+         ORDER BY effective_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Count of currently-pending transitions. Used by the sidebar's
+/// "Pending review" badge so Owners see at-a-glance how many actions
+/// are awaiting them. Cheap — the `transitions_due_idx` partial index
+/// covers `state = 'pending'`, so the count is essentially an index
+/// scan even with many resolved rows.
+pub async fn count_active(pool: &PgPool) -> Result<u32> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pending.transitions WHERE state = 'pending'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count.max(0) as u32)
+}
+
 /// Veto a pending transition. The caller is responsible for the authz
 /// check (Owner role) and for emitting the audit + notification side
 /// effects in the same transaction. Returns the row in its post-update

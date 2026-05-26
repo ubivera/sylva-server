@@ -270,12 +270,35 @@ pub async fn me_page(
     BrowserAuth(auth): BrowserAuth,
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
         csrf_token: &csrf_token,
+        pending_count,
     };
     Html(views::me_page(&ctx).into_string()).into_response()
+}
+
+/// Fetches the active pending-transition count, but only for Owner
+/// viewers — Admins and Members never see the sidebar entry and
+/// shouldn't pay for the query. Returns `None` on non-Owner; logs and
+/// swallows any DB error (the sidebar then just renders without a
+/// badge rather than failing the entire page render).
+pub(crate) async fn pending_count_for(
+    state: &hearth::app::AppState,
+    role: identity::InstanceRole,
+) -> Option<u32> {
+    if role != identity::InstanceRole::Owner {
+        return None;
+    }
+    match pending::count_active(&state.db).await {
+        Ok(n) => Some(n),
+        Err(err) => {
+            tracing::warn!(?err, "pending count for sidebar badge");
+            None
+        }
+    }
 }
 
 /// Query params on `/members`. `action` / `target` / `error` carry the
@@ -488,10 +511,12 @@ pub async fn members_page(
     };
 
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
         csrf_token: &csrf_token,
+        pending_count,
     };
     let banner = views::MembersBanner {
         action: query.action.as_deref(),

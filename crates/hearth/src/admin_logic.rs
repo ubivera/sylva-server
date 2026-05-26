@@ -3,6 +3,7 @@ use identity::{
     DEFAULT_INVITATION_TTL, InstanceRole, Invitation, InvitationRepository, User, UserId,
     UserLifecycle, UserRepository,
 };
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{app::AppState, auth_routes::AdminUser};
@@ -1020,4 +1021,207 @@ pub async fn perform_revoke_invite(
     .await;
 
     result.map_err(RevokeInviteError::Internal)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Pending-transition resolution (veto / cancel)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Which terminal state to drive a pending row into. Veto and Cancel
+/// share the same DB shape (sets `state`, `resolved_at`,
+/// `resolved_by_user_id`, `resolution`) — the only differences are
+/// authz (Owner vs initiator-or-Owner) and the audit / notification
+/// event types. `pub(crate)` so the JSON cancel handler in
+/// `admin_routes` can still drive the shared `resolve_pending_inner`
+/// after applying its own authz check.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResolveKind {
+    Veto,
+    Cancel,
+}
+
+/// Error returned by [`resolve_pending_inner`]. Shared by both
+/// veto and cancel paths.
+#[derive(Debug, Error)]
+pub enum ResolveError {
+    #[error("transition_not_found")]
+    NotFound,
+    #[error("not_pending")]
+    NotPending,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Error returned by [`perform_veto_pending`]. Adds the `NotOwner` arm
+/// since the public veto API enforces Owner-only authz; the JSON
+/// cancel handler enforces its own authz and uses [`ResolveError`]
+/// directly.
+#[derive(Debug, Error)]
+pub enum VetoError {
+    /// Only Owners can veto pending actions.
+    #[error("forbidden")]
+    NotOwner,
+    #[error("transition_not_found")]
+    NotFound,
+    #[error("not_pending")]
+    NotPending,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Owner-only public API: veto a pending transition. Wraps
+/// [`resolve_pending_inner`] with the Owner authz check, then emits
+/// the audit event + notification side effects in one transaction.
+///
+/// Both the JSON `/admin/pending-transitions/{id}/veto` endpoint and
+/// the web `POST /pending/{id}/veto` handler call this so the policy
+/// stays in one place.
+pub async fn perform_veto_pending(
+    state: &AppState,
+    admin: &AdminUser,
+    transition_id: Uuid,
+) -> Result<pending::TransitionRow, VetoError> {
+    if admin.0.user.instance_role != InstanceRole::Owner {
+        return Err(VetoError::NotOwner);
+    }
+    match resolve_pending_inner(state, admin, transition_id, ResolveKind::Veto).await {
+        Ok(row) => Ok(row),
+        Err(ResolveError::NotFound) => Err(VetoError::NotFound),
+        Err(ResolveError::NotPending) => Err(VetoError::NotPending),
+        Err(ResolveError::Internal(e)) => Err(VetoError::Internal(e)),
+    }
+}
+
+/// Drive a pending row to its terminal state and emit the side
+/// effects. Caller-side authz only — this function assumes the caller
+/// has already verified the operator is allowed to perform `kind` on
+/// the row in question (the veto API requires Owner; cancel allows
+/// Owner OR initiator).
+///
+/// Always runs in a single transaction so that the row state, audit
+/// event, and notification outbox row all commit (or roll back)
+/// together. On veto, also enqueues a notification to the initiator;
+/// cancel skips that since the initiator is usually the canceller
+/// themselves.
+pub(crate) async fn resolve_pending_inner(
+    state: &AppState,
+    admin: &AdminUser,
+    transition_id: Uuid,
+    kind: ResolveKind,
+) -> Result<pending::TransitionRow, ResolveError> {
+    let actor = admin.actor();
+    let by_user_id = admin.0.user.id;
+    let admin_display_name = admin.0.user.display_name.clone();
+
+    let result: anyhow::Result<pending::TransitionRow> = async {
+        let mut tx = state.db.begin().await?;
+        let row = match kind {
+            ResolveKind::Veto => pending::veto(&mut tx, transition_id, by_user_id).await?,
+            ResolveKind::Cancel => pending::cancel(&mut tx, transition_id, by_user_id).await?,
+        };
+
+        // Look up initiator + target display info for audit + notification.
+        let initiator_id = row
+            .initiator_user_id
+            .ok_or_else(|| anyhow::anyhow!("initiator_user_id is null"))?;
+        let target_id = row
+            .target_user_id
+            .ok_or_else(|| anyhow::anyhow!("target_user_id is null"))?;
+        let (initiator_email, initiator_display_name, target_display_name): (
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT
+                (SELECT email FROM identity.users WHERE id = $1),
+                (SELECT display_name FROM identity.users WHERE id = $1),
+                (SELECT display_name FROM identity.users WHERE id = $2)",
+        )
+        .bind(initiator_id)
+        .bind(target_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Audit + notification details differ by kind. For role_change we
+        // include the to_role; for lifecycle kinds we include the action.
+        let is_lifecycle = pending::lifecycle_from_kind(row.kind).is_some();
+        let event_type = match (kind, is_lifecycle) {
+            (ResolveKind::Veto, false) => "pending_role_change_vetoed",
+            (ResolveKind::Cancel, false) => "pending_role_change_cancelled",
+            (ResolveKind::Veto, true) => "pending_lifecycle_vetoed",
+            (ResolveKind::Cancel, true) => "pending_lifecycle_cancelled",
+        };
+
+        let mut event_data = serde_json::json!({
+            "transition_id": transition_id,
+            "initiator_user_id": initiator_id,
+            "target_user_id": target_id,
+            "resolved_by": by_user_id.0,
+        });
+        if let Some(action) = pending::lifecycle_from_kind(row.kind) {
+            event_data["action"] = serde_json::to_value(action)?;
+        } else {
+            let payload = row.role_payload()?;
+            event_data["to_role"] = serde_json::to_value(payload.to_role)?;
+        }
+        audit::append(&mut tx, Some(&actor), None, event_type, event_data).await?;
+
+        // Notify the initiator on veto. (Skip notification for cancel —
+        // the initiator is usually the cancel-er themselves.)
+        if matches!(kind, ResolveKind::Veto) {
+            if let Some(action) = pending::lifecycle_from_kind(row.kind) {
+                notifications::enqueue(
+                    &mut tx,
+                    notifications::Notification::PendingLifecycleVetoed {
+                        recipient_email: initiator_email,
+                        initiator_display_name,
+                        target_display_name,
+                        vetoed_by_display_name: admin_display_name.clone(),
+                        action,
+                        transition_id,
+                    },
+                )
+                .await?;
+            } else {
+                let payload = row.role_payload()?;
+                let from_role: InstanceRole = sqlx::query_scalar(
+                    "SELECT instance_role FROM identity.users WHERE id = $1",
+                )
+                .bind(target_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                notifications::enqueue(
+                    &mut tx,
+                    notifications::Notification::PendingRoleChangeVetoed {
+                        recipient_email: initiator_email,
+                        initiator_display_name,
+                        target_display_name,
+                        vetoed_by_display_name: admin_display_name.clone(),
+                        from_role,
+                        to_role: payload.to_role,
+                        transition_id,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(row)
+    }
+    .await;
+
+    match result {
+        Ok(row) => Ok(row),
+        Err(e) => {
+            if let Some(pe) = e.downcast_ref::<pending::PendingError>() {
+                match pe {
+                    pending::PendingError::NotFound => return Err(ResolveError::NotFound),
+                    pending::PendingError::NotPending => return Err(ResolveError::NotPending),
+                    _ => {}
+                }
+            }
+            Err(ResolveError::Internal(e))
+        }
+    }
 }

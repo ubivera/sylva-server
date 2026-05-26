@@ -11,6 +11,14 @@ pub struct ChromeContext<'a> {
     /// [`hearth::csrf::compute_token`]. Embed in every state-changing
     /// form via [`csrf_input`].
     pub csrf_token: &'a str,
+    /// Count of currently-pending Owner-on-Owner transitions. Sidebar
+    /// renders a badge next to the "Pending review" nav entry when
+    /// this is `Some(n)` with `n > 0`. Always `None` for non-Owner
+    /// viewers — they don't see the entry at all, and we avoid the
+    /// query for them too. Handlers that render the chrome can leave
+    /// this unset (defaulting to `None`) when the count isn't readily
+    /// available; the link still renders, just without a badge.
+    pub pending_count: Option<u32>,
 }
 
 /// Render the hidden `csrf_token` input for a form. Every state-changing
@@ -28,6 +36,7 @@ pub fn csrf_input(token: &str) -> Markup {
 pub enum PageId {
     Profile,
     Members,
+    Pending,
 }
 
 /// Sortable column on `/users`. Default is `Joined` ascending, which
@@ -373,6 +382,17 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                 @if is_admin {
                     (nav_link("/members", "Members", current == PageId::Members))
                 }
+                // Owner-only: 72-hour pending Owner-on-Owner action
+                // queue. Admins never see this nav entry — they can't
+                // veto and there's no Admin-on-X content here today.
+                @if is_owner(ctx.user.instance_role) {
+                    (nav_link_with_badge(
+                        "/pending",
+                        "Pending review",
+                        current == PageId::Pending,
+                        ctx.pending_count,
+                    ))
+                }
             }
 
             (user_card(ctx))
@@ -384,10 +404,32 @@ fn is_at_least_admin(role: InstanceRole) -> bool {
     matches!(role, InstanceRole::Admin | InstanceRole::Owner)
 }
 
+fn is_owner(role: InstanceRole) -> bool {
+    matches!(role, InstanceRole::Owner)
+}
+
 fn nav_link(href: &str, label: &str, active: bool) -> Markup {
     let class = if active { "nav-link active" } else { "nav-link" };
     html! {
         a class=(class) href=(href) { (label) }
+    }
+}
+
+/// Nav link with an optional count badge. The badge only renders when
+/// `count` is `Some(n)` with `n > 0` — so the layout collapses cleanly
+/// for the empty-queue case (the link still shows, just no number).
+fn nav_link_with_badge(href: &str, label: &str, active: bool, count: Option<u32>) -> Markup {
+    let class = if active { "nav-link active" } else { "nav-link" };
+    let show_badge = count.is_some_and(|n| n > 0);
+    html! {
+        a class=(class) href=(href) {
+            span class="nav-link-label" { (label) }
+            @if show_badge {
+                span class="nav-link-badge" aria-label=(format!("{} pending", count.unwrap())) {
+                    (count.unwrap())
+                }
+            }
+        }
     }
 }
 
@@ -558,11 +600,13 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
 /// `GET /members/invite` (and `POST` on validation failure) — render the
 /// invitation form. `prefill_email` carries the caller's previous input
 /// back into the form when re-rendering after an error so they don't
-/// have to retype.
+/// have to retype. The `selected_role` parameter is kept for backwards
+/// signature compatibility with the modal handlers but is no longer
+/// used in the UI — every invite goes out as Member.
 pub fn members_invite_form_page(
     ctx: &ChromeContext,
     prefill_email: &str,
-    selected_role: InstanceRole,
+    _selected_role: InstanceRole,
     error: Option<&str>,
 ) -> Markup {
     let content = html! {
@@ -579,8 +623,6 @@ pub fn members_invite_form_page(
                 (invite_form_fields(
                     ctx.csrf_token,
                     prefill_email,
-                    selected_role,
-                    ctx.user.instance_role,
                     /* autofocus_email = */ true,
                     /* id_prefix = */ "page",
                 ))
@@ -594,23 +636,19 @@ pub fn members_invite_form_page(
     shell_app(ctx, "Invite member", PageId::Members, content)
 }
 
-/// Shared invite form fields — email input + role picker + CSRF token.
-/// Used by both the standalone /members/invite page and the modal on
-/// /members. `id_prefix` keeps the input ids unique when both forms
-/// are rendered on the same page (so `<label for>` resolves to the
-/// right one).
+/// Shared invite form fields — email input + CSRF token. Used by both
+/// the standalone /members/invite page and the modal on /members.
+/// `id_prefix` keeps the input ids unique when both forms are rendered
+/// on the same page (so `<label for>` resolves to the right one).
 ///
-/// Role picker behavior:
-/// * Owner viewers see a segmented control with Member / Admin / Owner.
-/// * Non-Owner viewers (Admin) see a hidden input pinning role=member.
-///   That mirrors the design ref where "admins can only invite users
-///   rank"; the backend still accepts admin-on-admin via the JSON API,
-///   so this is a UI-only tightening.
+/// All invites are issued as Member. Promotion to Admin or Owner
+/// happens after the invitee accepts, via the change-role flow on
+/// their row in the directory. That keeps the most-common path (just
+/// add someone to the Hearth) to a single field, and the elevation
+/// path explicit and reauth-gated.
 fn invite_form_fields(
     csrf_token: &str,
     prefill_email: &str,
-    selected_role: InstanceRole,
-    inviter_role: InstanceRole,
     autofocus_email: bool,
     id_prefix: &str,
 ) -> Markup {
@@ -623,30 +661,107 @@ fn invite_form_fields(
                   autocomplete="email" required
                   autofocus[autofocus_email];
         }
-        @if matches!(inviter_role, InstanceRole::Owner) {
-            div class="field" {
-                span class="field-label" { "Role" }
-                (role_segmented_control(selected_role, id_prefix))
-            }
-        } @else {
-            // Admin invokers see no choice — backend still validates,
-            // but the UI presents one path: a new Member.
-            input type="hidden" name="role" value="member";
-        }
+        // All invites are Member. Pinning as a hidden input keeps the
+        // form serialization shape stable so the backend can keep its
+        // existing `Form<InviteForm>` deserializer without an `Option`
+        // around the role field.
+        input type="hidden" name="role" value="member";
+        // Password is collected by the shared reauth modal, not here.
+        // See the `data-reauth-confirm` button on the modal flow.
         (csrf_input(csrf_token))
     }
 }
 
-/// Invite-member modal — UUI-style `<dialog>` rendered always on the
-/// Members page. The toolbar CTA opens it via `data-open-dialog`;
-/// submitting POSTs to /members/invite where the existing handler
-/// either renders the one-time URL result page (success) or the
-/// standalone form page with an error banner (validation fail).
-/// Always-rendered `<dialog>` on /members. The inner `<div>` carries
-/// `id="invite-modal-content"` so the form's HTMX target swap stays
-/// scoped to the modal body — the dialog itself + open state survive
-/// the swap. Initial render shows the form; after a successful POST
-/// HTMX swaps in [`invite_modal_content_success`] in place.
+// ────────────────────────────────────────────────────────────────────────
+// Reauth modal — shared password-confirm gate for destructive actions
+// ────────────────────────────────────────────────────────────────────────
+
+/// Always-rendered `<dialog id="dlg-reauth">` on /members. The inner
+/// `<div id="reauth-modal-content">` is HTMX's swap target; on wrong
+/// password the server returns [`reauth_modal_content`] with an error
+/// banner, keeping the modal open. On right password the server
+/// responds with `HX-Redirect: /members?action=...` so HTMX navigates
+/// the page.
+///
+/// The form's `action` attribute is empty at render time; the JS
+/// chain in `REAUTH_CHAIN_JS` sets both `action` and `hx-post` to
+/// whichever per-row action URL the operator initiated.
+fn reauth_modal(ctx: &ChromeContext) -> Markup {
+    html! {
+        dialog id="dlg-reauth" class="action-dialog reauth-dialog" {
+            div id="reauth-modal-content" {
+                (reauth_modal_content(ctx, "", &[], None))
+            }
+        }
+    }
+}
+
+/// Inner content of the reauth modal. `action_url` is what the form
+/// posts to (set per-action at chain time). `staged_params` are
+/// hidden inputs carrying the original action's payload so a wrong
+/// password attempt doesn't make the operator re-pick (e.g., role
+/// selection survives a retry). `error` renders an inline banner
+/// — currently only `"invalid_password"` is wired.
+pub fn reauth_modal_content(
+    ctx: &ChromeContext,
+    action_url: &str,
+    staged_params: &[(&str, &str)],
+    error: Option<&str>,
+) -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-icon-shield" {
+                (shield_icon())
+            }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Please enter your password" }
+        p class="dialog-description dialog-center-text" {
+            "Enter your password to make this change."
+        }
+        @if let Some(code) = error {
+            (error_banner(code))
+        }
+        form id="form-reauth"
+             method="post" action=(action_url)
+             hx-post=(action_url)
+             hx-target="#reauth-modal-content"
+             hx-swap="innerHTML" {
+            div class="field" {
+                label for="reauth-password" { "Password" }
+                input type="password" id="reauth-password" name="password"
+                      autocomplete="current-password" required;
+            }
+            (csrf_input(ctx.csrf_token))
+            @for (name, value) in staged_params {
+                input type="hidden" name=(name) value=(value);
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog {
+                    "Cancel"
+                }
+                button type="submit" class="btn" { "Verify" }
+            }
+        }
+    }
+}
+
+/// 22px shield icon for the reauth modal's feature-icon slot.
+fn shield_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" {}
+        }
+    }
+}
+
 fn invite_modal(ctx: &ChromeContext) -> Markup {
     html! {
         dialog id="dlg-invite" class="action-dialog invite-dialog" {
@@ -667,7 +782,7 @@ fn invite_modal(ctx: &ChromeContext) -> Markup {
 pub fn invite_modal_content_form(
     ctx: &ChromeContext,
     prefill_email: &str,
-    selected_role: InstanceRole,
+    _selected_role: InstanceRole,
     error: Option<&str>,
 ) -> Markup {
     html! {
@@ -683,27 +798,33 @@ pub fn invite_modal_content_form(
         h2 { "Invite a member" }
         p class="dialog-description" {
             "Add a member by email. They'll receive a one-time link to "
-            "set up their account."
+            "set up their account. You can change their role after they "
+            "accept."
         }
         @if let Some(code) = error {
             (error_banner(code))
         }
-        form method="post" action="/members/invite"
-             hx-post="/members/invite"
-             hx-target="#invite-modal-content"
-             hx-swap="innerHTML" {
+        // No `hx-post` here — the Continue button chains to the
+        // shared reauth modal (dlg-reauth) via REAUTH_CHAIN_JS. The
+        // staged email + role=member + csrf get copied into the reauth
+        // form as hidden inputs, and that form is what actually POSTs.
+        // On success the server uses HX-Retarget + HX-Trigger to swap
+        // the response back into THIS modal, not the reauth modal.
+        form id="form-invite-modal"
+             method="post" action="/members/invite" {
             (invite_form_fields(
                 ctx.csrf_token,
                 prefill_email,
-                selected_role,
-                ctx.user.instance_role,
                 /* autofocus_email = */ false,
                 /* id_prefix = */ "modal",
             ))
             div class="dialog-actions" {
                 button type="button" class="btn-secondary"
                        data-close-dialog { "Cancel" }
-                button type="submit" class="btn" { "Send invitation" }
+                button type="button" class="btn"
+                       data-reauth-confirm="form-invite-modal" {
+                    "Send invitation"
+                }
             }
         }
     }
@@ -756,19 +877,65 @@ pub fn invite_modal_content_success(
             }
         }
         div class="dialog-actions" {
-            button type="button" class="btn-secondary" data-close-dialog {
-                "Done"
-            }
-            button type="button" class="btn"
-                   hx-get="/members/invite"
-                   hx-target="#invite-modal-content"
-                   hx-swap="innerHTML" {
-                "Invite another"
+            // Single "Close" action — invite flow is one-at-a-time. If
+            // the operator wants to invite another member they re-open
+            // the modal from the toolbar CTA, which gives them a fresh
+            // form (and a fresh password prompt).
+            button type="button" class="btn" data-close-dialog {
+                "Close"
             }
         }
         // Re-bind the clipboard handler — INVITE_COPY_JS is delegated
         // on `document`, so it picks up the swapped-in [data-copy-target]
         // automatically. No re-init needed.
+    }
+}
+
+/// 22px simple person silhouette — used for the "Member" segment in
+/// the change-role picker.
+fn user_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" {}
+            circle cx="12" cy="7" r="4" {}
+        }
+    }
+}
+
+/// 22px person + shield — "Admin" segment in the change-role picker.
+/// A shield (rather than a gear) reads as "elevated privileges
+/// constrained by guardrails", which matches the Admin role's mid-tier
+/// authority better than a settings/gear glyph would.
+fn user_shield_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M3 21v-2a4 4 0 0 1 4-4h6" {}
+            circle cx="10" cy="7" r="4" {}
+            path d="M19 11l3 1v3c0 2-3 4-3 4s-3-2-3-4v-3l3-1z" {}
+        }
+    }
+}
+
+/// 22px crown — "Owner" segment in the change-role picker, plus the
+/// feature icon on the Owner-promotion confirmation modal.
+fn crown_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M3 7l4 5 5-7 5 7 4-5v11H3z" {}
+            path d="M3 21h18" {}
+        }
     }
 }
 
@@ -817,24 +984,41 @@ fn close_icon() -> Markup {
     }
 }
 
-/// 3-option segmented control for selecting the invite role. Rendered
-/// only when the viewer is an Owner (Admins use a hidden input). The
-/// hidden radio inputs let the form serialize naturally without JS.
-fn role_segmented_control(selected: InstanceRole, id_prefix: &str) -> Markup {
-    let options = [
-        ("member", "Member", InstanceRole::Member),
-        ("admin", "Admin", InstanceRole::Admin),
-        ("owner", "Owner", InstanceRole::Owner),
-    ];
+/// 16px circle-with-exclamation icon used as the leading glyph on
+/// `.dialog-alert` strips. Sized smaller than the dialog feature
+/// icons because it sits inline with body copy, not as a focal
+/// element. Stroke uses `currentColor` so it picks up the alert's
+/// red tint automatically.
+fn alert_circle_icon() -> Markup {
     html! {
-        div class="segmented-control" role="radiogroup" aria-label="Role" {
-            @for (value, label, role) in options {
-                @let id = format!("invite-role-{id_prefix}-{value}");
-                input type="radio" name="role" id=(id)
-                      class="segment-input" value=(value)
-                      checked[selected == role];
-                label class="segment" for=(id) { (label) }
-            }
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            class="dialog-alert-icon" aria-hidden="true" {
+            circle cx="12" cy="12" r="10" {}
+            line x1="12" y1="8" x2="12" y2="13" {}
+            line x1="12" y1="16.5" x2="12" y2="16.5" {}
+        }
+    }
+}
+
+/// 22px trash-can icon used as the centered feature icon on the
+/// Delete and Purge modals. Stroke uses `currentColor` so the icon
+/// inherits the `.dialog-icon-danger` red tint without needing a
+/// dedicated fill rule.
+fn trash_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            polyline points="3 6 5 6 21 6" {}
+            path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" {}
+            path d="M10 11v6" {}
+            path d="M14 11v6" {}
+            path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" {}
         }
     }
 }
@@ -876,7 +1060,6 @@ pub fn members_invite_result_page(
             }
             div class="invite-form-actions" {
                 a class="btn-secondary" href="/members" { "Done" }
-                a class="btn-primary-link" href="/members/invite" { "Invite another" }
             }
         }
         // Tiny clipboard wiring — `navigator.clipboard.writeText` is on
@@ -1006,12 +1189,24 @@ pub fn members_page(
         // standalone form page uses; the result page still renders
         // full-screen so the one-time URL gets full attention.
         (invite_modal(ctx))
+        // Reauth gate. Destructive action dialogs (delete / purge /
+        // role / deactivate) close themselves and open this modal
+        // instead of submitting directly — `REAUTH_CHAIN_JS` copies
+        // their form payload into the modal's hidden inputs and sets
+        // the modal's POST target to the original action URL.
+        (reauth_modal(ctx))
         // outside-click closes any open kebab. All vanilla JS, no
         // framework, no XHR.
         script {
             (maud::PreEscaped(MEMBERS_SEARCH_JS))
             (maud::PreEscaped(MEMBERS_SELECT_ALL_JS))
             (maud::PreEscaped(MEMBERS_KEBAB_OUTSIDE_CLICK_JS))
+            (maud::PreEscaped(REAUTH_CHAIN_JS))
+            (maud::PreEscaped(CONFIRM_NAME_JS))
+            (maud::PreEscaped(ROLE_PICKER_GATE_JS))
+            (maud::PreEscaped(CONFIRM_CHECKBOX_JS))
+            (maud::PreEscaped(INVITE_SWAP_TO_INVITE_JS))
+            (maud::PreEscaped(INVITE_REFRESH_ON_CLOSE_JS))
         }
     };
     shell_app_wide(ctx, "Members", PageId::Members, content)
@@ -1331,6 +1526,230 @@ const MEMBERS_KEBAB_OUTSIDE_CLICK_JS: &str = r#"
 })();
 "#;
 
+// Type-display-name gate. Destructive dialogs (Delete / Purge) render
+// a `data-confirm-name="<expected>"` text input + a sibling
+// `data-reauth-confirm` button that ships disabled. On every keystroke
+// we compare the input to the expected name and toggle the button.
+// Pure UX guard against accidental clicks; the real security is the
+// password reauth in the next step.
+// Invite chain post-reauth handoff. The reauth modal's POST returns
+// content targeted at #invite-modal-content (via HX-Retarget) and
+// fires `switch-to-invite-modal`. We close the reauth dialog and open
+// the invite dialog so the swapped-in content (success or
+// validation-error form) is what's visible.
+const INVITE_SWAP_TO_INVITE_JS: &str = r#"
+(function() {
+    document.body.addEventListener('switch-to-invite-modal', function() {
+        var reauth = document.getElementById('dlg-reauth');
+        var invite = document.getElementById('dlg-invite');
+        if (reauth && reauth.open) reauth.close();
+        if (invite && !invite.open) invite.showModal();
+    });
+})();
+"#;
+
+// When an invite is created the new pending row needs to appear in the
+// table. We can't reload immediately (the modal still shows the
+// one-time URL the operator must copy), so:
+//   1. The server fires `invite-success` via HX-Trigger after the
+//      successful POST.
+//   2. We flip a flag when that event reaches the body.
+//   3. When the invite dialog is then closed by the operator (Close
+//      button → data-close-dialog → dialog.close() → 'close' event),
+//      we reload the page so the new pending invite is visible.
+const INVITE_REFRESH_ON_CLOSE_JS: &str = r#"
+(function() {
+    var needsRefresh = false;
+    document.body.addEventListener('invite-success', function() {
+        needsRefresh = true;
+    });
+    var dlg = document.getElementById('dlg-invite');
+    if (dlg) {
+        dlg.addEventListener('close', function() {
+            if (needsRefresh) {
+                window.location.reload();
+            }
+        });
+    }
+})();
+"#;
+
+const CONFIRM_NAME_JS: &str = r#"
+(function() {
+    document.addEventListener('input', function(e) {
+        var input = e.target.closest('[data-confirm-name]');
+        if (!input) return;
+        var dialog = input.closest('dialog');
+        if (!dialog) return;
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (!btn) return;
+        btn.disabled = (input.value !== input.getAttribute('data-confirm-name'));
+    });
+    // Reset the input + re-disable the button whenever the dialog
+    // closes, so reopening always starts from scratch.
+    document.addEventListener('close', function(e) {
+        var dialog = e.target;
+        if (!(dialog instanceof HTMLDialogElement)) return;
+        var input = dialog.querySelector('[data-confirm-name]');
+        if (input) input.value = '';
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (btn && input) btn.disabled = true;
+    }, true);
+})();
+"#;
+
+// Change-role dialog: the Modify Role button starts disabled. It
+// enables when the operator picks any non-disabled role radio. On
+// dialog close, reset to the initial state (no radio picked, button
+// disabled) so reopening always starts fresh.
+const ROLE_PICKER_GATE_JS: &str = r#"
+(function() {
+    document.addEventListener('change', function(e) {
+        var radio = e.target;
+        if (!(radio instanceof HTMLInputElement)) return;
+        if (radio.name !== 'role' || !radio.classList.contains('role-icon-input')) return;
+        var dialog = radio.closest('dialog');
+        if (!dialog) return;
+        var btn = dialog.querySelector('[data-role-aware][data-reauth-confirm]');
+        if (btn) btn.disabled = false;
+    });
+    document.addEventListener('close', function(e) {
+        var dialog = e.target;
+        if (!(dialog instanceof HTMLDialogElement)) return;
+        // The owner-confirm intercept closes the role dialog before
+        // opening the owner-confirm modal — but Make Owner then needs
+        // to read the still-checked 'owner' radio back off form-role-id
+        // when it fires the reauth chain. If we reset on every close
+        // we wipe that selection mid-chain, the chain stages no role,
+        // and the Verify POST is missing required form data (which
+        // surfaces as "Verify did nothing"). REAUTH_CHAIN_JS sets a
+        // `chainTransition` flag on the dialog before closing it as
+        // part of the intercept; honour that flag here.
+        if (dialog.dataset.chainTransition === '1') {
+            dialog.dataset.chainTransition = '';
+            return;
+        }
+        var radios = dialog.querySelectorAll('input.role-icon-input:not(:disabled)');
+        radios.forEach(function(r) { r.checked = false; });
+        var btn = dialog.querySelector('[data-role-aware][data-reauth-confirm]');
+        if (btn) btn.disabled = true;
+    }, true);
+})();
+"#;
+
+// Owner-confirmation dialog: the Make Owner button enables only when
+// the "I understand…" checkbox is ticked. Reset on close.
+const CONFIRM_CHECKBOX_JS: &str = r#"
+(function() {
+    document.addEventListener('change', function(e) {
+        var cb = e.target.closest('[data-confirm-checkbox]');
+        if (!cb) return;
+        var dialog = cb.closest('dialog');
+        if (!dialog) return;
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (btn) btn.disabled = !cb.checked;
+    });
+    document.addEventListener('close', function(e) {
+        var dialog = e.target;
+        if (!(dialog instanceof HTMLDialogElement)) return;
+        var cb = dialog.querySelector('[data-confirm-checkbox]');
+        if (cb) cb.checked = false;
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (cb && btn) btn.disabled = true;
+    }, true);
+})();
+"#;
+
+// Chains action dialog → reauth modal. Any button with
+// `data-reauth-confirm="<form-id>"` does:
+//   1. Read the named form's action URL + payload (skipping the form's
+//      own csrf_token + any password field).
+//   2. Copy the payload into the reauth modal's form as hidden inputs
+//      (clearing any previously-staged inputs from a prior chain).
+//   3. Point the reauth form's `action` + `hx-post` at the same URL.
+//   4. Close the source dialog, open `#dlg-reauth`, focus the password
+//      input. HTMX takes over on submit.
+const REAUTH_CHAIN_JS: &str = r#"
+(function() {
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-reauth-confirm]');
+        if (!btn) return;
+        e.preventDefault();
+        var sourceForm = document.getElementById(btn.getAttribute('data-reauth-confirm'));
+        var reauthDialog = document.getElementById('dlg-reauth');
+        var reauthContent = document.getElementById('reauth-modal-content');
+        var reauthForm = reauthContent ? reauthContent.querySelector('form') : null;
+        if (!sourceForm || !reauthDialog || !reauthForm) return;
+
+        // Role-aware intercept — if the source form has a role input
+        // and "owner" is selected, route through the owner-confirm
+        // dialog instead of straight to reauth.
+        if (btn.hasAttribute('data-role-aware')) {
+            var roleInput = sourceForm.querySelector('input[name="role"]:checked');
+            if (roleInput && roleInput.value === 'owner') {
+                var targetId = btn.getAttribute('data-target-id');
+                var ownerConfirm = document.getElementById('dlg-role-owner-confirm-' + targetId);
+                if (ownerConfirm) {
+                    var srcDialog = btn.closest('dialog');
+                    if (srcDialog && typeof srcDialog.close === 'function') {
+                        // Tell ROLE_PICKER_GATE_JS that this close is
+                        // part of a chain transition (role → owner-
+                        // confirm → reauth). Without this hint the
+                        // close handler unchecks the role radios, and
+                        // when Make Owner re-fires this chain it sees
+                        // no role selected → stages no role payload →
+                        // Verify POSTs missing data and HTMX silently
+                        // swaps a 422 body into the modal.
+                        srcDialog.dataset.chainTransition = '1';
+                        srcDialog.close();
+                    }
+                    ownerConfirm.showModal();
+                    return;
+                }
+            }
+        }
+
+        // Repoint the reauth form at the action URL.
+        reauthForm.setAttribute('action', sourceForm.getAttribute('action') || '');
+        reauthForm.setAttribute('hx-post', sourceForm.getAttribute('action') || '');
+        // Tell HTMX to re-scan the form so the new hx-post takes effect.
+        if (window.htmx && typeof window.htmx.process === 'function') {
+            window.htmx.process(reauthForm);
+        }
+
+        // Drop any previously-staged inputs from an earlier chain.
+        reauthForm.querySelectorAll('input[data-reauth-staged]').forEach(function(el) {
+            el.remove();
+        });
+        // Copy the source form's payload into the reauth form.
+        new FormData(sourceForm).forEach(function(value, key) {
+            if (key === 'csrf_token' || key === 'password') return;
+            var input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = key;
+            input.value = value;
+            input.setAttribute('data-reauth-staged', '');
+            reauthForm.appendChild(input);
+        });
+
+        // Clear the password input from any prior open.
+        var pwInput = reauthForm.querySelector('input[name="password"]');
+        if (pwInput) pwInput.value = '';
+
+        // Close the source dialog (the action setup is now staged),
+        // open the reauth modal, focus the password input.
+        var sourceDialog = btn.closest('dialog');
+        if (sourceDialog && typeof sourceDialog.close === 'function') {
+            sourceDialog.close();
+        }
+        if (typeof reauthDialog.showModal === 'function') {
+            reauthDialog.showModal();
+        }
+        if (pwInput) pwInput.focus();
+    });
+})();
+"#;
+
 /// Filter dropdown rendered in the Members toolbar. Items round-trip
 /// the current `sort` state in their href so flipping the filter
 /// doesn't reset whichever column the operator was sorting by.
@@ -1542,15 +1961,49 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
                         span aria-hidden="true" { "⋮" }
                     }
                     div class="row-actions-menu" {
-                        form method="post"
-                             action=(format!("/members/invitations/{id}/revoke"))
-                             class="row-action-form" {
-                            (csrf_input(csrf_token))
-                            button type="submit"
-                                   class="row-action-item row-action-danger" {
-                                "Revoke invite"
-                            }
+                        // Same dialog-chain pattern as the member-row
+                        // actions: kebab opens a confirmation, which
+                        // chains into the reauth modal. The backend
+                        // enforces re-auth too (LifecycleActionForm
+                        // requires `password`), so even a forged
+                        // direct POST won't bypass the gate.
+                        button type="button"
+                               class="row-action-item row-action-danger"
+                               data-open-dialog=(format!("dlg-revoke-invite-{id}")) {
+                            "Revoke invite…"
                         }
+                    }
+                }
+                (revoke_invite_dialog(id, &invitation.email, csrf_token))
+            }
+        }
+    }
+}
+
+/// Confirmation dialog for the Revoke invite row action on pending
+/// invitations. Mirrors the Deactivate dialog's shape (h2 + short
+/// explanation + Cancel/Continue) and chains into the shared reauth
+/// modal so the operator must re-enter their password before the
+/// revoke commits.
+fn revoke_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
+    html! {
+        dialog id=(format!("dlg-revoke-invite-{id}")) class="action-dialog" {
+            form id=(format!("form-revoke-invite-{id}"))
+                 method="post"
+                 action=(format!("/members/invitations/{id}/revoke")) {
+                h2 { "Revoke invitation?" }
+                p class="dialog-description" {
+                    "The pending invitation for " strong { (email) } " will "
+                    "stop working. They won't be able to use the acceptance "
+                    "link they received. You can send a new invitation any "
+                    "time."
+                }
+                (csrf_input(csrf_token))
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn-danger"
+                           data-reauth-confirm=(format!("form-revoke-invite-{id}")) {
+                        "Revoke invite"
                     }
                 }
             }
@@ -1676,11 +2129,14 @@ fn row_actions_kebab(
     }
 }
 
-fn action_uses_dialog(action: RowAction) -> bool {
-    matches!(
-        action,
-        RowAction::ChangeRole | RowAction::Delete | RowAction::Purge
-    )
+/// Every row action now opens a confirmation dialog first — there are
+/// no submit-direct items in the kebab anymore. Deactivate +
+/// Reactivate are the recently-added ones; the destructive trio
+/// (Delete / Purge / ChangeRole) already had dialogs. The dialog's
+/// Confirm/Continue button then chains into the reauth modal for
+/// actions that require it (everything but Reactivate).
+fn action_uses_dialog(_action: RowAction) -> bool {
+    true
 }
 
 fn render_action_item(
@@ -1693,17 +2149,18 @@ fn render_action_item(
         return render_locked_item(action);
     }
     let id = target.id.0;
+    let _ = csrf_token; // dialogs render the csrf input themselves
     match action {
         RowAction::Deactivate => html! {
-            form method="post" action=(format!("/members/{id}/deactivate")) class="row-action-form" {
-                (csrf_input(csrf_token))
-                button type="submit" class="row-action-item" { "Deactivate" }
+            button type="button" class="row-action-item"
+                   data-open-dialog=(format!("dlg-deactivate-{id}")) {
+                "Deactivate…"
             }
         },
         RowAction::Reactivate => html! {
-            form method="post" action=(format!("/members/{id}/reactivate")) class="row-action-form" {
-                (csrf_input(csrf_token))
-                button type="submit" class="row-action-item" { "Reactivate" }
+            button type="button" class="row-action-item"
+                   data-open-dialog=(format!("dlg-reactivate-{id}")) {
+                "Reactivate…"
             }
         },
         RowAction::ChangeRole => html! {
@@ -1756,6 +2213,133 @@ fn render_locked_item(action: RowAction) -> Markup {
     }
 }
 
+/// 3-up segmented role picker for the change-role dialog. Each segment
+/// stacks an icon over its label; the active segment fills with the
+/// primary tint. The segment matching the target's current role is
+/// rendered `disabled` (greyed) — picking the same role is a no-op
+/// the API would refuse anyway, so we just remove the dead-end choice.
+/// Nothing is pre-checked so the operator must explicitly pick one of
+/// the two remaining roles before the Modify Role button enables.
+fn role_icon_picker(id: uuid::Uuid, current: InstanceRole) -> Markup {
+    let options = [
+        ("member", "Member", InstanceRole::Member),
+        ("admin", "Admin", InstanceRole::Admin),
+        ("owner", "Owner", InstanceRole::Owner),
+    ];
+    html! {
+        div class="role-icon-picker" role="radiogroup" aria-label="New role" {
+            @for (value, label, role) in options {
+                @let input_id = format!("role-{id}-{value}");
+                @let is_current = current == role;
+                input type="radio" name="role" id=(input_id)
+                      class="role-icon-input" value=(value)
+                      disabled[is_current];
+                label class="role-icon-segment" for=(input_id)
+                      title=[is_current.then_some("This member is already in this role")] {
+                    span class="role-icon-glyph" aria-hidden="true" {
+                        @match role {
+                            InstanceRole::Member => (user_icon()),
+                            InstanceRole::Admin => (user_shield_icon()),
+                            InstanceRole::Owner => (crown_icon()),
+                        }
+                    }
+                    span class="role-icon-label" {
+                        (label)
+                        @if is_current {
+                            span class="role-icon-current-tag" { "current" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Owner-promotion confirmation modal. Sits as a sibling of the
+/// change-role dialog and opens when the operator picks "Owner" in
+/// the picker and clicks Modify Role. The Make Owner button here
+/// chains directly to the reauth modal — Member/Admin paths skip
+/// this step. Uses the centered-icon dialog chrome so the warning
+/// icon reads as the focal point.
+///
+/// The Make Owner button stays disabled until the operator ticks
+/// the "I understand…" checkbox (wired by CONFIRM_CHECKBOX_JS) — a
+/// second deliberate confirmation step on top of the password
+/// re-auth that follows.
+fn role_owner_confirm_dialog(id: uuid::Uuid, name: &str) -> Markup {
+    html! {
+        dialog id=(format!("dlg-role-owner-confirm-{id}"))
+               class="action-dialog action-dialog-centered" {
+            div class="dialog-header" {
+                div class="dialog-icon dialog-icon-warning" {
+                    (crown_icon())
+                }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" {
+                    (close_icon())
+                }
+            }
+            h2 { "Make " (name) " an Owner?" }
+            p class="dialog-description" {
+                "Owners have full control of this Hearth: they can change "
+                "any member's role, deactivate or delete accounts, read the "
+                "audit log, and rotate the server-level recovery code. "
+                "Promoting someone to Owner means sharing your authority "
+                "with them. They'll be able to deactivate or remove you."
+            }
+            label class="confirm-checkbox-field" {
+                input type="checkbox" class="member-checkbox"
+                      data-confirm-checkbox;
+                span {
+                    "I understand the impact of making " strong { (name) }
+                    " an Owner of this Hearth instance."
+                }
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog {
+                    "Cancel"
+                }
+                // Chains to the reauth modal. The original change-role
+                // form was already staged (csrf + role) when
+                // REAUTH_CHAIN_JS opened this owner-confirm intercept;
+                // clicking Make Owner here re-fires the chain without
+                // the role-aware intercept so it proceeds to reauth.
+                button type="button" class="btn"
+                       data-reauth-confirm=(format!("form-role-{id}"))
+                       disabled {
+                    "Make Owner"
+                }
+            }
+        }
+    }
+}
+
+/// Confirmation field for destructive actions — requires the operator
+/// to type the target's display name verbatim before the Continue
+/// button (sibling, with `[data-reauth-confirm]`) enables. Pure UX
+/// guard; the real security is the password reauth that follows.
+/// Input deliberately has no `name=` so it doesn't get submitted.
+///
+/// The name is wrapped in literal double-quote characters (GitHub
+/// repo-deletion style) so the operator sees exactly the string they
+/// need to type, including any surrounding whitespace or punctuation
+/// in the display name. The quotes themselves are not part of the
+/// expected typed value — `data-confirm-name` still holds the raw
+/// name, and CONFIRM_NAME_JS compares against that.
+fn confirm_name_field(id: uuid::Uuid, name: &str, verb: &str) -> Markup {
+    let input_id = format!("confirm-name-{verb}-{id}");
+    html! {
+        div class="field confirm-name-field" {
+            label for=(input_id) {
+                "Type " strong { "\"" (name) "\"" } " to confirm"
+            }
+            input type="text" id=(input_id)
+                  data-confirm-name=(name)
+                  autocomplete="off" spellcheck="false";
+        }
+    }
+}
+
 /// Small inline lock SVG, sized to ~14px square. Uses `currentColor`
 /// so it inherits the item's text color (and the locked opacity).
 fn lock_icon() -> Markup {
@@ -1789,74 +2373,185 @@ fn plus_icon() -> Markup {
 fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: uuid::Uuid) -> Markup {
     let name = &target.display_name;
     match action {
-        RowAction::ChangeRole => html! {
-            dialog id=(format!("dlg-role-{id}")) class="action-dialog" {
-                form method="post" action=(format!("/members/{id}/role")) {
-                    h2 { "Change role for " (name) }
-                    p class="dialog-note" {
-                        "If the target is an Owner, a 72-hour veto window "
-                        "begins instead of applying immediately."
+        RowAction::Deactivate => html! {
+            dialog id=(format!("dlg-deactivate-{id}")) class="action-dialog" {
+                form id=(format!("form-deactivate-{id}"))
+                     method="post" action=(format!("/members/{id}/deactivate")) {
+                    h2 { "Deactivate " (name) "?" }
+                    p class="dialog-description" {
+                        "Revokes all of " (name) "'s active sessions. Their "
+                        "credentials stay in place so reactivation later "
+                        "doesn't need a password reset."
                     }
-                    label class="field" {
-                        span { "New role" }
-                        select name="role" required {
-                            @let current = target.instance_role;
-                            option value="member" selected[current == InstanceRole::Member] { "Member" }
-                            option value="admin"  selected[current == InstanceRole::Admin]  { "Admin" }
-                            option value="owner"  selected[current == InstanceRole::Owner]  { "Owner" }
+                    p class="dialog-note" {
+                        "If the target is an Owner, a 72-hour veto window begins "
+                        "instead of applying immediately."
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="button" class="btn"
+                               data-reauth-confirm=(format!("form-deactivate-{id}")) {
+                            "Continue"
                         }
                     }
+                }
+            }
+        },
+        // Reactivate now flows through the reauth chain too — folded
+        // into the same gate as the destructive trio so any change to
+        // a member's lifecycle requires the operator's password.
+        RowAction::Reactivate => html! {
+            dialog id=(format!("dlg-reactivate-{id}")) class="action-dialog" {
+                form id=(format!("form-reactivate-{id}"))
+                     method="post" action=(format!("/members/{id}/reactivate")) {
+                    h2 { "Reactivate " (name) "?" }
+                    p class="dialog-description" {
+                        "Re-enables sign-in for " (name) ". Their existing "
+                        "password still works. They'll need to sign in again "
+                        "(any prior sessions were revoked at deactivation)."
+                    }
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
-                        button type="submit" class="btn" { "Apply" }
+                        button type="button" class="btn"
+                               data-reauth-confirm=(format!("form-reactivate-{id}")) {
+                            "Continue"
+                        }
                     }
                 }
             }
         },
+        RowAction::ChangeRole => html! {
+            dialog id=(format!("dlg-role-{id}")) class="action-dialog action-dialog-centered" {
+                form id=(format!("form-role-{id}"))
+                     method="post" action=(format!("/members/{id}/role")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-shield" {
+                            (user_shield_icon())
+                        }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" {
+                            (close_icon())
+                        }
+                    }
+                    h2 { "Change role for " (name) }
+                    p class="dialog-description" {
+                        "Roles control what someone can do across this "
+                        "Hearth instance, like inviting members, "
+                        "deactivating accounts, and configuring server "
+                        "settings. App-level permissions (Tasks lists, "
+                        "notes, etc.) are managed separately."
+                    }
+                    (role_icon_picker(id, target.instance_role))
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        // `data-role-aware` tells REAUTH_CHAIN_JS to peek at
+                        // the form's role selection: if "owner", route to
+                        // the owner-confirmation dialog first instead of
+                        // chaining straight to reauth. The button starts
+                        // disabled and only enables once the operator
+                        // picks a role that isn't the current one.
+                        button type="button" class="btn"
+                               data-reauth-confirm=(format!("form-role-{id}"))
+                               data-role-aware="true"
+                               data-target-id=(id)
+                               data-role-form=(format!("form-role-{id}"))
+                               disabled {
+                            "Modify Role"
+                        }
+                    }
+                }
+            }
+            (role_owner_confirm_dialog(id, name))
+        },
+        // Delete = anonymize. Account row stays so any non-orphaned
+        // content (comments on shared docs, shared list ownership, etc.)
+        // keeps its byline; just the person's identity is scrubbed.
+        // Uses the centered-chrome variant + danger-red feature icon so
+        // the destructive nature is immediately visible.
         RowAction::Delete => html! {
-            dialog id=(format!("dlg-delete-{id}")) class="action-dialog" {
-                form method="post" action=(format!("/members/{id}/delete")) {
+            dialog id=(format!("dlg-delete-{id}"))
+                   class="action-dialog action-dialog-centered" {
+                form id=(format!("form-delete-{id}"))
+                     method="post" action=(format!("/members/{id}/delete")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-danger" {
+                            (trash_icon())
+                        }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" {
+                            (close_icon())
+                        }
+                    }
                     h2 { "Delete " (name) "?" }
-                    p {
-                        "Revokes all sessions, removes their credentials, and "
-                        "redacts their email. The account row is preserved so "
-                        "their authored content keeps its byline."
+                    p class="dialog-description" {
+                        "This anonymizes the account. Sign-in is revoked, "
+                        "credentials are removed, and the email is redacted. "
+                        "Any content " (name) " created that other members "
+                        "still rely on stays in place, attributed to the "
+                        "anonymized account."
                     }
-                    p class="dialog-note" {
-                        "If the target is an Owner, a 72-hour veto window begins "
-                        "instead of applying immediately."
+                    div class="dialog-alert dialog-alert-danger" role="alert" {
+                        (alert_circle_icon())
+                        span { "This action is permanent and cannot be undone." }
                     }
+                    (confirm_name_field(id, name, "delete"))
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
-                        button type="submit" class="btn-danger" { "Delete" }
+                        button type="button" class="btn-danger"
+                               data-reauth-confirm=(format!("form-delete-{id}"))
+                               disabled {
+                            "Delete"
+                        }
                     }
                 }
             }
         },
+        // Purge = total removal. The account and every piece of content
+        // it created is dropped, even if other members were collaborating
+        // on that content. Heavier hammer than Delete; same chrome so
+        // the two read as a pair, same alert because both are terminal.
         RowAction::Purge => html! {
-            dialog id=(format!("dlg-purge-{id}")) class="action-dialog" {
-                form method="post" action=(format!("/members/{id}/purge")) {
+            dialog id=(format!("dlg-purge-{id}"))
+                   class="action-dialog action-dialog-centered" {
+                form id=(format!("form-purge-{id}"))
+                     method="post" action=(format!("/members/{id}/purge")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-danger" {
+                            (trash_icon())
+                        }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" {
+                            (close_icon())
+                        }
+                    }
                     h2 { "Purge " (name) "?" }
-                    p {
-                        "Same row-level effect as delete today; once the apps "
-                        "platform lands, this also drops every piece of their "
-                        "content regardless of collaborators."
+                    p class="dialog-description" {
+                        "This fully removes the account and every piece of "
+                        "content " (name) " created, regardless of whether "
+                        "other members were collaborating on it. Use Delete "
+                        "instead if you only want to anonymize the account."
                     }
-                    p class="dialog-note" {
-                        "If the target is an Owner, a 72-hour veto window begins "
-                        "instead of applying immediately."
+                    div class="dialog-alert dialog-alert-danger" role="alert" {
+                        (alert_circle_icon())
+                        span { "This action is permanent and cannot be undone." }
                     }
+                    (confirm_name_field(id, name, "purge"))
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
-                        button type="submit" class="btn-danger" { "Purge" }
+                        button type="button" class="btn-danger"
+                               data-reauth-confirm=(format!("form-purge-{id}"))
+                               disabled {
+                            "Purge"
+                        }
                     }
                 }
             }
         },
-        _ => html! {},
     }
 }
 
@@ -1887,6 +2582,7 @@ fn action_banner(action: &str, target: Option<&str>) -> Markup {
         "pending_purge" => "A 72-hour veto window has begun for the requested purge.".to_string(),
         "pending_role_change" => "A 72-hour veto window has begun for the requested role change.".to_string(),
         "invite_revoked" => "The invitation was revoked.".to_string(),
+        "vetoed" => "The pending action was vetoed.".to_string(),
         _ => return html! {},
     };
     html! {
@@ -1907,6 +2603,7 @@ fn error_banner(error: &str) -> Markup {
         "pending_action_exists" => "An action is already pending against that member.",
         "forbidden" => "Only Owners can change roles.",
         "invalid_recovery_code" => "Invalid recovery code.",
+        "invalid_password" => "Incorrect password. Please try again.",
         // Invite-form errors. These re-render the form with the input
         // preserved (see members_invite_form_page).
         "email_required" => "Enter an email address.",
@@ -1917,10 +2614,261 @@ fn error_banner(error: &str) -> Markup {
         // with these codes when the underlying call refuses.
         "invite_not_found" => "That invitation no longer exists.",
         "invite_already_accepted" => "That invitation was already accepted.",
+        // /pending veto errors.
+        "transition_not_found" => "That pending action no longer exists.",
+        "not_pending" => {
+            "That action is no longer pending — another Owner may have just resolved it."
+        }
         _ => "Something went wrong.",
     };
     html! {
         div class="banner banner-error" role="alert" { (msg) }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /pending — Owners-only veto review queue
+// ────────────────────────────────────────────────────────────────────────
+
+/// URL-driven banner state for the /pending page. Set by the veto
+/// handler's redirect after the action (vetoed / error). Pattern
+/// mirrors `MembersBanner`.
+#[derive(Default)]
+pub struct PendingBanner<'a> {
+    pub action: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+fn render_pending_banner(banner: &PendingBanner<'_>) -> Markup {
+    if let Some(error_code) = banner.error {
+        return error_banner(error_code);
+    }
+    if let Some(action) = banner.action {
+        return action_banner(action, None);
+    }
+    html! {}
+}
+
+
+/// `GET /pending` — Owners-only directory of the currently-pending
+/// Owner-on-Owner transitions. Each row shows who's being targeted,
+/// what the action is, who started it, and how much of the 72-hour
+/// window remains. The Veto button opens a confirmation dialog whose
+/// Continue chains into the shared reauth modal.
+///
+/// Query params recognised by this page:
+/// * `action=vetoed` — success banner after a successful veto.
+/// * `error=transition_not_found` / `error=not_pending` — failure
+///   banners after a race with another Owner / the 72h sweeper.
+pub fn pending_page(
+    ctx: &ChromeContext,
+    rows: &[pending::TransitionRow],
+    users: &[identity::User],
+    banner: PendingBanner<'_>,
+) -> Markup {
+    use std::collections::HashMap;
+    let by_id: HashMap<uuid::Uuid, &identity::User> =
+        users.iter().map(|u| (u.id.0, u)).collect();
+
+    let content = html! {
+        (render_pending_banner(&banner))
+        // Reauth modal lives at the page level so every per-row Veto
+        // dialog can chain into the same #dlg-reauth. Mirrors the
+        // structure used by the /members page.
+        (reauth_modal(ctx))
+
+        @if rows.is_empty() {
+            (pending_empty_state())
+        } @else {
+            div class="card pending-card" {
+                table class="users-table pending-table" {
+                    thead {
+                        tr {
+                            th class="col-pending-target" { "Target" }
+                            th class="col-pending-action" { "Action" }
+                            th class="col-pending-initiator" { "Initiated by" }
+                            th class="col-pending-remaining" { "Time remaining" }
+                            th class="col-pending-actions" { span class="sr-only" { "Actions" } }
+                        }
+                    }
+                    tbody {
+                        @for row in rows {
+                            (pending_row(ctx, row, &by_id))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wire up the dialog open/close + reauth chain JS used by the
+        // per-row Veto buttons. Same constants the Members page uses.
+        script { (maud::PreEscaped(REAUTH_CHAIN_JS)) }
+    };
+
+    shell_app_wide(ctx, "Pending review", PageId::Pending, content)
+}
+
+/// Empty state for the /pending page — no active pending transitions.
+/// Shown both when the queue starts empty and after the operator
+/// vetoes the last item.
+fn pending_empty_state() -> Markup {
+    html! {
+        div class="card pending-empty" {
+            div class="dialog-icon dialog-icon-shield pending-empty-icon" {
+                (shield_icon())
+            }
+            h2 { "Nothing pending" }
+            p {
+                "Owner-on-Owner deactivations, deletes, purges, and role "
+                "changes wait here for 72 hours so any Owner can veto. "
+                "When something gets queued, it shows up on this page."
+            }
+        }
+    }
+}
+
+/// One row of the /pending table. Renders the target and initiator
+/// using the standard avatar + name treatment, the action verb (e.g.
+/// "Promote to Owner", "Delete"), a time-remaining pill, and a Veto
+/// button that opens a per-row confirmation dialog.
+fn pending_row(
+    ctx: &ChromeContext,
+    row: &pending::TransitionRow,
+    by_id: &std::collections::HashMap<uuid::Uuid, &identity::User>,
+) -> Markup {
+    let target = row.target_user_id.and_then(|id| by_id.get(&id).copied());
+    let initiator = row.initiator_user_id.and_then(|id| by_id.get(&id).copied());
+    let target_name = target
+        .map(|u| u.display_name.as_str())
+        .unwrap_or("(unknown member)");
+    let action_label = pending_action_label(row);
+
+    html! {
+        tr class="pending-row" {
+            td class="col-pending-target" {
+                @if let Some(u) = target {
+                    div class="user-row-id" {
+                        span class="avatar-wrapper" {
+                            span class="avatar avatar-sm"
+                                 style=(format!("background:{}", avatar_color(&u.id.0))) {
+                                (display_initial(&u.display_name))
+                            }
+                        }
+                        div class="user-row-text" {
+                            span class="user-name" { (u.display_name) }
+                            span class="user-email" { (u.email) }
+                        }
+                    }
+                } @else {
+                    span class="muted-dash" { "(unknown member)" }
+                }
+            }
+            td class="col-pending-action" { (action_label) }
+            td class="col-pending-initiator" {
+                @if let Some(u) = initiator {
+                    span class="user-name" { (u.display_name) }
+                } @else {
+                    span class="muted-dash" { "—" }
+                }
+            }
+            td class="col-pending-remaining" {
+                (time_remaining_pill(row.effective_at))
+            }
+            td class="col-pending-actions" {
+                button type="button" class="btn-secondary"
+                       data-open-dialog=(format!("dlg-veto-{}", row.id)) {
+                    "Veto"
+                }
+                (veto_pending_dialog(row.id, target_name, &action_label, ctx.csrf_token))
+            }
+        }
+    }
+}
+
+/// Per-row Veto confirmation dialog. Centered chrome with a warning
+/// (amber) feature icon; chains into the shared reauth modal via the
+/// standard `data-reauth-confirm` attribute.
+fn veto_pending_dialog(
+    transition_id: uuid::Uuid,
+    target_name: &str,
+    action_label: &str,
+    csrf_token: &str,
+) -> Markup {
+    html! {
+        dialog id=(format!("dlg-veto-{transition_id}"))
+               class="action-dialog action-dialog-centered" {
+            form id=(format!("form-veto-{transition_id}"))
+                 method="post"
+                 action=(format!("/pending/{transition_id}/veto")) {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-warning" {
+                        (shield_icon())
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 { "Veto this pending action?" }
+                p class="dialog-description" {
+                    "Stops the pending " strong { (action_label) } " on "
+                    strong { (target_name) } ". The initiator will be "
+                    "notified that you cancelled it. The action can be "
+                    "started again from the Members page."
+                }
+                (csrf_input(csrf_token))
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn"
+                           data-reauth-confirm=(format!("form-veto-{transition_id}")) {
+                        "Veto"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Human-readable verb for a pending transition. Lifecycle kinds
+/// render as the action name; role-change kinds render as
+/// "Promote to Owner", "Demote to Member", etc., based on the
+/// payload's target role.
+fn pending_action_label(row: &pending::TransitionRow) -> String {
+    use pending::TransitionKind;
+    match row.kind {
+        TransitionKind::Deactivate => "Deactivate".to_string(),
+        TransitionKind::SoftDelete => "Delete".to_string(),
+        TransitionKind::HardDelete => "Purge".to_string(),
+        TransitionKind::RoleChange => match row.role_payload() {
+            Ok(payload) => match payload.to_role {
+                InstanceRole::Owner => "Promote to Owner".to_string(),
+                InstanceRole::Admin => "Change to Admin".to_string(),
+                InstanceRole::Member => "Demote to Member".to_string(),
+            },
+            // Bad payload is logged at apply time; in the UI we just
+            // fall back to a generic label so the row still renders.
+            Err(_) => "Change role".to_string(),
+        },
+    }
+}
+
+/// Small pill rendering "47h left" / "8m left" / "Imminent". When the
+/// remaining duration is below 1 hour the pill switches to minutes;
+/// once `effective_at` has already passed (the sweeper hasn't run yet)
+/// it shows "Imminent" instead of a negative count.
+fn time_remaining_pill(effective_at: chrono::DateTime<chrono::Utc>) -> Markup {
+    let now = chrono::Utc::now();
+    let delta = effective_at - now;
+    let (text, class) = if delta.num_seconds() <= 0 {
+        ("Imminent".to_string(), "time-pill time-pill-urgent")
+    } else if delta.num_hours() >= 1 {
+        (format!("{}h left", delta.num_hours()), "time-pill")
+    } else {
+        let mins = delta.num_minutes().max(1);
+        (format!("{mins}m left"), "time-pill time-pill-urgent")
+    };
+    html! {
+        span class=(class) { (text) }
     }
 }
 

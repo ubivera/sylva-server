@@ -637,18 +637,37 @@ pub async fn list_pending_transitions(
 }
 
 /// `POST /admin/pending-transitions/{id}/veto` — any Owner can veto.
+/// Delegates to [`admin_logic::perform_veto_pending`] so the policy
+/// (Owner-only authz, audit, notification fanout) lives in one place
+/// and is shared with the web `/pending/{id}/veto` route.
 pub async fn veto_pending_transition(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if admin.0.user.instance_role != InstanceRole::Owner {
-        return err(StatusCode::FORBIDDEN, "forbidden").into_response();
+    match admin_logic::perform_veto_pending(&state, &admin, id).await {
+        Ok(row) => (StatusCode::OK, Json(PendingTransitionView::from(row))).into_response(),
+        Err(admin_logic::VetoError::NotOwner) => {
+            err(StatusCode::FORBIDDEN, "forbidden").into_response()
+        }
+        Err(admin_logic::VetoError::NotFound) => {
+            err(StatusCode::NOT_FOUND, "transition_not_found").into_response()
+        }
+        Err(admin_logic::VetoError::NotPending) => {
+            err(StatusCode::CONFLICT, "not_pending").into_response()
+        }
+        Err(admin_logic::VetoError::Internal(e)) => {
+            tracing::error!(?e, "vetoing pending transition");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
+        }
     }
-    resolve_pending(&state, &admin, id, ResolveKind::Veto).await
 }
 
 /// `POST /admin/pending-transitions/{id}/cancel` — initiator or any Owner.
+///
+/// Cancel keeps its inline authz here (Owner OR initiator) because the
+/// rule is route-specific; the shared [`admin_logic::resolve_pending_inner`]
+/// only enforces the row-state transition, leaving authz to the caller.
 pub async fn cancel_pending_transition(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -673,138 +692,23 @@ pub async fn cancel_pending_transition(
         return err(StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
-    resolve_pending(&state, &admin, id, ResolveKind::Cancel).await
-}
-
-#[derive(Clone, Copy)]
-enum ResolveKind {
-    Veto,
-    Cancel,
-}
-
-async fn resolve_pending(
-    state: &AppState,
-    admin: &AdminUser,
-    transition_id: Uuid,
-    kind: ResolveKind,
-) -> axum::response::Response {
-    let actor = admin.actor();
-    let by_user_id = admin.0.user.id;
-    let admin_display_name = admin.0.user.display_name.clone();
-
-    let result: anyhow::Result<pending::TransitionRow> = async {
-        let mut tx = state.db.begin().await?;
-        let row = match kind {
-            ResolveKind::Veto => pending::veto(&mut tx, transition_id, by_user_id).await?,
-            ResolveKind::Cancel => pending::cancel(&mut tx, transition_id, by_user_id).await?,
-        };
-
-        // Look up initiator + target display info for audit + notification.
-        let initiator_id = row
-            .initiator_user_id
-            .ok_or_else(|| anyhow::anyhow!("initiator_user_id is null"))?;
-        let target_id = row
-            .target_user_id
-            .ok_or_else(|| anyhow::anyhow!("target_user_id is null"))?;
-        let (initiator_email, initiator_display_name, target_display_name): (
-            String,
-            String,
-            String,
-        ) = sqlx::query_as(
-            "SELECT
-                (SELECT email FROM identity.users WHERE id = $1),
-                (SELECT display_name FROM identity.users WHERE id = $1),
-                (SELECT display_name FROM identity.users WHERE id = $2)",
-        )
-        .bind(initiator_id)
-        .bind(target_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        // Audit + notification details differ by kind. For role_change we
-        // include the to_role; for lifecycle kinds we include the action.
-        let is_lifecycle = pending::lifecycle_from_kind(row.kind).is_some();
-        let event_type = match (kind, is_lifecycle) {
-            (ResolveKind::Veto, false) => "pending_role_change_vetoed",
-            (ResolveKind::Cancel, false) => "pending_role_change_cancelled",
-            (ResolveKind::Veto, true) => "pending_lifecycle_vetoed",
-            (ResolveKind::Cancel, true) => "pending_lifecycle_cancelled",
-        };
-
-        let mut event_data = serde_json::json!({
-            "transition_id": transition_id,
-            "initiator_user_id": initiator_id,
-            "target_user_id": target_id,
-            "resolved_by": by_user_id.0,
-        });
-        if let Some(action) = pending::lifecycle_from_kind(row.kind) {
-            event_data["action"] = serde_json::to_value(action)?;
-        } else {
-            let payload = row.role_payload()?;
-            event_data["to_role"] = serde_json::to_value(payload.to_role)?;
-        }
-        audit::append(&mut tx, Some(&actor), None, event_type, event_data).await?;
-
-        // Notify the initiator on veto. (Skip notification for cancel —
-        // the initiator is usually the cancel-er themselves.)
-        if matches!(kind, ResolveKind::Veto) {
-            if let Some(action) = pending::lifecycle_from_kind(row.kind) {
-                notifications::enqueue(
-                    &mut tx,
-                    notifications::Notification::PendingLifecycleVetoed {
-                        recipient_email: initiator_email,
-                        initiator_display_name,
-                        target_display_name,
-                        vetoed_by_display_name: admin_display_name.clone(),
-                        action,
-                        transition_id,
-                    },
-                )
-                .await?;
-            } else {
-                let payload = row.role_payload()?;
-                let from_role: InstanceRole = sqlx::query_scalar(
-                    "SELECT instance_role FROM identity.users WHERE id = $1",
-                )
-                .bind(target_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                notifications::enqueue(
-                    &mut tx,
-                    notifications::Notification::PendingRoleChangeVetoed {
-                        recipient_email: initiator_email,
-                        initiator_display_name,
-                        target_display_name,
-                        vetoed_by_display_name: admin_display_name.clone(),
-                        from_role,
-                        to_role: payload.to_role,
-                        transition_id,
-                    },
-                )
-                .await?;
-            }
-        }
-
-        tx.commit().await?;
-        Ok(row)
-    }
-    .await;
-
-    match result {
+    match admin_logic::resolve_pending_inner(
+        &state,
+        &admin,
+        id,
+        admin_logic::ResolveKind::Cancel,
+    )
+    .await
+    {
         Ok(row) => (StatusCode::OK, Json(PendingTransitionView::from(row))).into_response(),
-        Err(e) => {
-            if let Some(pe) = e.downcast_ref::<pending::PendingError>() {
-                match pe {
-                    pending::PendingError::NotFound => {
-                        return err(StatusCode::NOT_FOUND, "transition_not_found").into_response();
-                    }
-                    pending::PendingError::NotPending => {
-                        return err(StatusCode::CONFLICT, "not_pending").into_response();
-                    }
-                    _ => {}
-                }
-            }
-            tracing::error!(?e, "resolving pending transition");
+        Err(admin_logic::ResolveError::NotFound) => {
+            err(StatusCode::NOT_FOUND, "transition_not_found").into_response()
+        }
+        Err(admin_logic::ResolveError::NotPending) => {
+            err(StatusCode::CONFLICT, "not_pending").into_response()
+        }
+        Err(admin_logic::ResolveError::Internal(e)) => {
+            tracing::error!(?e, "cancelling pending transition");
             err(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
         }
     }

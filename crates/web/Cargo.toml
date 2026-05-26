@@ -26,6 +26,7 @@ hearth = { path = "../hearth" }
 identity = { path = "../identity" }
 auth = { path = "../auth" }
 audit = { path = "../audit" }
+pending = { path = "../pending" }
 
 [lints]
 workspace = true
