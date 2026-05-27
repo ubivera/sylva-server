@@ -1986,6 +1986,15 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
                         // enforces re-auth too (LifecycleActionForm
                         // requires `password`), so even a forged
                         // direct POST won't bypass the gate.
+                        //
+                        // Reissue sits above Revoke because it's the
+                        // more common operator action — recovering a
+                        // lost URL is routine; revoking is terminal.
+                        button type="button"
+                               class="row-action-item"
+                               data-open-dialog=(format!("dlg-reissue-invite-{id}")) {
+                            "Reissue invitation…"
+                        }
                         button type="button"
                                class="row-action-item row-action-danger"
                                data-open-dialog=(format!("dlg-revoke-invite-{id}")) {
@@ -1993,7 +2002,105 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
                         }
                     }
                 }
+                (reissue_invite_dialog(id, &invitation.email, csrf_token))
                 (revoke_invite_dialog(id, &invitation.email, csrf_token))
+            }
+        }
+    }
+}
+
+/// Confirmation dialog for the Reissue invitation row action on
+/// pending invitations. Centered chrome with the shield feature icon
+/// so it reads as a "you're about to invalidate something" gate, not
+/// destructive. The dialog spells out the implication (old URL stops
+/// working) before chaining into the reauth modal.
+fn reissue_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
+    html! {
+        dialog id=(format!("dlg-reissue-invite-{id}"))
+               class="action-dialog action-dialog-centered" {
+            form id=(format!("form-reissue-invite-{id}"))
+                 method="post"
+                 action=(format!("/members/invitations/{id}/reissue")) {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-shield" {
+                        (shield_icon())
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 { "Reissue invitation?" }
+                p class="dialog-description" {
+                    "A fresh acceptance URL will be generated for "
+                    strong { (email) } ". The previous URL stops working "
+                    "immediately. The new URL is shown to you once "
+                    "(and emailed to the invitee if notifications are enabled)."
+                }
+                (csrf_input(csrf_token))
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn"
+                           data-reauth-confirm=(format!("form-reissue-invite-{id}")) {
+                        "Reissue"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inner content of the invite modal in its post-reissue "success"
+/// state. Same Copy-URL chrome as [`invite_modal_content_success`] but
+/// the headline + caption are reissue-specific so the operator
+/// understands the old URL is dead. Renders inside #invite-modal-content
+/// after HX-Retarget swaps this body into the existing invite dialog.
+pub fn reissue_modal_content_success(
+    ctx: &ChromeContext,
+    invitee_email: &str,
+    invited_role: InstanceRole,
+    accept_url: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let expires_label = expires_at.format("%b %-d, %Y %H:%M UTC").to_string();
+    let _ = ctx;
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-icon-success" {
+                (check_circle_icon())
+            }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 { "Invitation reissued" }
+        p class="dialog-description" {
+            "A new acceptance URL has been generated for "
+            strong { (invitee_email) } " as "
+            span class=(role_class(invited_role)) {
+                (role_label(invited_role))
+            }
+            ". The previous URL no longer works. New URL expires "
+            (expires_label) "."
+        }
+        div class="invite-link-block" {
+            p class="invite-link-label" {
+                "Save or share this acceptance link. "
+                strong { "It is shown only once." }
+                " A copy was also queued to the invitee's email if "
+                "notifications are enabled."
+            }
+            div class="invite-link-row" {
+                input type="text" id="invite-url-modal" class="invite-url-input"
+                      value=(accept_url) readonly;
+                button type="button" class="btn-secondary"
+                       data-copy-target="invite-url-modal" { "Copy" }
+            }
+        }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog {
+                "Close"
             }
         }
     }
@@ -2633,6 +2740,9 @@ fn error_banner(error: &str) -> Markup {
         // with these codes when the underlying call refuses.
         "invite_not_found" => "That invitation no longer exists.",
         "invite_already_accepted" => "That invitation was already accepted.",
+        "invite_expired" => {
+            "That invitation has expired. Send a new one from the toolbar instead."
+        }
         // /pending veto errors.
         "transition_not_found" => "That pending action no longer exists.",
         "not_pending" => {

@@ -36,6 +36,10 @@ pub fn ui_router(state: AppState) -> Router {
             "/members/invitations/{id}/revoke",
             post(admin_routes::revoke_invitation),
         )
+        .route(
+            "/members/invitations/{id}/reissue",
+            post(admin_routes::reissue_invitation),
+        )
         .route("/members/{id}/deactivate", post(admin_routes::deactivate_member))
         .route("/members/{id}/reactivate", post(admin_routes::reactivate_member))
         .route("/members/{id}/delete", post(admin_routes::delete_member))

@@ -650,3 +650,106 @@ pub async fn revoke_invitation(
         }
     }
 }
+
+/// `POST /members/invitations/{id}/reissue` — kebab action on a pending
+/// invite row. Rotates the invitation's token (old URL stops working
+/// immediately), extends its expiry to now+TTL, and renders the new
+/// acceptance URL once.
+///
+/// Reuses the same cross-modal HTMX swap as `invite_submit`: the
+/// reauth chain POSTs here, on success we HX-Retarget to
+/// `#invite-modal-content` so the swap lands in the existing invite
+/// dialog, and fire `switch-to-invite-modal` + `invite-success`
+/// triggers so the JS closes reauth, opens the invite dialog (now
+/// showing the reissue success body), and flags the page for a
+/// reload when the operator closes it (so the bumped expiry shows on
+/// the row). Same `LifecycleActionForm` shape; same `require_password`
+/// gate as Revoke.
+pub async fn reissue_invitation(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
+    Path(invitation_id): Path<Uuid>,
+    Form(form): Form<LifecycleActionForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let admin = match require_admin(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let htmx = is_htmx(&headers);
+    let action_url = format!("/members/invitations/{invitation_id}/reissue");
+    if let Err(resp) =
+        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+    {
+        return resp;
+    }
+
+    let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
+    let pending_count = pending_count_for(&state, admin.0.user.instance_role).await;
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &admin.0.user,
+        csrf_token: &csrf_token,
+        pending_count,
+    };
+
+    let id = InvitationId::new(invitation_id);
+    match admin_logic::perform_reissue_invite(&state, &admin, id).await {
+        Ok(outcome) => {
+            let accept_url =
+                format!("{}/invite/{}", state.public_base_url, outcome.raw_token);
+            if htmx {
+                let body = views::reissue_modal_content_success(
+                    &ctx,
+                    &outcome.invitation.email,
+                    outcome.invitation.instance_role,
+                    &accept_url,
+                    outcome.invitation.expires_at,
+                )
+                .into_string();
+                // Same swap-into-invite-modal response as create-invite.
+                // The `succeeded=true` arg flags the page to reload on
+                // dlg-invite close so the bumped expires_at + the new
+                // pending row state surface.
+                invite_modal_swap_response(body, /* succeeded = */ true)
+            } else {
+                // No-JS / HTMX-absent fallback: render the URL on a
+                // standalone result page so the operator still gets
+                // the one-time URL. Mirrors invite_submit's fallback.
+                Html(
+                    views::members_invite_result_page(
+                        &ctx,
+                        &outcome.invitation.email,
+                        outcome.invitation.instance_role,
+                        &accept_url,
+                        outcome.invitation.expires_at,
+                    )
+                    .into_string(),
+                )
+                .into_response()
+            }
+        }
+        Err(admin_logic::ReissueInviteError::NotFound) => {
+            redirect_or_hx_redirect("/members?error=invite_not_found", htmx)
+        }
+        Err(admin_logic::ReissueInviteError::AlreadyAccepted) => {
+            redirect_or_hx_redirect("/members?error=invite_already_accepted", htmx)
+        }
+        Err(admin_logic::ReissueInviteError::AlreadyRevoked) => {
+            redirect_or_hx_redirect("/members?error=invite_not_found", htmx)
+        }
+        Err(admin_logic::ReissueInviteError::Expired) => {
+            redirect_or_hx_redirect("/members?error=invite_expired", htmx)
+        }
+        Err(admin_logic::ReissueInviteError::Internal(err)) => {
+            tracing::error!(?err, "reissue invite internal error (web)");
+            error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+        }
+    }
+}

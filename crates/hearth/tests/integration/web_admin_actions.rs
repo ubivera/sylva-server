@@ -1323,6 +1323,238 @@ async fn revoke_invite_with_correct_password_htmx_responds_with_hx_redirect() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Reissue invitation — kebab action on pending invite rows (CP4)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Pull the (token_hash, expires_at) pair for an invitation so tests
+/// can assert the reissue actually rotated + extended the row.
+async fn invitation_state(
+    app: &TestApp,
+    invitation_id: uuid::Uuid,
+) -> (Vec<u8>, chrono::DateTime<chrono::Utc>) {
+    sqlx::query_as::<_, (Vec<u8>, chrono::DateTime<chrono::Utc>)>(
+        "SELECT token_hash, expires_at FROM identity.invitations WHERE id = $1",
+    )
+    .bind(invitation_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reissue_rotates_token_extends_expiry_and_invalidates_old_url() {
+    // Seed a pending invite, then reissue it. Assert:
+    //   - token_hash changed (old URL is dead)
+    //   - expires_at extended to roughly now + TTL
+    //   - GET on the old URL is 404, but a fresh one would work
+    //     (we don't have the new raw token from this code path, so we
+    //     just verify the old hash truly changed and old URL fails)
+    let app = TestApp::new().await;
+    let old_token = seed_pending_invite(&app, "to-reissue@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (old_hash, old_expires) = invitation_state(&app, invitation_id).await;
+
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    // Response renders the new URL on the result page (no redirect).
+    assert!(body.contains("Invitation reissued") || body.contains("Invitation sent"));
+    assert!(body.contains("/invite/"));
+
+    // DB: hash rotated, expiry extended.
+    let (new_hash, new_expires) = invitation_state(&app, invitation_id).await;
+    assert_ne!(old_hash, new_hash, "token_hash should rotate");
+    assert!(
+        new_expires > old_expires,
+        "new expires_at should be later: old={old_expires} new={new_expires}"
+    );
+
+    // The old URL must no longer work.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/invite/{old_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "old invitation URL must stop working after reissue"
+    );
+}
+
+#[tokio::test]
+async fn reissue_writes_audit_event_and_enqueues_notification() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "audit-me@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    // Outbox should have exactly 1 row right now — the original invite.
+    let outbox_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notifications.outbox")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_before, 1);
+
+    post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit.events \
+         WHERE event_type = 'invitation_reissued' \
+           AND (event_data->>'invitation_id')::uuid = $1",
+    )
+    .bind(invitation_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1, "expected one invitation_reissued audit event");
+
+    let outbox_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notifications.outbox")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outbox_after, 2,
+        "reissue should enqueue a fresh invitation notification"
+    );
+}
+
+#[tokio::test]
+async fn reissue_with_wrong_password_htmx_returns_modal_with_error() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "wrong-pw@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+    let (old_hash, _) = invitation_state(&app, invitation_id).await;
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/members/invitations/{invitation_id}/reissue"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password=wrong",
+            urlencoding(&csrf)
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(!body.contains("<!DOCTYPE html>"));
+    assert!(body.contains("Incorrect password"));
+    let expected_action =
+        format!(r#"action="/members/invitations/{invitation_id}/reissue""#);
+    assert!(body.contains(&expected_action));
+
+    // DB: nothing changed.
+    let (new_hash, _) = invitation_state(&app, invitation_id).await;
+    assert_eq!(old_hash, new_hash, "token must not rotate on wrong password");
+}
+
+#[tokio::test]
+async fn reissue_rejected_for_already_accepted_invite() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "accepted@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+
+    // Accept the invite so its state is "accepted".
+    let body = format!(
+        "display_name={}&password={}",
+        urlencoding("Acceptor"),
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+
+    // Now try to reissue.
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(loc, "/members?error=invite_already_accepted");
+}
+
+#[tokio::test]
+async fn reissue_forbidden_for_member() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "victim@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    app.seed_user("m@test.local", "M", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, "m@test.local", "pw").await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password=pw", urlencoding(&csrf)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pending_invite_row_renders_reissue_dialog_with_csrf() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "renders@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    let dialog_id = format!(r#"data-open-dialog="dlg-reissue-invite-{invitation_id}""#);
+    assert!(
+        body.contains(&dialog_id),
+        "kebab should open reissue dialog: {body}"
+    );
+    let dlg = format!(r#"id="dlg-reissue-invite-{invitation_id}""#);
+    assert!(body.contains(&dlg));
+    let chain = format!(r#"data-reauth-confirm="form-reissue-invite-{invitation_id}""#);
+    assert!(body.contains(&chain));
+    let action = format!(r#"action="/members/invitations/{invitation_id}/reissue""#);
+    assert!(body.contains(&action));
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // /pending — Owners-only veto review page (Checkpoint 1 MVP)
 // ────────────────────────────────────────────────────────────────────────
 
