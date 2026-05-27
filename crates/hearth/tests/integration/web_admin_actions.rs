@@ -1197,6 +1197,29 @@ async fn invite_submit_htmx_error_returns_form_partial_with_banner() {
 }
 
 #[tokio::test]
+async fn members_page_includes_submit_interceptor_for_chained_forms() {
+    // Regression guard: REAUTH_CHAIN_JS must catch native form
+    // submission (Enter in a text input) and route through the chain
+    // button instead. Without this, pressing Enter in the invite
+    // modal's email field — or in the Delete/Purge type-to-confirm
+    // field — submits the form directly to its action URL, missing
+    // the `password` field that the LifecycleActionForm/InviteForm
+    // deserializer requires, surfacing as a raw 422 error page.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("addEventListener('submit'"),
+        "REAUTH_CHAIN_JS must wire a submit-event listener to catch \
+         Enter-key implicit form submission on chained forms"
+    );
+}
+
+#[tokio::test]
 async fn members_page_renders_invite_cta_and_modal() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)

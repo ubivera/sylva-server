@@ -1758,6 +1758,36 @@ const REAUTH_CHAIN_JS: &str = r#"
         }
         if (pwInput) pwInput.focus();
     });
+
+    // Implicit form submission (Enter in a text input) bypasses the
+    // click handler above and POSTs the form natively to its `action`
+    // URL — which for chain forms is the action endpoint, *not* the
+    // reauth modal. Without an interceptor here the result is a body
+    // missing the `password` field, surfacing as Axum's deserialize
+    // error. Affects the invite modal (Enter in email), and the
+    // Delete + Purge dialogs (Enter in the type-to-confirm field).
+    //
+    // The fix: catch the submit event, find the chain button whose
+    // `data-reauth-confirm` points at this form, and synthesize a
+    // click on it. The existing click handler then runs the full
+    // chain (role-aware intercept + payload staging + reauth open).
+    //
+    // `.click()` on a disabled button is a spec-defined no-op, so
+    // the type-to-confirm and role-picker gates stay enforced —
+    // pressing Enter before the gate is satisfied does nothing,
+    // which matches the click behaviour.
+    document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!(form instanceof HTMLFormElement)) return;
+        var btns = form.querySelectorAll('[data-reauth-confirm]');
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].getAttribute('data-reauth-confirm') === form.id) {
+                e.preventDefault();
+                btns[i].click();
+                return;
+            }
+        }
+    });
 })();
 "#;
 
@@ -2107,16 +2137,26 @@ pub fn reissue_modal_content_success(
 }
 
 /// Confirmation dialog for the Revoke invite row action on pending
-/// invitations. Mirrors the Deactivate dialog's shape (h2 + short
-/// explanation + Cancel/Continue) and chains into the shared reauth
-/// modal so the operator must re-enter their password before the
-/// revoke commits.
+/// invitations. Centered chrome with the warning-amber feature icon —
+/// terminal-but-recoverable, same palette as Deactivate. Sits as a
+/// sibling of the Reissue dialog on the same row; the operator picks
+/// which one fits their intent from the kebab.
 fn revoke_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
     html! {
-        dialog id=(format!("dlg-revoke-invite-{id}")) class="action-dialog" {
+        dialog id=(format!("dlg-revoke-invite-{id}"))
+               class="action-dialog action-dialog-centered" {
             form id=(format!("form-revoke-invite-{id}"))
                  method="post"
                  action=(format!("/members/invitations/{id}/revoke")) {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-warning" {
+                        (shield_icon())
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
                 h2 { "Revoke invitation?" }
                 p class="dialog-description" {
                     "The pending invitation for " strong { (email) } " will "
@@ -2499,17 +2539,33 @@ fn plus_icon() -> Markup {
 fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: uuid::Uuid) -> Markup {
     let name = &target.display_name;
     match action {
+        // Deactivate uses the centered-icon chrome shared with the
+        // rest of the destructive row dialogs (change role, delete,
+        // purge, reissue). Warning-amber feature icon because
+        // deactivate is impactful (kicks active sessions) but
+        // reversible — the more saturated red of `dialog-icon-danger`
+        // is reserved for the terminal trio.
         RowAction::Deactivate => html! {
-            dialog id=(format!("dlg-deactivate-{id}")) class="action-dialog" {
+            dialog id=(format!("dlg-deactivate-{id}"))
+                   class="action-dialog action-dialog-centered" {
                 form id=(format!("form-deactivate-{id}"))
                      method="post" action=(format!("/members/{id}/deactivate")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-warning" {
+                            (shield_icon())
+                        }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" {
+                            (close_icon())
+                        }
+                    }
                     h2 { "Deactivate " (name) "?" }
                     p class="dialog-description" {
                         "Revokes all of " (name) "'s active sessions. Their "
                         "credentials stay in place so reactivation later "
                         "doesn't need a password reset."
                     }
-                    p class="dialog-note" {
+                    p class="dialog-note dialog-center-text" {
                         "If the target is an Owner, a 72-hour veto window begins "
                         "instead of applying immediately."
                     }
@@ -2518,19 +2574,31 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
                         button type="button" class="btn"
                                data-reauth-confirm=(format!("form-deactivate-{id}")) {
-                            "Continue"
+                            "Deactivate"
                         }
                     }
                 }
             }
         },
-        // Reactivate now flows through the reauth chain too — folded
-        // into the same gate as the destructive trio so any change to
-        // a member's lifecycle requires the operator's password.
+        // Reactivate uses the same centered chrome as Deactivate so
+        // the pair reads symmetric in the operator's mental model.
+        // Neutral shield palette (not warning) because this is the
+        // restoring-access half of the flip; the dramatic colour is
+        // saved for the action that actually cuts access.
         RowAction::Reactivate => html! {
-            dialog id=(format!("dlg-reactivate-{id}")) class="action-dialog" {
+            dialog id=(format!("dlg-reactivate-{id}"))
+                   class="action-dialog action-dialog-centered" {
                 form id=(format!("form-reactivate-{id}"))
                      method="post" action=(format!("/members/{id}/reactivate")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-shield" {
+                            (shield_icon())
+                        }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" {
+                            (close_icon())
+                        }
+                    }
                     h2 { "Reactivate " (name) "?" }
                     p class="dialog-description" {
                         "Re-enables sign-in for " (name) ". Their existing "
@@ -2542,7 +2610,7 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
                         button type="button" class="btn"
                                data-reauth-confirm=(format!("form-reactivate-{id}")) {
-                            "Continue"
+                            "Reactivate"
                         }
                     }
                 }
