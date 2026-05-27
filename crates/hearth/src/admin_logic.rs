@@ -698,6 +698,17 @@ async fn enqueue_pending_lifecycle(
         notifications::LifecycleAction::HardDelete => "pending_hard_delete_initiated",
     };
 
+    // Reviewer cohort = every active Owner except the initiator + the
+    // target. Fetched once and threaded into the closure so the
+    // notification fan-out can enqueue one row per reviewer in the
+    // same transaction as everything else. Note this happens before
+    // `tx.begin()` so a slow Owner lookup doesn't hold a write lock.
+    let peer_owners = state
+        .users
+        .list_active_owners_excluding(&[initiator, target_user_id])
+        .await
+        .map_err(|e| LifecycleError::Internal(e.into()))?;
+
     let result: anyhow::Result<pending::TransitionRow> = async {
         let mut tx = state.db.begin().await?;
         let (transition_id, effective_at) =
@@ -722,8 +733,8 @@ async fn enqueue_pending_lifecycle(
             &mut tx,
             notifications::Notification::PendingLifecycleInitiated {
                 recipient_email: target_email,
-                target_display_name,
-                initiator_display_name,
+                target_display_name: target_display_name.clone(),
+                initiator_display_name: initiator_display_name.clone(),
                 action,
                 effective_at,
                 veto_url: format!("{base}/admin/pending-transitions/{transition_id}/veto"),
@@ -731,6 +742,26 @@ async fn enqueue_pending_lifecycle(
             },
         )
         .await?;
+
+        // Fan-out: one peer notification per reviewing Owner. Same
+        // transaction so it's all-or-nothing with the action.
+        for peer in &peer_owners {
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingLifecycleInitiatedPeer {
+                    recipient_email: peer.email.clone(),
+                    target_display_name: target_display_name.clone(),
+                    initiator_display_name: initiator_display_name.clone(),
+                    action,
+                    effective_at,
+                    veto_url: format!(
+                        "{base}/admin/pending-transitions/{transition_id}/veto"
+                    ),
+                    transition_id,
+                },
+            )
+            .await?;
+        }
 
         let row: pending::TransitionRow = sqlx::query_as(
             "SELECT id, kind, initiator_user_id, target_user_id, payload, state,
@@ -775,6 +806,15 @@ async fn enqueue_pending_role_change(
     let actor = admin.actor();
     let base = state.public_base_url.clone();
 
+    // Reviewer cohort — every active Owner other than initiator +
+    // target. See the matching block in `enqueue_pending_lifecycle`
+    // for the rationale for fetching this before opening the tx.
+    let peer_owners = state
+        .users
+        .list_active_owners_excluding(&[initiator, target_user_id])
+        .await
+        .map_err(|e| RoleError::Internal(e.into()))?;
+
     let result: anyhow::Result<pending::TransitionRow> = async {
         let mut tx = state.db.begin().await?;
         let (transition_id, effective_at) =
@@ -800,8 +840,8 @@ async fn enqueue_pending_role_change(
             &mut tx,
             notifications::Notification::PendingRoleChangeInitiated {
                 recipient_email: target_email,
-                target_display_name,
-                initiator_display_name,
+                target_display_name: target_display_name.clone(),
+                initiator_display_name: initiator_display_name.clone(),
                 from_role,
                 to_role,
                 effective_at,
@@ -810,6 +850,26 @@ async fn enqueue_pending_role_change(
             },
         )
         .await?;
+
+        // Fan-out: one peer notification per reviewing Owner.
+        for peer in &peer_owners {
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::PendingRoleChangeInitiatedPeer {
+                    recipient_email: peer.email.clone(),
+                    target_display_name: target_display_name.clone(),
+                    initiator_display_name: initiator_display_name.clone(),
+                    from_role,
+                    to_role,
+                    effective_at,
+                    veto_url: format!(
+                        "{base}/admin/pending-transitions/{transition_id}/veto"
+                    ),
+                    transition_id,
+                },
+            )
+            .await?;
+        }
 
         let row: pending::TransitionRow = sqlx::query_as(
             "SELECT id, kind, initiator_user_id, target_user_id, payload, state,

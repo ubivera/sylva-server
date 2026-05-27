@@ -841,3 +841,149 @@ async fn second_owner_on_owner_lifecycle_action_is_blocked() {
     resp.assert_status(StatusCode::CONFLICT)
         .assert_error("pending_action_exists");
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// CP3: peer-Owner email fan-out on pending initiation
+// ────────────────────────────────────────────────────────────────────────
+
+/// Fetch the `(kind, recipient_email)` pairs of every outbox row,
+/// ordered by created_at ASC so tests can assert on insertion order.
+async fn outbox_rows(app: &TestApp) -> Vec<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT kind::text, recipient_email \
+         FROM notifications.outbox \
+         ORDER BY created_at ASC",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn lifecycle_initiation_fans_out_peer_notifications_to_other_owners() {
+    // 3 Owners (A, B, C) + 1 Admin. A initiates deactivate against B.
+    // Expected outbox:
+    //   - PendingLifecycleInitiated → B (target)
+    //   - PendingLifecycleInitiatedPeer → C (reviewing peer)
+    // Admin gets nothing. A (initiator) gets nothing.
+    let app = TestApp::new().await;
+    let a = app
+        .seed_user("a@test.local", "A", "apw", InstanceRole::Owner)
+        .await;
+    let b = app
+        .seed_user("b@test.local", "B", "bpw", InstanceRole::Owner)
+        .await;
+    let c = app
+        .seed_user("c@test.local", "C", "cpw", InstanceRole::Owner)
+        .await;
+    let _adm = app
+        .seed_user("adm@test.local", "Adm", "admpw", InstanceRole::Admin)
+        .await;
+    let a_tok = app.login(&a.email, "apw").await;
+
+    app.post(
+        &format!("/api/admin/members/{}/deactivate", b.id.0),
+        Some(&a_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::ACCEPTED);
+
+    let rows = outbox_rows(&app).await;
+    assert_eq!(rows.len(), 2, "expected target row + 1 peer row, got: {rows:?}");
+    assert_eq!(rows[0].0, "pending_lifecycle_initiated");
+    assert_eq!(rows[0].1, b.email);
+    assert_eq!(rows[1].0, "pending_lifecycle_initiated_peer");
+    assert_eq!(rows[1].1, c.email);
+}
+
+#[tokio::test]
+async fn role_change_initiation_fans_out_peer_notifications_to_other_owners() {
+    // Same as lifecycle but driven through the role-change path so the
+    // role-change-specific peer variant gets exercised.
+    let app = TestApp::new().await;
+    let a = app
+        .seed_user("a@test.local", "A", "apw", InstanceRole::Owner)
+        .await;
+    let b = app
+        .seed_user("b@test.local", "B", "bpw", InstanceRole::Owner)
+        .await;
+    let c = app
+        .seed_user("c@test.local", "C", "cpw", InstanceRole::Owner)
+        .await;
+    let a_tok = app.login(&a.email, "apw").await;
+
+    app.post(
+        &format!("/api/admin/members/{}/role", b.id.0),
+        Some(&a_tok),
+        Some(json!({ "role": "admin" })),
+    )
+    .await
+    .assert_status(StatusCode::ACCEPTED);
+
+    let rows = outbox_rows(&app).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "pending_role_change_initiated");
+    assert_eq!(rows[0].1, b.email);
+    assert_eq!(rows[1].0, "pending_role_change_initiated_peer");
+    assert_eq!(rows[1].1, c.email);
+}
+
+#[tokio::test]
+async fn two_owner_instance_has_no_peer_fan_out() {
+    // Only Owners A + B. A → B has no peer to fan out to, so the
+    // outbox holds exactly the one target-specific row.
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+
+    app.post(
+        &format!("/api/admin/members/{b_id}/deactivate"),
+        Some(&a_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::ACCEPTED);
+
+    let rows = outbox_rows(&app).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "pending_lifecycle_initiated");
+}
+
+#[tokio::test]
+async fn deactivated_peer_owner_skipped_in_fan_out() {
+    // 3 Owners; C is deactivated. A → B should still fire the
+    // target-specific row to B, but skip C entirely (deactivated
+    // Owners can't sign in to veto, so emailing them would bounce).
+    let app = TestApp::new().await;
+    let a = app
+        .seed_user("a@test.local", "A", "apw", InstanceRole::Owner)
+        .await;
+    let b = app
+        .seed_user("b@test.local", "B", "bpw", InstanceRole::Owner)
+        .await;
+    let c = app
+        .seed_user("c@test.local", "C", "cpw", InstanceRole::Owner)
+        .await;
+    // Mark C deactivated directly in the DB — a real deactivate flow
+    // would loop through pending since C is an Owner; this bypass
+    // gets us to the test state without exercising that path.
+    sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
+        .bind(c.id.0)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let a_tok = app.login(&a.email, "apw").await;
+
+    app.post(
+        &format!("/api/admin/members/{}/deactivate", b.id.0),
+        Some(&a_tok),
+        None,
+    )
+    .await
+    .assert_status(StatusCode::ACCEPTED);
+
+    let rows = outbox_rows(&app).await;
+    // Only the target row — C is deactivated so they're skipped.
+    assert_eq!(rows.len(), 1, "deactivated C should not receive a peer email: {rows:?}");
+    assert_eq!(rows[0].0, "pending_lifecycle_initiated");
+    assert_eq!(rows[0].1, b.email);
+}

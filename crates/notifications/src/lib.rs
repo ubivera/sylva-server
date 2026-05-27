@@ -34,9 +34,17 @@ pub type Result<T> = std::result::Result<T, NotificationsError>;
 pub enum OutboxKind {
     Invitation,
     PendingRoleChangeInitiated,
+    /// Fan-out variant sent to every active Owner *other* than the
+    /// initiator and target when an Owner-on-Owner role change is
+    /// queued. Lets the wider Owner cohort veto on behalf of the
+    /// target without depending on the target seeing their own email.
+    PendingRoleChangeInitiatedPeer,
     PendingRoleChangeVetoed,
     PendingRoleChangeApplied,
     PendingLifecycleInitiated,
+    /// Companion fan-out variant for lifecycle pendings. See
+    /// [`OutboxKind::PendingRoleChangeInitiatedPeer`] for the rationale.
+    PendingLifecycleInitiatedPeer,
     PendingLifecycleVetoed,
     PendingLifecycleApplied,
 }
@@ -96,6 +104,21 @@ pub enum Notification {
         veto_url: String,
         transition_id: Uuid,
     },
+    /// Fan-out copy of [`Notification::PendingRoleChangeInitiated`]
+    /// addressed to a peer Owner (anyone except the initiator + target).
+    /// Same payload shape; the rendered subject + body frame it as
+    /// "a peer Owner is being targeted" rather than "your account is
+    /// being targeted".
+    PendingRoleChangeInitiatedPeer {
+        recipient_email: String,
+        target_display_name: String,
+        initiator_display_name: String,
+        from_role: InstanceRole,
+        to_role: InstanceRole,
+        effective_at: DateTime<Utc>,
+        veto_url: String,
+        transition_id: Uuid,
+    },
     /// An initiator's pending role-change was vetoed.
     PendingRoleChangeVetoed {
         recipient_email: String,
@@ -122,6 +145,18 @@ pub enum Notification {
     /// been queued against `recipient`. Mirrors `PendingRoleChangeInitiated`
     /// but parameterized by lifecycle action rather than from/to roles.
     PendingLifecycleInitiated {
+        recipient_email: String,
+        target_display_name: String,
+        initiator_display_name: String,
+        action: LifecycleAction,
+        effective_at: DateTime<Utc>,
+        veto_url: String,
+        transition_id: Uuid,
+    },
+    /// Fan-out copy of [`Notification::PendingLifecycleInitiated`]
+    /// addressed to a peer Owner. See the role-change variant's
+    /// `PendingRoleChangeInitiatedPeer` for rationale.
+    PendingLifecycleInitiatedPeer {
         recipient_email: String,
         target_display_name: String,
         initiator_display_name: String,
@@ -281,6 +316,69 @@ impl Notification {
                     payload,
                 }
             }
+            Notification::PendingRoleChangeInitiatedPeer {
+                recipient_email,
+                target_display_name,
+                initiator_display_name,
+                from_role,
+                to_role,
+                effective_at,
+                veto_url,
+                transition_id,
+            } => {
+                let from = role_label(from_role);
+                let to = role_label(to_role);
+                let subject = format!(
+                    "Heads up: {initiator_display_name} has initiated a role change on \
+                     {target_display_name}"
+                );
+                let body_text = format!(
+                    "Another Owner action on your Sylva Hearth instance needs review.\n\n\
+                     {initiator_display_name} has initiated a pending role change on \
+                     {target_display_name}'s account:\n\n\
+                     \tFrom: {from}\n\
+                     \tTo:   {to}\n\n\
+                     If you don't take action, this will apply automatically on \
+                     {effective_at}.\n\n\
+                     If this was not coordinated, any Owner can veto it here:\n  {veto_url}\n",
+                    effective_at = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Heads up — another Owner action on your Sylva Hearth instance needs review.</p>\
+                     <p><strong>{initiator}</strong> has initiated a pending role change on \
+                     <strong>{target}</strong>'s account:</p>\
+                     <ul><li>From: <strong>{from}</strong></li>\
+                     <li>To: <strong>{to}</strong></li></ul>\
+                     <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
+                     <p><a href=\"{url}\" style=\"display:inline-block;padding:10px 16px;\
+                     background:#d83a3a;color:#fff;text-decoration:none;border-radius:4px;\">\
+                     Veto this change</a></p>\
+                     <p style=\"color:#666;font-size:13px;\">Or paste this link into your browser:\
+                     <br><span style=\"font-family:monospace;\">{url}</span></p>\
+                     </body></html>",
+                    target = html_escape(&target_display_name),
+                    initiator = html_escape(&initiator_display_name),
+                    from = from,
+                    to = to,
+                    when = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                    url = html_escape(&veto_url),
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "from_role": from_role,
+                    "to_role": to_role,
+                    "target_display_name": target_display_name,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingRoleChangeInitiatedPeer,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
             Notification::PendingRoleChangeVetoed {
                 recipient_email,
                 initiator_display_name,
@@ -427,6 +525,61 @@ impl Notification {
                 });
                 Rendered {
                     kind: OutboxKind::PendingLifecycleInitiated,
+                    recipient_email,
+                    subject,
+                    body_text,
+                    body_html,
+                    payload,
+                }
+            }
+            Notification::PendingLifecycleInitiatedPeer {
+                recipient_email,
+                target_display_name,
+                initiator_display_name,
+                action,
+                effective_at,
+                veto_url,
+                transition_id,
+            } => {
+                let noun = action.noun();
+                let subject = format!(
+                    "Heads up: {initiator_display_name} has initiated a pending {noun} on \
+                     {target_display_name}"
+                );
+                let body_text = format!(
+                    "Another Owner action on your Sylva Hearth instance needs review.\n\n\
+                     {initiator_display_name} has initiated a pending {noun} on \
+                     {target_display_name}'s account.\n\n\
+                     If you don't take action, this will apply automatically on \
+                     {effective_at}.\n\n\
+                     If this was not coordinated, any Owner can veto it here:\n  {veto_url}\n",
+                    effective_at = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                );
+                let body_html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
+                     <p>Heads up — another Owner action on your Sylva Hearth instance needs review.</p>\
+                     <p><strong>{initiator}</strong> has initiated a pending \
+                     <strong>{noun}</strong> on <strong>{target}</strong>'s account.</p>\
+                     <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
+                     <p><a href=\"{url}\" style=\"display:inline-block;padding:10px 16px;\
+                     background:#d83a3a;color:#fff;text-decoration:none;border-radius:4px;\">\
+                     Veto this action</a></p>\
+                     <p style=\"color:#666;font-size:13px;\">Or paste this link into your browser:\
+                     <br><span style=\"font-family:monospace;\">{url}</span></p>\
+                     </body></html>",
+                    target = html_escape(&target_display_name),
+                    initiator = html_escape(&initiator_display_name),
+                    noun = noun,
+                    when = effective_at.format("%Y-%m-%d %H:%M UTC"),
+                    url = html_escape(&veto_url),
+                );
+                let payload = serde_json::json!({
+                    "transition_id": transition_id,
+                    "action": action,
+                    "target_display_name": target_display_name,
+                });
+                Rendered {
+                    kind: OutboxKind::PendingLifecycleInitiatedPeer,
                     recipient_email,
                     subject,
                     body_text,
