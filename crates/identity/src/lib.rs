@@ -202,6 +202,62 @@ impl UserRepository {
         Ok(users)
     }
 
+    /// Active Owner users, excluding any ids in `exclude_ids`. Used
+    /// by the pending-transition fan-out to find the reviewer cohort
+    /// (every Owner except the initiator + target) for an
+    /// Owner-on-Owner pending action.
+    ///
+    /// Filters out `Deactivated`, `SoftDeleted`, and `HardDeleted` —
+    /// those Owners can't sign in to veto, so emailing them would
+    /// just bounce. Also filters `kind = 'member'` so future Guest-
+    /// kind Owners (if that ever exists) don't accidentally surface.
+    pub async fn list_active_owners_excluding(
+        &self,
+        exclude_ids: &[UserId],
+    ) -> Result<Vec<User>> {
+        let users = sqlx::query_as::<_, User>(
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
+                    locale, created_at, updated_at \
+             FROM identity.users \
+             WHERE instance_role = 'owner' \
+               AND lifecycle = 'active' \
+               AND kind = 'member' \
+               AND NOT (id = ANY($1)) \
+             ORDER BY created_at",
+        )
+        .bind(exclude_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(users)
+    }
+
+    /// Bulk fetch users by id, regardless of lifecycle (mirrors
+    /// `find_any` semantics for each id). Returns rows in unspecified
+    /// order — the caller is expected to re-index by id. Ids that
+    /// don't match any row are silently dropped.
+    ///
+    /// Used by the `/pending` admin page to hydrate the target +
+    /// initiator details for each pending transition in a single
+    /// round-trip rather than N+1 lookups. We need `find_any` (not
+    /// `find_by_id`) because pending transitions can outlive their
+    /// targets if a `delete` has already been applied while the action
+    /// was in flight.
+    pub async fn list_by_ids(&self, ids: &[UserId]) -> Result<Vec<User>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let users = sqlx::query_as::<_, User>(
+            "SELECT id, email, display_name, lifecycle, instance_role, kind, \
+                    locale, created_at, updated_at \
+             FROM identity.users \
+             WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(users)
+    }
+
     /// Members in a specific lifecycle state, oldest first. Used by the
     /// Members page's "Deleted" filter, which surfaces SoftDeleted rows
     /// that [`list_all`] intentionally hides. Always filters to

@@ -270,12 +270,35 @@ pub async fn me_page(
     BrowserAuth(auth): BrowserAuth,
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
         csrf_token: &csrf_token,
+        pending_count,
     };
     Html(views::me_page(&ctx).into_string()).into_response()
+}
+
+/// Fetches the active pending-transition count, but only for Owner
+/// viewers — Admins and Members never see the sidebar entry and
+/// shouldn't pay for the query. Returns `None` on non-Owner; logs and
+/// swallows any DB error (the sidebar then just renders without a
+/// badge rather than failing the entire page render).
+pub(crate) async fn pending_count_for(
+    state: &hearth::app::AppState,
+    role: identity::InstanceRole,
+) -> Option<u32> {
+    if role != identity::InstanceRole::Owner {
+        return None;
+    }
+    match pending::count_active(&state.db).await {
+        Ok(n) => Some(n),
+        Err(err) => {
+            tracing::warn!(?err, "pending count for sidebar badge");
+            None
+        }
+    }
 }
 
 /// Query params on `/members`. `action` / `target` / `error` carry the
@@ -488,10 +511,38 @@ pub async fn members_page(
     };
 
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let pending_count = pending_count_for(&state, auth.user.instance_role).await;
+
+    // Fetch active pending transitions that target any of the
+    // currently-displayed members so member_row can render a
+    // "Pending …" pill. One bulk query keyed by the displayed user
+    // ids — Owner-on-Owner pendings are rare, so this typically
+    // returns zero rows on any given page load.
+    let displayed_target_ids: Vec<uuid::Uuid> = page_slice
+        .iter()
+        .filter_map(|row| match row {
+            views::MemberRow::Member { user, .. } => Some(user.id.0),
+            views::MemberRow::PendingInvite(_) => None,
+        })
+        .collect();
+    let pending_rows = match pending::active_by_target_ids(&state.db, &displayed_target_ids).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(?err, "fetching active pendings for /members row badges");
+            Vec::new()
+        }
+    };
+    let pending_by_target: std::collections::HashMap<uuid::Uuid, &pending::TransitionRow> =
+        pending_rows
+            .iter()
+            .filter_map(|r| r.target_user_id.map(|tid| (tid, r)))
+            .collect();
+
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
         csrf_token: &csrf_token,
+        pending_count,
     };
     let banner = views::MembersBanner {
         action: query.action.as_deref(),
@@ -499,8 +550,16 @@ pub async fn members_page(
         error: query.error.as_deref(),
     };
     Html(
-        views::members_page(&ctx, page_slice, banner, sort, filter, pagination)
-            .into_string(),
+        views::members_page(
+            &ctx,
+            page_slice,
+            banner,
+            sort,
+            filter,
+            pagination,
+            &pending_by_target,
+        )
+        .into_string(),
     )
     .into_response()
 }

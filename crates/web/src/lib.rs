@@ -1,4 +1,5 @@
 pub mod admin_routes;
+pub mod pending_routes;
 pub mod routes;
 pub mod views;
 
@@ -40,6 +41,11 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/members/{id}/delete", post(admin_routes::delete_member))
         .route("/members/{id}/purge", post(admin_routes::purge_member))
         .route("/members/{id}/role", post(admin_routes::change_member_role))
+        .route("/pending", get(pending_routes::pending_page))
+        .route(
+            "/pending/{id}/veto",
+            post(pending_routes::veto_pending),
+        )
         .route("/logout", post(routes::logout_submit))
         .nest_service("/assets", ServeDir::new(assets_dir()))
         .with_state(state)
