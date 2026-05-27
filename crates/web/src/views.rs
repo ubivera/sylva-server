@@ -764,7 +764,11 @@ fn shield_icon() -> Markup {
 
 fn invite_modal(ctx: &ChromeContext) -> Markup {
     html! {
-        dialog id="dlg-invite" class="action-dialog invite-dialog" {
+        // `action-dialog-centered` so invite_modal_content_form + the
+        // post-create / post-reissue success bodies all render with
+        // the same centered icon + centered title treatment as the
+        // rest of the dialog set (delete, purge, veto, reissue confirm).
+        dialog id="dlg-invite" class="action-dialog action-dialog-centered invite-dialog" {
             div id="invite-modal-content" {
                 (invite_modal_content_form(ctx, "", InstanceRole::Member, None))
             }
@@ -1079,6 +1083,23 @@ pub fn members_invite_result_page(
 // hidden Member input). The backend still gates with `authz::satisfies`
 // — this helper just isn't needed at the view layer anymore.
 
+// Copy-URL handler for the invite + reissue result modals.
+//
+// The earlier version called `input.select()` on the visible readonly
+// input as its `execCommand` fallback. Inside an open `<dialog>`
+// (via showModal), the dialog gets its own top layer; calling
+// `.select()` on an input from a click that originated on a sibling
+// button doesn't always update the platform selection — empirically
+// the Copy button no-op'd unless the operator had manually selected
+// the URL text first.
+//
+// Fix: append a temporary off-screen textarea *into the dialog
+// itself* (same top layer as the click), focus + select that, then
+// execCommand('copy'). This is the standard "modal clipboard"
+// workaround and is reliable across browsers. We still try the
+// modern `navigator.clipboard.writeText` path first — in a secure
+// context it's preferred — and only fall back if writeText rejects
+// or the API isn't exposed (insecure context).
 const INVITE_COPY_JS: &str = r#"
 document.addEventListener('click', function(e) {
     var btn = e.target.closest('[data-copy-target]');
@@ -1092,12 +1113,43 @@ document.addEventListener('click', function(e) {
         btn.textContent = 'Copied';
         setTimeout(function() { btn.textContent = orig; }, 1500);
     };
+    var fallback = function() {
+        // Mount the temp textarea inside whatever dialog the button
+        // lives in (or the body, if there is none) so the selection +
+        // execCommand run inside the same top layer.
+        var host = btn.closest('dialog') || document.body;
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '0';
+        ta.style.left = '0';
+        ta.style.width = '1px';
+        ta.style.height = '1px';
+        ta.style.opacity = '0';
+        ta.style.pointerEvents = 'none';
+        host.appendChild(ta);
+        try {
+            ta.focus();
+            ta.select();
+            // Some browsers ignore .select() for textareas without
+            // an explicit setSelectionRange — set it defensively.
+            ta.setSelectionRange(0, ta.value.length);
+            var ok = document.execCommand('copy');
+            if (ok) done();
+        } catch (_) {
+            // Last resort: leave the URL selected in the original
+            // input so the operator can hit Ctrl/Cmd+C themselves.
+            input.focus();
+            input.select();
+        } finally {
+            host.removeChild(ta);
+        }
+    };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, function() {
-            input.select(); document.execCommand('copy'); done();
-        });
+        navigator.clipboard.writeText(text).then(done, fallback);
     } else {
-        input.select(); document.execCommand('copy'); done();
+        fallback();
     }
 });
 "#;
@@ -2564,10 +2616,6 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                         "Revokes all of " (name) "'s active sessions. Their "
                         "credentials stay in place so reactivation later "
                         "doesn't need a password reset."
-                    }
-                    p class="dialog-note dialog-center-text" {
-                        "If the target is an Owner, a 72-hour veto window begins "
-                        "instead of applying immediately."
                     }
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
