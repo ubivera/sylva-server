@@ -81,6 +81,23 @@ fn location(resp: &axum::response::Response) -> String {
         .to_string()
 }
 
+/// Parse the `HX-Trigger` response header into the toast payload it
+/// carries (under the `hearth-toast` key). Returns `None` when the
+/// header isn't present or the payload isn't shaped as expected.
+fn hx_trigger_toast(resp: &axum::response::Response) -> Option<serde_json::Value> {
+    let raw = resp.headers().get("hx-trigger")?.to_str().ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    parsed.get("hearth-toast").cloned()
+}
+
+fn hx_redirect(resp: &axum::response::Response) -> String {
+    resp.headers()
+        .get("hx-redirect")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // CSRF
 // ────────────────────────────────────────────────────────────────────────
@@ -166,7 +183,10 @@ async fn regular_user_cannot_invoke_row_actions() {
 // ────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn admin_deactivates_user_redirects_with_banner_params() {
+async fn admin_deactivates_user_redirects_to_clean_members_url() {
+    // Non-HTMX path: 303 to a clean /members. Toast detail used to ride
+    // in the query string; it now travels via HX-Trigger on the HTMX
+    // path only (see admin_deactivates_user_htmx_emits_info_toast).
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -184,9 +204,7 @@ async fn admin_deactivates_user_redirects_with_banner_params() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let loc = location(&resp);
-    assert!(loc.starts_with("/members?action=deactivated"), "got {loc}");
-    assert!(loc.contains("target=Alice"), "got {loc}");
+    assert_eq!(location(&resp), "/members");
 
     // Confirm DB-side state changed.
     let lifecycle: String = sqlx::query_scalar(
@@ -224,7 +242,7 @@ async fn admin_reactivates_deactivated_user() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/members?action=reactivated"));
+    assert_eq!(location(&resp), "/members");
 }
 
 #[tokio::test]
@@ -246,7 +264,7 @@ async fn admin_deletes_user() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/members?action=deleted"));
+    assert_eq!(location(&resp), "/members");
 
     let lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle::text FROM identity.users WHERE id = $1",
@@ -277,7 +295,7 @@ async fn admin_purges_user() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/members?action=purged"));
+    assert_eq!(location(&resp), "/members");
 }
 
 #[tokio::test]
@@ -302,7 +320,7 @@ async fn owner_changes_user_role() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).starts_with("/members?action=role_changed"));
+    assert_eq!(location(&resp), "/members");
 
     let role: String = sqlx::query_scalar(
         "SELECT instance_role::text FROM identity.users WHERE id = $1",
@@ -337,7 +355,7 @@ async fn admin_cannot_change_role() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).contains("error=forbidden"));
+    assert_eq!(location(&resp), "/members");
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -364,7 +382,7 @@ async fn deactivate_with_wrong_password_redirects_with_banner() {
     .await;
     // Non-HTMX path → redirect to /members?error=invalid_password.
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).contains("error=invalid_password"));
+    assert_eq!(location(&resp), "/members");
 
     // DB-side: target still active (action didn't fire).
     let lifecycle: String = sqlx::query_scalar(
@@ -445,18 +463,13 @@ async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    // HTMX-success path: 200 OK + HX-Redirect tells the client to
-    // navigate. Body is intentionally empty.
+    // HTMX-success path: 200 OK + HX-Redirect (clean URL) + HX-Trigger
+    // carrying the toast payload that the client renders post-redirect.
     assert_eq!(resp.status(), StatusCode::OK);
-    let hx_redirect = resp
-        .headers()
-        .get("hx-redirect")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        hx_redirect.starts_with("/members?action=deleted"),
-        "expected HX-Redirect to deleted banner, got {hx_redirect:?}"
-    );
+    assert_eq!(hx_redirect(&resp), "/members");
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "error");
+    assert_eq!(toast["title"], "Account deleted");
 
     // DB-side: soft-deleted.
     let lifecycle: String = sqlx::query_scalar(
@@ -492,7 +505,7 @@ async fn admin_cannot_target_owner() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).contains("error=cannot_target_peer_or_higher"));
+    assert_eq!(location(&resp), "/members");
 }
 
 #[tokio::test]
@@ -512,7 +525,7 @@ async fn cannot_target_self() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(location(&resp).contains("error=cannot_target_self"));
+    assert_eq!(location(&resp), "/members");
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -538,7 +551,7 @@ async fn owner_on_owner_deactivate_routes_to_pending() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&resp), "/members?action=pending_deactivate");
+    assert_eq!(location(&resp), "/members");
 
     // Confirm target is still Active and a pending row exists.
     let lifecycle: String = sqlx::query_scalar(
@@ -673,49 +686,150 @@ async fn kebab_shown_for_owner_viewing_other_owner() {
 }
 
 #[tokio::test]
-async fn success_banner_renders_from_query_params() {
+async fn htmx_deactivate_emits_info_toast_via_hx_trigger() {
+    // Toast now ships via HX-Trigger on the HTMX response, not
+    // embedded in the page body via query params. Kind is `info`
+    // because deactivate is reversible.
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
-    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let target = app
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
 
     let req = axum::http::Request::builder()
-        .method(Method::GET)
-        .uri("/members?action=deactivated&target=Alice")
+        .method(Method::POST)
+        .uri(format!("/members/{}/deactivate", target.id.0))
         .header(header::COOKIE, cookie)
-        .body(axum::body::Body::empty())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password={}",
+            urlencoding(&csrf),
+            ADMIN_PW
+        )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = String::from_utf8_lossy(&body_bytes);
-
-    assert!(body.contains("banner-success"));
-    assert!(body.contains("Alice has been deactivated"));
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hx_redirect(&resp), "/members");
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "info");
+    assert_eq!(toast["title"], "Deactivated");
+    assert!(
+        toast["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Alice"),
+        "toast message should mention the target name: {toast:?}"
+    );
 }
 
 #[tokio::test]
-async fn error_banner_renders_from_query_params() {
+async fn htmx_reactivate_emits_success_toast() {
+    // Positive outcomes carry the green success palette.
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
-    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
-
-    let req = axum::http::Request::builder()
-        .method(Method::GET)
-        .uri("/members?error=cannot_target_peer_or_higher")
-        .header(header::COOKIE, cookie)
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let target = app
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    // Reactivate requires the user to already be deactivated.
+    sqlx::query("UPDATE identity.users SET lifecycle = 'deactivated' WHERE id = $1")
+        .bind(target.id.0)
+        .execute(&app.pool)
         .await
         .unwrap();
-    let body = String::from_utf8_lossy(&body_bytes);
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
 
-    assert!(body.contains("banner-error"));
-    assert!(body.contains("peer or higher"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/members/{}/reactivate", target.id.0))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password={}",
+            urlencoding(&csrf),
+            ADMIN_PW
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "success");
+    assert_eq!(toast["title"], "Reactivated");
+}
+
+#[tokio::test]
+async fn htmx_delete_emits_error_toast() {
+    // Irreversible outcomes carry the red error palette so the
+    // operator's eye registers the weight of what just landed.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let target = app
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/members/{}/delete", target.id.0))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password={}",
+            urlencoding(&csrf),
+            ADMIN_PW
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "error");
+    assert_eq!(toast["title"], "Account deleted");
+}
+
+#[tokio::test]
+async fn htmx_failed_action_emits_error_toast() {
+    // Failure paths still ship a toast via HX-Trigger. Admin trying
+    // to target an Owner trips `cannot_target_peer_or_higher`; the
+    // resulting redirect carries an `error`-kind toast with the
+    // shared catalog message.
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("owner@test.local", "Owner", "ownerpw", InstanceRole::Owner)
+        .await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/members/{}/deactivate", owner.id.0))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password={}",
+            urlencoding(&csrf),
+            ADMIN_PW
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "error");
+    assert!(
+        toast["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("peer or higher"),
+        "toast message should mention 'peer or higher': {toast:?}"
+    );
 }
 
 #[tokio::test]
@@ -1197,6 +1311,111 @@ async fn invite_submit_htmx_error_returns_form_partial_with_banner() {
 }
 
 #[tokio::test]
+async fn toast_listener_extracts_clean_payload_not_raw_detail() {
+    // Regression guard. HTMX's event dispatcher mutates `event.detail`
+    // to add an `elt` field pointing at the source DOM element. Naively
+    // serializing the whole detail to sessionStorage throws a
+    // TypeError (DOM nodes aren't JSON-serializable) and the silent
+    // catch leaves the queue empty — symptom: toasts silently never
+    // appear after redirect. The fix is extracting just the three
+    // payload fields explicitly; this test pins that shape.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    // The listener must whitelist kind/title/message and avoid touching
+    // e.detail.elt (which HTMX injects and which can't be JSON-stringified).
+    assert!(
+        body.contains("kind: src.kind"),
+        "TOAST_JS must extract kind explicitly, not pass through raw detail"
+    );
+    assert!(
+        body.contains("title: src.title"),
+        "TOAST_JS must extract title explicitly"
+    );
+    assert!(
+        body.contains("message: src.message"),
+        "TOAST_JS must extract message explicitly"
+    );
+}
+
+#[tokio::test]
+async fn assets_carry_cache_busting_version_query() {
+    // Browsers cache `app.css` aggressively; without a ?v= suffix the
+    // operator has to hard-refresh to see CSS edits across rebuilds.
+    // The version is a process-startup timestamp so it changes once
+    // per restart — every code edit forces a rebuild + restart so the
+    // browser sees a new URL on every meaningful change.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("/assets/css/app.css?v="),
+        "stylesheet link must include a cache-bust query string"
+    );
+    assert!(
+        body.contains("/assets/vendor/htmx.min.js?v="),
+        "htmx script must include a cache-bust query string"
+    );
+}
+
+#[tokio::test]
+async fn shared_modals_live_inside_templates_not_live_dom() {
+    // dlg-invite and dlg-reauth are wrapped in <template> elements so
+    // they don't contribute to initial DOM layout. DIALOG_JS clones
+    // them into the body on first use via hearthMaterializeDialog.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains(r#"template id="tpl-dlg-invite""#),
+        "dlg-invite must be wrapped in a <template>"
+    );
+    assert!(
+        body.contains(r#"template id="tpl-dlg-reauth""#),
+        "dlg-reauth must be wrapped in a <template>"
+    );
+    assert!(
+        body.contains("hearthMaterializeDialog"),
+        "DIALOG_JS must expose the materializer helper"
+    );
+}
+
+#[tokio::test]
+async fn members_page_includes_submit_interceptor_for_chained_forms() {
+    // Regression guard: REAUTH_CHAIN_JS must catch native form
+    // submission (Enter in a text input) and route through the chain
+    // button instead. Without this, pressing Enter in the invite
+    // modal's email field — or in the Delete/Purge type-to-confirm
+    // field — submits the form directly to its action URL, missing
+    // the `password` field that the LifecycleActionForm/InviteForm
+    // deserializer requires, surfacing as a raw 422 error page.
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("addEventListener('submit'"),
+        "REAUTH_CHAIN_JS must wire a submit-event listener to catch \
+         Enter-key implicit form submission on chained forms"
+    );
+}
+
+#[tokio::test]
 async fn members_page_renders_invite_cta_and_modal() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
@@ -1298,15 +1517,10 @@ async fn revoke_invite_with_correct_password_htmx_responds_with_hx_redirect() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let hx_redirect = resp
-        .headers()
-        .get("hx-redirect")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        hx_redirect.starts_with("/members?action=invite_revoked"),
-        "expected HX-Redirect to invite_revoked banner, got {hx_redirect:?}"
-    );
+    assert_eq!(hx_redirect(&resp), "/members");
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "info");
+    assert_eq!(toast["title"], "Invitation revoked");
 
     // DB-side: invitation now has a revoked_at timestamp.
     let revoked_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
@@ -1320,6 +1534,238 @@ async fn revoke_invite_with_correct_password_htmx_responds_with_hx_redirect() {
         revoked_at.is_some(),
         "invitation should be marked revoked after a correct password"
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Reissue invitation — kebab action on pending invite rows (CP4)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Pull the (token_hash, expires_at) pair for an invitation so tests
+/// can assert the reissue actually rotated + extended the row.
+async fn invitation_state(
+    app: &TestApp,
+    invitation_id: uuid::Uuid,
+) -> (Vec<u8>, chrono::DateTime<chrono::Utc>) {
+    sqlx::query_as::<_, (Vec<u8>, chrono::DateTime<chrono::Utc>)>(
+        "SELECT token_hash, expires_at FROM identity.invitations WHERE id = $1",
+    )
+    .bind(invitation_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reissue_rotates_token_extends_expiry_and_invalidates_old_url() {
+    // Seed a pending invite, then reissue it. Assert:
+    //   - token_hash changed (old URL is dead)
+    //   - expires_at extended to roughly now + TTL
+    //   - GET on the old URL is 404, but a fresh one would work
+    //     (we don't have the new raw token from this code path, so we
+    //     just verify the old hash truly changed and old URL fails)
+    let app = TestApp::new().await;
+    let old_token = seed_pending_invite(&app, "to-reissue@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (old_hash, old_expires) = invitation_state(&app, invitation_id).await;
+
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    // Response renders the new URL on the result page (no redirect).
+    assert!(body.contains("Invitation reissued") || body.contains("Invitation sent"));
+    assert!(body.contains("/invite/"));
+
+    // DB: hash rotated, expiry extended.
+    let (new_hash, new_expires) = invitation_state(&app, invitation_id).await;
+    assert_ne!(old_hash, new_hash, "token_hash should rotate");
+    assert!(
+        new_expires > old_expires,
+        "new expires_at should be later: old={old_expires} new={new_expires}"
+    );
+
+    // The old URL must no longer work.
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/invite/{old_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "old invitation URL must stop working after reissue"
+    );
+}
+
+#[tokio::test]
+async fn reissue_writes_audit_event_and_enqueues_notification() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "audit-me@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    // Outbox should have exactly 1 row right now — the original invite.
+    let outbox_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notifications.outbox")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(outbox_before, 1);
+
+    post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit.events \
+         WHERE event_type = 'invitation_reissued' \
+           AND (event_data->>'invitation_id')::uuid = $1",
+    )
+    .bind(invitation_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1, "expected one invitation_reissued audit event");
+
+    let outbox_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notifications.outbox")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outbox_after, 2,
+        "reissue should enqueue a fresh invitation notification"
+    );
+}
+
+#[tokio::test]
+async fn reissue_with_wrong_password_htmx_returns_modal_with_error() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "wrong-pw@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+    let (old_hash, _) = invitation_state(&app, invitation_id).await;
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/members/invitations/{invitation_id}/reissue"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("HX-Request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password=wrong",
+            urlencoding(&csrf)
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+    assert!(!body.contains("<!DOCTYPE html>"));
+    assert!(body.contains("Incorrect password"));
+    let expected_action =
+        format!(r#"action="/members/invitations/{invitation_id}/reissue""#);
+    assert!(body.contains(&expected_action));
+
+    // DB: nothing changed.
+    let (new_hash, _) = invitation_state(&app, invitation_id).await;
+    assert_eq!(old_hash, new_hash, "token must not rotate on wrong password");
+}
+
+#[tokio::test]
+async fn reissue_rejected_for_already_accepted_invite() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "accepted@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+
+    // Accept the invite so its state is "accepted".
+    let body = format!(
+        "display_name={}&password={}",
+        urlencoding("Acceptor"),
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+
+    // Now try to reissue.
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(loc, "/members");
+}
+
+#[tokio::test]
+async fn reissue_forbidden_for_member() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "victim@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    app.seed_user("m@test.local", "M", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, "m@test.local", "pw").await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/invitations/{invitation_id}/reissue"),
+        &cookie,
+        format!("csrf_token={}&password=pw", urlencoding(&csrf)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pending_invite_row_renders_reissue_dialog_with_csrf() {
+    let app = TestApp::new().await;
+    let _ = seed_pending_invite(&app, "renders@test.local").await;
+    let invitation_id = latest_invitation_id(&app).await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    let dialog_id = format!(r#"data-open-dialog="dlg-reissue-invite-{invitation_id}""#);
+    assert!(
+        body.contains(&dialog_id),
+        "kebab should open reissue dialog: {body}"
+    );
+    let dlg = format!(r#"id="dlg-reissue-invite-{invitation_id}""#);
+    assert!(body.contains(&dlg));
+    let chain = format!(r#"data-reauth-confirm="form-reissue-invite-{invitation_id}""#);
+    assert!(body.contains(&chain));
+    let action = format!(r#"action="/members/invitations/{invitation_id}/reissue""#);
+    assert!(body.contains(&action));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1427,28 +1873,40 @@ async fn pending_page_renders_active_row_for_owner_with_veto_dialog() {
 }
 
 #[tokio::test]
-async fn pending_page_sidebar_renders_count_badge_for_owner() {
+async fn members_sidebar_renders_count_badge_for_owner_with_pendings() {
+    // The pending-action count badge now lives on the Members nav
+    // entry (the dedicated Pending review link was retired in favour
+    // of the in-page alert card). Badge only renders when count > 0
+    // and the viewer is an Owner.
     let app = TestApp::new().await;
     let (cookie, _target, _transition_id, _csrf) =
         seed_pending_owner_deactivate(&app).await;
 
-    let resp = get(&app, "/pending", &cookie).await;
+    let resp = get(&app, "/members", &cookie).await;
     let body = body_text(resp).await;
-    // Sidebar badge renders inside the Pending review nav entry.
     assert!(
         body.contains(r#"class="nav-link-badge""#),
         "count badge missing for Owner with active pending: {body}"
     );
-    // Active count is 1 — assert the literal lands inside the badge.
     assert!(
         body.contains(">1</span>"),
         "expected '1' inside the badge"
     );
+    // The dedicated Pending review nav entry no longer exists — the
+    // sidebar should not carry a nav-link pointing at /pending. (The
+    // /pending page itself still exists, reachable via the alert
+    // CTA's btn — that's not a `.nav-link`.)
+    assert!(
+        !body.contains(r#"<a class="nav-link" href="/pending">"#)
+        && !body.contains(r#"<a class="nav-link active" href="/pending">"#),
+        "Pending review nav entry should be removed from the sidebar"
+    );
 }
 
 #[tokio::test]
-async fn members_page_sidebar_hides_pending_entry_for_admin() {
-    // Admins never see the "Pending review" link — they can't veto.
+async fn members_sidebar_hides_badge_for_admin() {
+    // Admins can't veto, so the count badge stays hidden even when
+    // there's something pending. The label stays the plain "Members".
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -1457,7 +1915,95 @@ async fn members_page_sidebar_hides_pending_entry_for_admin() {
     let resp = get(&app, "/members", &cookie).await;
     let body = body_text(resp).await;
     assert!(!body.contains("Pending review"));
-    assert!(!body.contains(r#"href="/pending""#));
+    assert!(!body.contains(r#"class="nav-link-badge""#));
+}
+
+#[tokio::test]
+async fn members_page_renders_pending_alert_for_owner_with_pendings() {
+    // Replaces the dedicated /pending sidebar link: when at least
+    // one Owner-on-Owner pending transition is in flight, /members
+    // renders a primary-tinted alert card between the page header
+    // and the toolbar with a Review CTA linking to /pending.
+    let app = TestApp::new().await;
+    let (cookie, _target, _transition_id, _csrf) =
+        seed_pending_owner_deactivate(&app).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains(r#"class="alert-card alert-card-primary""#),
+        "pending-actions alert card missing: {body}"
+    );
+    assert!(
+        body.contains("1 pending action awaiting review"),
+        "expected singular title for count=1"
+    );
+    // CTA links to /pending.
+    assert!(body.contains(r#"href="/pending""#));
+}
+
+#[tokio::test]
+async fn members_page_alert_pluralizes_title_for_multiple_pendings() {
+    // Seed two Owner-on-Owner pendings so the alert title flips to
+    // the plural form. The seed helper already gives us one (Owner
+    // One → Owner Two); we add a third Owner and queue Owner One →
+    // Owner Three for the second pending against a fresh target.
+    let app = TestApp::new().await;
+    let (cookie, _target, _transition_id, _csrf) =
+        seed_pending_owner_deactivate(&app).await;
+    let owner3 = app
+        .seed_user("o3@test.local", "Owner Three", "pw", InstanceRole::Owner)
+        .await;
+    // Use the SAME initiator session that already seeded the first
+    // pending, so the CSRF token + cookie match. The seed helper
+    // already logged O1 in; just re-grab the session id from the
+    // existing cookie + ask the app for the matching csrf.
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+    let resp = post_form(
+        &app,
+        &format!("/members/{}/deactivate", owner3.id.0),
+        &cookie,
+        format!("csrf_token={}&password=pw", urlencoding(&csrf)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "second deactivate should queue, not fail");
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("2 pending actions awaiting review"),
+        "expected plural title for count=2"
+    );
+}
+
+#[tokio::test]
+async fn members_page_alert_hidden_when_no_pendings() {
+    // Empty queue → no alert card. Keeps the page clean for the
+    // common case.
+    let app = TestApp::new().await;
+    app.seed_user("o@test.local", "O", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, "o@test.local", "pw").await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(!body.contains("alert-card-primary"));
+}
+
+#[tokio::test]
+async fn members_page_alert_hidden_for_admin_even_with_pendings() {
+    // Admins can't veto; they shouldn't see the alert at all even
+    // when Owner-on-Owner actions are pending.
+    let app = TestApp::new().await;
+    let _ = seed_pending_owner_deactivate(&app).await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(!body.contains("alert-card-primary"));
 }
 
 #[tokio::test]
@@ -1518,15 +2064,10 @@ async fn pending_veto_with_correct_password_htmx_responds_with_hx_redirect() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let hx_redirect = resp
-        .headers()
-        .get("hx-redirect")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        hx_redirect.starts_with("/pending?action=vetoed"),
-        "expected HX-Redirect to vetoed banner, got {hx_redirect:?}"
-    );
+    assert_eq!(hx_redirect(&resp), "/pending");
+    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    assert_eq!(toast["kind"], "success");
+    assert_eq!(toast["title"], "Action vetoed");
 
     // DB-side: transition resolved as vetoed.
     let (state, resolution): (String, Option<String>) = sqlx::query_as(

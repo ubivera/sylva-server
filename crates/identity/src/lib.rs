@@ -664,6 +664,80 @@ impl InvitationRepository {
         .await?;
         Ok(())
     }
+
+    /// Rotate the token on a pending invitation and extend its expiry
+    /// to `now() + DEFAULT_INVITATION_TTL`. Returns the post-update row
+    /// and the new raw token (which is what the operator needs to
+    /// share with the invitee — only its SHA-256 is persisted).
+    ///
+    /// "Pending" here means non-accepted, non-revoked, non-expired —
+    /// the same conditions [`list_pending`] filters on. Callers that
+    /// need to disambiguate why a reissue refused should use the
+    /// returned [`ReissueRejection`] to render a specific error
+    /// (rather than treating everything as a generic 404).
+    ///
+    /// The old token's hash is overwritten in the same UPDATE, so any
+    /// previously-shared link stops working as soon as this returns.
+    /// That's the whole point: reissue is the operator saying "the
+    /// link in flight is no good, here's a fresh one."
+    pub async fn reissue(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invitation_id: InvitationId,
+    ) -> Result<std::result::Result<(Invitation, String), ReissueRejection>> {
+        let new_token = generate_invite_token();
+        let new_hash = hash_invite_token(&new_token);
+        let new_expires_at = Utc::now() + DEFAULT_INVITATION_TTL;
+
+        let updated: Option<Invitation> = sqlx::query_as(
+            "UPDATE identity.invitations
+             SET token_hash = $2, expires_at = $3
+             WHERE id = $1
+               AND accepted_at IS NULL
+               AND revoked_at IS NULL
+               AND expires_at > now()
+             RETURNING id, email, invited_by_user_id, instance_role,
+                       created_at, expires_at, accepted_at, accepted_user_id, revoked_at",
+        )
+        .bind(invitation_id)
+        .bind(&new_hash[..])
+        .bind(new_expires_at)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some(row) = updated {
+            return Ok(Ok((row, new_token)));
+        }
+
+        // Update affected zero rows. Look up the row to figure out why
+        // so the caller can produce a specific error code.
+        let snapshot: Option<Invitation> = sqlx::query_as(
+            "SELECT id, email, invited_by_user_id, instance_role,
+                    created_at, expires_at, accepted_at, accepted_user_id, revoked_at
+             FROM identity.invitations WHERE id = $1",
+        )
+        .bind(invitation_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let rejection = match snapshot {
+            None => ReissueRejection::NotFound,
+            Some(row) if row.accepted_at.is_some() => ReissueRejection::AlreadyAccepted,
+            Some(row) if row.revoked_at.is_some() => ReissueRejection::AlreadyRevoked,
+            Some(_) => ReissueRejection::Expired,
+        };
+        Ok(Err(rejection))
+    }
+}
+
+/// Why a reissue refused. Mirrors the JSON error codes the JSON admin
+/// API surface uses for these cases so the web layer can map straight
+/// across to existing banner copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReissueRejection {
+    NotFound,
+    AlreadyAccepted,
+    AlreadyRevoked,
+    Expired,
 }
 
 #[cfg(test)]

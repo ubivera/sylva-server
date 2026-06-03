@@ -1083,6 +1083,114 @@ pub async fn perform_revoke_invite(
     result.map_err(RevokeInviteError::Internal)
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ReissueInviteError {
+    #[error("invite_not_found")]
+    NotFound,
+    #[error("invite_already_accepted")]
+    AlreadyAccepted,
+    #[error("invite_already_revoked")]
+    AlreadyRevoked,
+    #[error("invite_expired")]
+    Expired,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+/// Rotate the token on a pending invitation and produce a fresh
+/// acceptance URL. Same write-shape as `perform_create_invite` from
+/// the audit + notification angle: writes one `invitation_reissued`
+/// audit event, enqueues one `Invitation` notification (which the
+/// notifications worker fires only when delivery is configured), and
+/// returns the new raw token in the in-memory outcome.
+///
+/// The old URL stops working the instant this commits — there's
+/// nothing to "undo." Operator-side reauth (already enforced at the
+/// route layer) is the gate, and the reissue confirmation dialog
+/// spells out the implication.
+///
+/// Uses [`CreateInviteOutcome`] for the return type so the view layer
+/// can render with the same `invite_modal_content_success` helper as
+/// the post-create result — single canonical "here is the URL once"
+/// chrome.
+pub async fn perform_reissue_invite(
+    state: &AppState,
+    admin: &AdminUser,
+    invitation_id: identity::InvitationId,
+) -> Result<CreateInviteOutcome, ReissueInviteError> {
+    let actor = admin.actor();
+    let inviter_display_name = admin.0.user.display_name.clone();
+    let base = state.public_base_url.clone();
+
+    let result: anyhow::Result<std::result::Result<CreateInviteOutcome, ReissueInviteError>> =
+        async {
+            let mut tx = state.db.begin().await?;
+            let outcome = match InvitationRepository::reissue(&mut tx, invitation_id).await? {
+                Ok(pair) => pair,
+                Err(rej) => {
+                    let err = match rej {
+                        identity::ReissueRejection::NotFound => ReissueInviteError::NotFound,
+                        identity::ReissueRejection::AlreadyAccepted => {
+                            ReissueInviteError::AlreadyAccepted
+                        }
+                        identity::ReissueRejection::AlreadyRevoked => {
+                            ReissueInviteError::AlreadyRevoked
+                        }
+                        identity::ReissueRejection::Expired => ReissueInviteError::Expired,
+                    };
+                    // Drop the tx without committing — no writes have
+                    // landed on the rejection path.
+                    return Ok(Err(err));
+                }
+            };
+            let (invitation, raw_token) = outcome;
+
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "invitation_reissued",
+                serde_json::json!({
+                    "invitation_id": invitation.id.0,
+                    "invited_email": invitation.email,
+                    "instance_role": invitation.instance_role,
+                    "new_expires_at": invitation.expires_at,
+                }),
+            )
+            .await?;
+
+            // Same enqueue as create. The notifications worker no-ops
+            // delivery when transport isn't configured, so this is the
+            // right thing to do whether the instance has email or not
+            // — when it does, the invitee gets the fresh URL by email
+            // too. When it doesn't, the operator simply hands off the
+            // URL out of band as before.
+            let full_accept_url = format!("{base}/invite/{raw_token}");
+            notifications::enqueue(
+                &mut tx,
+                notifications::Notification::Invitation {
+                    recipient_email: invitation.email.clone(),
+                    inviter_display_name: inviter_display_name.clone(),
+                    accept_url: full_accept_url,
+                    expires_at: invitation.expires_at,
+                    instance_role: invitation.instance_role,
+                    invitation_id: invitation.id.0,
+                },
+            )
+            .await?;
+
+            tx.commit().await?;
+            Ok(Ok(CreateInviteOutcome { invitation, raw_token }))
+        }
+        .await;
+
+    match result {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(rej)) => Err(rej),
+        Err(e) => Err(ReissueInviteError::Internal(e)),
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Pending-transition resolution (veto / cancel)
 // ────────────────────────────────────────────────────────────────────────
