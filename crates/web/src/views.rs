@@ -601,16 +601,17 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
             nav class="nav-links" {
                 (nav_link("/me", "Profile", current == PageId::Profile))
                 @if is_admin {
-                    (nav_link("/members", "Members", current == PageId::Members))
-                }
-                // Owner-only: 72-hour pending Owner-on-Owner action
-                // queue. Admins never see this nav entry — they can't
-                // veto and there's no Admin-on-X content here today.
-                @if is_owner(ctx.user.instance_role) {
+                    // Members carries the pending-action count badge
+                    // for Owner viewers — the dedicated `/pending` nav
+                    // entry was retired in favour of an alert card on
+                    // the Members page itself (so the queue is
+                    // discovered alongside the directory it's about).
+                    // For Admin viewers the badge is None and the
+                    // helper renders just the plain label.
                     (nav_link_with_badge(
-                        "/pending",
-                        "Pending review",
-                        current == PageId::Pending,
+                        "/members",
+                        "Members",
+                        current == PageId::Members,
                         ctx.pending_count,
                     ))
                 }
@@ -1242,6 +1243,58 @@ fn close_icon() -> Markup {
     }
 }
 
+/// 22px circle-with-lowercase-i icon used as the leading glyph on
+/// the pending-actions alert card. Same outline weight as
+/// `alert_circle_icon` but with an "i" body, matching the toast
+/// info palette so the alert reads as part of the same family.
+fn info_circle_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="10" {}
+            line x1="12" y1="11" x2="12" y2="16" {}
+            line x1="12" y1="7.5" x2="12" y2="7.5" {}
+        }
+    }
+}
+
+/// Card-style alert rendered between the /members h1 and the
+/// toolbar when at least one Owner-on-Owner pending transition is in
+/// flight. Replaces the dedicated `/pending` sidebar item — the
+/// pattern follows the Untitled UI feature-callout shape (icon puck
+/// on left, title + description in the middle, CTA on the right).
+///
+/// Counts pluralize naturally — "1 pending action" vs "3 pending
+/// actions". Caller is responsible for only calling this when
+/// `count > 0`; we render unconditionally so the visible state is
+/// data-driven from the call site.
+fn pending_alert_card(count: u32) -> Markup {
+    let title = if count == 1 {
+        "1 pending action awaiting review".to_string()
+    } else {
+        format!("{count} pending actions awaiting review")
+    };
+    html! {
+        section class="alert-card alert-card-primary" role="status" {
+            div class="alert-card-icon" { (info_circle_icon()) }
+            div class="alert-card-body" {
+                div class="alert-card-title" { (title) }
+                div class="alert-card-message" {
+                    "Owner-initiated changes wait 72 hours so any Owner can "
+                    "veto before they apply. Review now to act before the "
+                    "window expires."
+                }
+            }
+            div class="alert-card-actions" {
+                a class="btn" href="/pending" { "Review" }
+            }
+        }
+    }
+}
+
 /// 16px circle-with-exclamation icon used as the leading glyph on
 /// `.dialog-alert` strips. Sized smaller than the dialog feature
 /// icons because it sits inline with body copy, not as a focal
@@ -1441,6 +1494,19 @@ pub fn members_page(
 ) -> Markup {
     let content = html! {
         (render_banner(&banner))
+        // Pending-actions alert. Renders for Owner viewers when at
+        // least one Owner-on-Owner action is in flight; sits between
+        // the page header and the toolbar so it's the first thing the
+        // operator sees on entering the directory. Replaces the
+        // dedicated "Pending review" sidebar item (the count badge on
+        // the Members link still flags the queue at a glance; this
+        // alert provides the call-to-action).
+        @if is_owner(ctx.user.instance_role)
+            && let Some(n) = ctx.pending_count
+            && n > 0
+        {
+            (pending_alert_card(n))
+        }
         div class="users-toolbar" {
             input type="search" id="users-search" class="users-search"
                   placeholder="Search by name or email…" autocomplete="off"

@@ -1873,28 +1873,40 @@ async fn pending_page_renders_active_row_for_owner_with_veto_dialog() {
 }
 
 #[tokio::test]
-async fn pending_page_sidebar_renders_count_badge_for_owner() {
+async fn members_sidebar_renders_count_badge_for_owner_with_pendings() {
+    // The pending-action count badge now lives on the Members nav
+    // entry (the dedicated Pending review link was retired in favour
+    // of the in-page alert card). Badge only renders when count > 0
+    // and the viewer is an Owner.
     let app = TestApp::new().await;
     let (cookie, _target, _transition_id, _csrf) =
         seed_pending_owner_deactivate(&app).await;
 
-    let resp = get(&app, "/pending", &cookie).await;
+    let resp = get(&app, "/members", &cookie).await;
     let body = body_text(resp).await;
-    // Sidebar badge renders inside the Pending review nav entry.
     assert!(
         body.contains(r#"class="nav-link-badge""#),
         "count badge missing for Owner with active pending: {body}"
     );
-    // Active count is 1 — assert the literal lands inside the badge.
     assert!(
         body.contains(">1</span>"),
         "expected '1' inside the badge"
     );
+    // The dedicated Pending review nav entry no longer exists — the
+    // sidebar should not carry a nav-link pointing at /pending. (The
+    // /pending page itself still exists, reachable via the alert
+    // CTA's btn — that's not a `.nav-link`.)
+    assert!(
+        !body.contains(r#"<a class="nav-link" href="/pending">"#)
+        && !body.contains(r#"<a class="nav-link active" href="/pending">"#),
+        "Pending review nav entry should be removed from the sidebar"
+    );
 }
 
 #[tokio::test]
-async fn members_page_sidebar_hides_pending_entry_for_admin() {
-    // Admins never see the "Pending review" link — they can't veto.
+async fn members_sidebar_hides_badge_for_admin() {
+    // Admins can't veto, so the count badge stays hidden even when
+    // there's something pending. The label stays the plain "Members".
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -1903,7 +1915,95 @@ async fn members_page_sidebar_hides_pending_entry_for_admin() {
     let resp = get(&app, "/members", &cookie).await;
     let body = body_text(resp).await;
     assert!(!body.contains("Pending review"));
-    assert!(!body.contains(r#"href="/pending""#));
+    assert!(!body.contains(r#"class="nav-link-badge""#));
+}
+
+#[tokio::test]
+async fn members_page_renders_pending_alert_for_owner_with_pendings() {
+    // Replaces the dedicated /pending sidebar link: when at least
+    // one Owner-on-Owner pending transition is in flight, /members
+    // renders a primary-tinted alert card between the page header
+    // and the toolbar with a Review CTA linking to /pending.
+    let app = TestApp::new().await;
+    let (cookie, _target, _transition_id, _csrf) =
+        seed_pending_owner_deactivate(&app).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains(r#"class="alert-card alert-card-primary""#),
+        "pending-actions alert card missing: {body}"
+    );
+    assert!(
+        body.contains("1 pending action awaiting review"),
+        "expected singular title for count=1"
+    );
+    // CTA links to /pending.
+    assert!(body.contains(r#"href="/pending""#));
+}
+
+#[tokio::test]
+async fn members_page_alert_pluralizes_title_for_multiple_pendings() {
+    // Seed two Owner-on-Owner pendings so the alert title flips to
+    // the plural form. The seed helper already gives us one (Owner
+    // One → Owner Two); we add a third Owner and queue Owner One →
+    // Owner Three for the second pending against a fresh target.
+    let app = TestApp::new().await;
+    let (cookie, _target, _transition_id, _csrf) =
+        seed_pending_owner_deactivate(&app).await;
+    let owner3 = app
+        .seed_user("o3@test.local", "Owner Three", "pw", InstanceRole::Owner)
+        .await;
+    // Use the SAME initiator session that already seeded the first
+    // pending, so the CSRF token + cookie match. The seed helper
+    // already logged O1 in; just re-grab the session id from the
+    // existing cookie + ask the app for the matching csrf.
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+    let resp = post_form(
+        &app,
+        &format!("/members/{}/deactivate", owner3.id.0),
+        &cookie,
+        format!("csrf_token={}&password=pw", urlencoding(&csrf)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "second deactivate should queue, not fail");
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("2 pending actions awaiting review"),
+        "expected plural title for count=2"
+    );
+}
+
+#[tokio::test]
+async fn members_page_alert_hidden_when_no_pendings() {
+    // Empty queue → no alert card. Keeps the page clean for the
+    // common case.
+    let app = TestApp::new().await;
+    app.seed_user("o@test.local", "O", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, "o@test.local", "pw").await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(!body.contains("alert-card-primary"));
+}
+
+#[tokio::test]
+async fn members_page_alert_hidden_for_admin_even_with_pendings() {
+    // Admins can't veto; they shouldn't see the alert at all even
+    // when Owner-on-Owner actions are pending.
+    let app = TestApp::new().await;
+    let _ = seed_pending_owner_deactivate(&app).await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(!body.contains("alert-card-primary"));
 }
 
 #[tokio::test]
