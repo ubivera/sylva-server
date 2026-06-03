@@ -30,6 +30,49 @@ pub(crate) fn redirect_or_hx_redirect(url: &str, htmx: bool) -> Response {
     }
 }
 
+/// Attach a `hearth-toast` HX-Trigger event to a response so the
+/// client-side toast system (see `TOAST_JS`) buffers + renders it
+/// across the HX-Redirect navigation that usually accompanies these
+/// handlers. Non-HTMX responses pass through unchanged — the modal
+/// flow requires JS anyway, so a JS-disabled caller wouldn't be
+/// hitting these endpoints in the first place.
+///
+/// HX-Trigger value is `{"hearth-toast": {kind, title, message}}`;
+/// the client parses the JSON and dispatches the event with the
+/// payload as `event.detail`.
+pub(crate) fn with_toast(mut response: Response, toast: Option<views::Toast>) -> Response {
+    let Some(t) = toast else {
+        return response;
+    };
+    let payload = serde_json::json!({ "hearth-toast": t });
+    if let Ok(json) = serde_json::to_string(&payload)
+        && let Ok(v) = axum::http::HeaderValue::from_str(&json)
+    {
+        response.headers_mut().insert("HX-Trigger", v);
+    }
+    response
+}
+
+/// Convenience: build a toast for `action_token` (looked up against
+/// the catalog in [`views::toast_for_action`]) and attach it to the
+/// response. No-ops cleanly when the token isn't recognised.
+pub(crate) fn redirect_with_action_toast(
+    url: &str,
+    htmx: bool,
+    action: &str,
+    target: Option<&str>,
+) -> Response {
+    let toast = views::toast_for_action(action, target);
+    with_toast(redirect_or_hx_redirect(url, htmx), toast)
+}
+
+/// Convenience: build a red error toast from `error_code` (looked up
+/// against [`views::toast_for_error`]) and attach it to the redirect.
+pub(crate) fn redirect_with_error_toast(url: &str, htmx: bool, error_code: &str) -> Response {
+    let toast = Some(views::toast_for_error(error_code));
+    with_toast(redirect_or_hx_redirect(url, htmx), toast)
+}
+
 /// Reauth gate. Verifies the operator's current password against
 /// `auth.credentials`. On `Ok(true)` returns control to the caller.
 /// On `Ok(false)`:
@@ -75,7 +118,12 @@ pub(crate) async fn require_password(
         )
         .into_response())
     } else {
-        Err(Redirect::to("/members?error=invalid_password").into_response())
+        // Non-HTMX wrong-password just bounces to clean /members.
+        // The HTMX modal flow shows an inline error banner inside
+        // the reauth modal; the non-HTMX path can't paint a toast
+        // (sessionStorage write requires JS on the originating page),
+        // so the operator just sees the directory with no feedback.
+        Err(Redirect::to("/members").into_response())
     }
 }
 use hearth::{
@@ -88,10 +136,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    routes::{
-        BrowserAuth, check_csrf_token, error_response, pending_count_for, require_admin,
-        url_encode,
-    },
+    routes::{BrowserAuth, check_csrf_token, error_response, pending_count_for, require_admin},
     views,
 };
 
@@ -163,15 +208,14 @@ pub async fn deactivate_member(
         return resp;
     }
     match admin_logic::perform_deactivate(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
-            &format!(
-                "/members?action=deactivated&target={}",
-                url_encode(&target.display_name)
-            ),
+        Ok(Outcome::Applied { target }) => redirect_with_action_toast(
+            "/members",
             htmx,
+            "deactivated",
+            Some(&target.display_name),
         ),
         Ok(Outcome::Pending(_)) => {
-            redirect_or_hx_redirect("/members?action=pending_deactivate", htmx)
+            redirect_with_action_toast("/members", htmx, "pending_deactivate", None)
         }
         Err(e) => lifecycle_error_to_response(e, htmx),
     }
@@ -203,12 +247,11 @@ pub async fn reactivate_member(
         return resp;
     }
     match admin_logic::perform_reactivate(&state, &admin, target_id).await {
-        Ok(user) => redirect_or_hx_redirect(
-            &format!(
-                "/members?action=reactivated&target={}",
-                url_encode(&user.display_name)
-            ),
+        Ok(user) => redirect_with_action_toast(
+            "/members",
             htmx,
+            "reactivated",
+            Some(&user.display_name),
         ),
         Err(e) => lifecycle_error_to_response(e, htmx),
     }
@@ -238,14 +281,15 @@ pub async fn delete_member(
         return resp;
     }
     match admin_logic::perform_soft_delete(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
-            &format!(
-                "/members?action=deleted&target={}",
-                url_encode(&target.display_name)
-            ),
+        Ok(Outcome::Applied { target }) => redirect_with_action_toast(
+            "/members",
             htmx,
+            "deleted",
+            Some(&target.display_name),
         ),
-        Ok(Outcome::Pending(_)) => redirect_or_hx_redirect("/members?action=pending_delete", htmx),
+        Ok(Outcome::Pending(_)) => {
+            redirect_with_action_toast("/members", htmx, "pending_delete", None)
+        }
         Err(e) => lifecycle_error_to_response(e, htmx),
     }
 }
@@ -273,14 +317,15 @@ pub async fn purge_member(
         return resp;
     }
     match admin_logic::perform_hard_delete(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
-            &format!(
-                "/members?action=purged&target={}",
-                url_encode(&target.display_name)
-            ),
+        Ok(Outcome::Applied { target }) => redirect_with_action_toast(
+            "/members",
             htmx,
+            "purged",
+            Some(&target.display_name),
         ),
-        Ok(Outcome::Pending(_)) => redirect_or_hx_redirect("/members?action=pending_purge", htmx),
+        Ok(Outcome::Pending(_)) => {
+            redirect_with_action_toast("/members", htmx, "pending_purge", None)
+        }
         Err(e) => lifecycle_error_to_response(e, htmx),
     }
 }
@@ -319,15 +364,14 @@ pub async fn change_member_role(
         return resp;
     }
     match admin_logic::perform_change_role(&state, &admin, target_id, form.role, None).await {
-        Ok(Outcome::Applied { target }) => redirect_or_hx_redirect(
-            &format!(
-                "/members?action=role_changed&target={}",
-                url_encode(&target.display_name)
-            ),
+        Ok(Outcome::Applied { target }) => redirect_with_action_toast(
+            "/members",
             htmx,
+            "role_changed",
+            Some(&target.display_name),
         ),
         Ok(Outcome::Pending(_)) => {
-            redirect_or_hx_redirect("/members?action=pending_role_change", htmx)
+            redirect_with_action_toast("/members", htmx, "pending_role_change", None)
         }
         Err(e) => role_error_to_response(e, htmx),
     }
@@ -353,7 +397,7 @@ fn lifecycle_error_to_response(e: LifecycleError, htmx: bool) -> Response {
             );
         }
     };
-    redirect_or_hx_redirect(&format!("/members?error={code}"), htmx)
+    redirect_with_error_toast("/members", htmx, code)
 }
 
 fn role_error_to_response(e: RoleError, htmx: bool) -> Response {
@@ -373,7 +417,7 @@ fn role_error_to_response(e: RoleError, htmx: bool) -> Response {
             );
         }
     };
-    redirect_or_hx_redirect(&format!("/members?error={code}"), htmx)
+    redirect_with_error_toast("/members", htmx, code)
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -634,12 +678,12 @@ pub async fn revoke_invitation(
     }
     let id = InvitationId::new(invitation_id);
     match admin_logic::perform_revoke_invite(&state, &admin, id).await {
-        Ok(()) => redirect_or_hx_redirect("/members?action=invite_revoked", htmx),
+        Ok(()) => redirect_with_action_toast("/members", htmx, "invite_revoked", None),
         Err(RevokeInviteError::NotFound) => {
-            redirect_or_hx_redirect("/members?error=invite_not_found", htmx)
+            redirect_with_error_toast("/members", htmx, "invite_not_found")
         }
         Err(RevokeInviteError::AlreadyAccepted) => {
-            redirect_or_hx_redirect("/members?error=invite_already_accepted", htmx)
+            redirect_with_error_toast("/members", htmx, "invite_already_accepted")
         }
         Err(RevokeInviteError::Internal(err)) => {
             tracing::error!(?err, "revoke invite internal error (web)");
@@ -733,16 +777,16 @@ pub async fn reissue_invitation(
             }
         }
         Err(admin_logic::ReissueInviteError::NotFound) => {
-            redirect_or_hx_redirect("/members?error=invite_not_found", htmx)
+            redirect_with_error_toast("/members", htmx, "invite_not_found")
         }
         Err(admin_logic::ReissueInviteError::AlreadyAccepted) => {
-            redirect_or_hx_redirect("/members?error=invite_already_accepted", htmx)
+            redirect_with_error_toast("/members", htmx, "invite_already_accepted")
         }
         Err(admin_logic::ReissueInviteError::AlreadyRevoked) => {
-            redirect_or_hx_redirect("/members?error=invite_not_found", htmx)
+            redirect_with_error_toast("/members", htmx, "invite_not_found")
         }
         Err(admin_logic::ReissueInviteError::Expired) => {
-            redirect_or_hx_redirect("/members?error=invite_expired", htmx)
+            redirect_with_error_toast("/members", htmx, "invite_expired")
         }
         Err(admin_logic::ReissueInviteError::Internal(err)) => {
             tracing::error!(?err, "reissue invite internal error (web)");

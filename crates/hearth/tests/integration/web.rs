@@ -541,11 +541,9 @@ async fn users_page_sort_default_is_joined_ascending() {
     assert!(admin_pos < alice_pos, "admin should appear before alice");
     assert!(alice_pos < bob_pos, "alice should appear before bob");
 
-    // Joined column header should be marked `aria-sort=ascending`.
-    assert!(
-        body.contains(r#"aria-sort="ascending""#),
-        "expected joined column to be ascending: {body}"
-    );
+    // Joined column was removed from the UI but `created_at` still
+    // drives the default sort, so row order verifies the ordering
+    // logic without needing an `aria-sort` chevron to test against.
 }
 
 #[tokio::test]
@@ -586,9 +584,10 @@ async fn users_page_sort_header_link_flips_direction_on_active_column() {
     // any active filter.
     let (_, body) = get_with_cookie(&app, "/members?sort=name&dir=asc", Some(&cookie)).await;
     assert!(body.contains(r#"href="/members?sort=name&amp;dir=desc&amp;filter=all""#));
-    // Other columns reset to asc when clicked from a different sort.
+    // Other visible sortable column (Type) resets to asc when clicked
+    // from a different sort. The Joined column was removed from the
+    // UI; only Member + Type remain user-facing.
     assert!(body.contains(r#"href="/members?sort=role&amp;dir=asc&amp;filter=all""#));
-    assert!(body.contains(r#"href="/members?sort=joined&amp;dir=asc&amp;filter=all""#));
 }
 
 #[tokio::test]
@@ -607,7 +606,11 @@ async fn users_page_invalid_sort_param_falls_back_to_default() {
     .await;
     assert_eq!(status, StatusCode::OK);
     // Garbage params shouldn't crash; we fall back to joined asc.
-    assert!(body.contains(r#"aria-sort="ascending""#));
+    // The Joined column header is gone from the UI but the sort still
+    // runs server-side — Member column's link should be the asc form
+    // even after the garbage `dir=sideways` is rejected (the unsorted
+    // default puts Member into the asc-clickable state).
+    assert!(body.contains(r#"sort=name&amp;dir=asc"#));
 }
 
 #[tokio::test]

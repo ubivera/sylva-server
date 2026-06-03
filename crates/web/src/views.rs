@@ -1,6 +1,29 @@
 use identity::{InstanceRole, User, UserLifecycle};
 use maud::{DOCTYPE, Markup, html};
 
+/// Cache-bust suffix appended to every static asset URL. Computed
+/// once at process startup so the value is stable for the lifetime
+/// of the running server but changes on each restart — which lines
+/// up with how operators iterate (every CSS / JS / template change
+/// requires `cargo run`, so the rebuilt binary serves a new version).
+///
+/// Without this, browsers cache `app.css` aggressively (per the
+/// default `tower_http::services::ServeDir` headers) and operators
+/// see stale styles until they hard-refresh. The query-string form
+/// is the standard "fingerprint" approach; the file content itself
+/// doesn't need to change for the URL to look new.
+fn asset_version() -> &'static str {
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{secs:x}")
+    })
+}
+
 /// Per-request context for authenticated chrome. Borrowed pointers so
 /// handlers can pass references straight from `AppState` + the
 /// authenticated user without cloning.
@@ -253,8 +276,10 @@ pub fn shell_public(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · Hearth" }
-                link rel="stylesheet" href="/assets/css/app.css";
-                script src="/assets/vendor/htmx.min.js" defer {}
+                link rel="stylesheet"
+                     href=(format!("/assets/css/app.css?v={}", asset_version()));
+                script src=(format!("/assets/vendor/htmx.min.js?v={}", asset_version()))
+                       defer {}
             }
             body class="public" {
                 main class="narrow" {
@@ -317,8 +342,10 @@ fn shell_app_inner(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · " (ctx.instance_name) }
-                link rel="stylesheet" href="/assets/css/app.css";
-                script src="/assets/vendor/htmx.min.js" defer {}
+                link rel="stylesheet"
+                     href=(format!("/assets/css/app.css?v={}", asset_version()));
+                script src=(format!("/assets/vendor/htmx.min.js?v={}", asset_version()))
+                       defer {}
             }
             body class="app" {
                 (sidebar(ctx, current))
@@ -332,17 +359,211 @@ fn shell_app_inner(
                 script {
                     (maud::PreEscaped(DIALOG_JS))
                 }
+                // Toast auto-dismiss + close-button handler. Runs once
+                // per page load and wires up any `.toast` element
+                // present in the page (typically zero or one — emitted
+                // by render_banner / render_pending_banner after a
+                // post-action redirect). No-op on pages without toasts.
+                script {
+                    (maud::PreEscaped(TOAST_JS))
+                }
             }
         }
     }
 }
 
+// Dynamic toast system. No page-level toast markup is server-rendered
+// anymore. Three parts:
+//
+//   1. Server: action handlers attach an `HX-Trigger` header with a
+//      `hearth-toast` event carrying `{kind, title, message}`.
+//   2. Old-page listener: when HTMX fires `hearth-toast`, we push the
+//      payload into sessionStorage so it survives the HX-Redirect
+//      navigation that usually accompanies the trigger.
+//   3. New-page bootstrap: drain anything queued in sessionStorage and
+//      render each toast client-side into a `.toast-container`. The
+//      container is created lazily on first toast, removed when empty.
+//
+// Properties this gives us:
+//   - Reload doesn't re-render an old toast — the queue is consumed.
+//   - Multiple actions in flight naturally stack — each pushes its own
+//     entry; the next page render flushes them all.
+//   - URL stays clean — no `?action=` or `?error=` pollution.
+//   - 15s auto-dismiss for every kind, plus click-the-× to dismiss
+//     immediately.
+const TOAST_JS: &str = r#"
+(function() {
+    var STORAGE_KEY = 'hearth-toasts';
+    var DURATION_MS = 15000;
+    var MAX_AGE_MS = 30000;
+
+    // Inline SVG strings used by the client-side renderer. Kept in
+    // sync with the Maud helpers (check_circle_icon / info_circle_icon
+    // / alert_circle_icon / close_icon) — they're small enough that a
+    // copy here beats fetching them dynamically.
+    var ICONS = {
+        success:
+            '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" ' +
+            'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
+            'aria-hidden="true"><circle cx="12" cy="12" r="10"></circle>' +
+            '<polyline points="8 12 11 15 16 9"></polyline></svg>',
+        info:
+            '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" ' +
+            'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
+            'aria-hidden="true"><circle cx="12" cy="12" r="10"></circle>' +
+            '<line x1="12" y1="11" x2="12" y2="16"></line>' +
+            '<line x1="12" y1="7.5" x2="12" y2="7.5"></line></svg>',
+        error:
+            '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" ' +
+            'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
+            'aria-hidden="true"><circle cx="12" cy="12" r="10"></circle>' +
+            '<line x1="12" y1="8" x2="12" y2="13"></line>' +
+            '<line x1="12" y1="16.5" x2="12" y2="16.5"></line></svg>'
+    };
+    var CLOSE_ICON =
+        '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" ' +
+        'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
+        'aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line>' +
+        '<line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+
+    function ensureContainer() {
+        var c = document.querySelector('.toast-container');
+        if (c) return c;
+        c = document.createElement('div');
+        c.className = 'toast-container';
+        document.body.appendChild(c);
+        return c;
+    }
+
+    function dismissToast(toast) {
+        if (toast.dataset.leaving === '1') return;
+        toast.dataset.leaving = '1';
+        if (toast._dismissTimer) clearTimeout(toast._dismissTimer);
+        toast.classList.add('toast-leaving');
+        setTimeout(function() {
+            var container = toast.closest('.toast-container');
+            toast.remove();
+            if (container && !container.querySelector('.toast')) {
+                container.remove();
+            }
+        }, 220);
+    }
+
+    function renderToast(data) {
+        if (!data || typeof data !== 'object') return;
+        var kind = data.kind === 'success' || data.kind === 'info' ||
+                   data.kind === 'error' ? data.kind : 'info';
+        var container = ensureContainer();
+        var toast = document.createElement('div');
+        toast.className = 'toast toast-' + kind;
+        toast.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+        toast.innerHTML =
+            '<div class="toast-icon">' + ICONS[kind] + '</div>' +
+            '<div class="toast-body">' +
+                '<div class="toast-title"></div>' +
+                '<div class="toast-message"></div>' +
+            '</div>' +
+            '<button type="button" class="toast-close" aria-label="Dismiss">' +
+                CLOSE_ICON + '</button>';
+        // textContent (not innerHTML) so any server-controlled title /
+        // message string can't smuggle markup or scripts into the page.
+        toast.querySelector('.toast-title').textContent = String(data.title || '');
+        toast.querySelector('.toast-message').textContent = String(data.message || '');
+        container.appendChild(toast);
+        toast._dismissTimer = setTimeout(function() {
+            dismissToast(toast);
+        }, DURATION_MS);
+    }
+
+    // Close-X delegation. One listener on document covers every toast,
+    // including ones added later by the HX-Trigger flow.
+    document.addEventListener('click', function(e) {
+        var close = e.target.closest('.toast-close');
+        if (!close) return;
+        var toast = close.closest('.toast');
+        if (toast) dismissToast(toast);
+    });
+
+    // Buffer toast payloads that arrive via HX-Trigger so they survive
+    // the HX-Redirect navigation HTMX usually performs alongside.
+    // HTMX dispatches the event synchronously before triggering the
+    // redirect, so the sessionStorage write completes in time.
+    //
+    // **Important**: HTMX's event dispatcher mutates `event.detail` to
+    // add an `elt` field pointing at the source DOM element. Including
+    // that reference in what we hand to `JSON.stringify` makes the
+    // call throw a TypeError (DOM nodes aren't JSON-serializable), and
+    // the silent catch below would leave the queue empty — which is
+    // exactly the "toasts never show up post-navigation" symptom.
+    // Extract only the three fields we care about so the payload is
+    // pure data and round-trips through JSON cleanly.
+    document.body.addEventListener('hearth-toast', function(e) {
+        var src = (e && e.detail) || {};
+        var clean = {
+            kind: src.kind,
+            title: src.title,
+            message: src.message
+        };
+        try {
+            var queue = JSON.parse(sessionStorage.getItem(STORAGE_KEY) || '[]');
+            queue.push({ data: clean, ts: Date.now() });
+            sessionStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
+        } catch (_) {
+            // sessionStorage can throw in private mode or when quota is
+            // exhausted. The toast is decorative; swallow the error.
+        }
+    });
+
+    // Drain any queued toasts on every page load. Anything older than
+    // 30 seconds is considered stale (the redirect-render flow is sub-
+    // second; older entries are from a separate session and shouldn't
+    // pop up unexpectedly).
+    (function drain() {
+        try {
+            var raw = sessionStorage.getItem(STORAGE_KEY);
+            if (!raw) return;
+            sessionStorage.removeItem(STORAGE_KEY);
+            var queue = JSON.parse(raw);
+            if (!Array.isArray(queue)) return;
+            var now = Date.now();
+            queue.forEach(function(item) {
+                if (item && (now - (item.ts || 0)) < MAX_AGE_MS) {
+                    renderToast(item.data);
+                }
+            });
+        } catch (_) {}
+    })();
+})();
+"#;
+
 const DIALOG_JS: &str = r#"
+// Some shared dialogs (dlg-invite, dlg-reauth) live inside
+// `<template>` elements so the page boots without them in the live
+// DOM. When something needs one of them, we clone the template's
+// content into <body> and then proceed as if it had always been
+// there. Idempotent — the live-dialog check at the top short-
+// circuits any subsequent calls so we never end up with duplicates.
+window.hearthMaterializeDialog = function(id) {
+    var live = document.getElementById(id);
+    if (live) return live;
+    var tpl = document.getElementById('tpl-' + id);
+    if (tpl && tpl.content) {
+        document.body.appendChild(tpl.content.cloneNode(true));
+        return document.getElementById(id);
+    }
+    return null;
+};
+
 document.addEventListener('click', function(e) {
     var openId = e.target.closest('[data-open-dialog]');
     if (openId) {
         e.preventDefault();
-        var d = document.getElementById(openId.getAttribute('data-open-dialog'));
+        var id = openId.getAttribute('data-open-dialog');
+        var d = window.hearthMaterializeDialog(id);
         if (d && typeof d.showModal === 'function') d.showModal();
         return;
     }
@@ -514,6 +735,39 @@ fn avatar_status_dot(lifecycle: UserLifecycle) -> Markup {
     let class = format!("avatar-status {variant}");
     html! {
         span class=(class) title=(label) aria-label=(label) {}
+    }
+}
+
+/// Renders the avatar circle + the lifecycle status dot inside the
+/// standard `.avatar-wrapper`. Deactivated users get an extra
+/// treatment: the avatar dims to 50% opacity and a small lock icon
+/// is overlaid in the middle so the disabled state reads at a glance
+/// even when the row is scanned without looking at the status pill.
+fn avatar_block(display_name: &str, user_id: &uuid::Uuid, lifecycle: UserLifecycle) -> Markup {
+    let initial = display_initial(display_name);
+    let color = avatar_color(user_id);
+    let deactivated = matches!(lifecycle, UserLifecycle::Deactivated);
+    let avatar_class = if deactivated {
+        "avatar avatar-sm avatar-deactivated"
+    } else {
+        "avatar avatar-sm"
+    };
+    html! {
+        span class="avatar-wrapper" {
+            span class=(avatar_class) style=(format!("background:{color}")) {
+                (initial)
+            }
+            @if deactivated {
+                // Lock overlay sits above the avatar inside the same
+                // wrapper. `aria-hidden` because the status pill +
+                // user-name "Deactivated" tag already announce the
+                // state to assistive tech.
+                span class="avatar-lock" aria-hidden="true" {
+                    (lock_icon())
+                }
+            }
+            (avatar_status_dot(lifecycle))
+        }
     }
 }
 
@@ -1216,7 +1470,12 @@ pub fn members_page(
                         }
                         (sortable_th("Member", SortColumn::Name, sort, filter, "col-member"))
                         (sortable_th("Type", SortColumn::Role, sort, filter, "col-role"))
-                        (sortable_th("Joined", SortColumn::Joined, sort, filter, "col-date"))
+                        // "Joined" column intentionally hidden in the
+                        // UI — created_at still lives on the User row
+                        // and powers the default sort, but operators
+                        // don't need the absolute date visible by
+                        // default. Last-activity carries the more
+                        // useful "is this person still around" signal.
                         th class="col-last-activity" { "Last activity" }
                         th class="col-actions" aria-label="Actions" { "" }
                     }
@@ -1246,18 +1505,22 @@ pub fn members_page(
         // toolbar/table rhythm stable as rows come and go and gives
         // the operator a fixed place to find the rows-per-page control.
         (pagination_bar(pagination, sort, filter))
-        // Always-rendered invite modal — the "+ Invite members" CTA in
-        // the toolbar above opens it via the shared dialog-open inline
-        // JS in `shell_app`. Submitting POSTs to the same endpoint the
-        // standalone form page uses; the result page still renders
-        // full-screen so the one-time URL gets full attention.
-        (invite_modal(ctx))
-        // Reauth gate. Destructive action dialogs (delete / purge /
-        // role / deactivate) close themselves and open this modal
-        // instead of submitting directly — `REAUTH_CHAIN_JS` copies
-        // their form payload into the modal's hidden inputs and sets
-        // the modal's POST target to the original action URL.
-        (reauth_modal(ctx))
+        // Both shared modals (invite + reauth) live inside `<template>`
+        // elements until first use. The `<template>` content is parsed
+        // by the browser but isn't part of the live DOM — no layout
+        // cost, no DOM-API queries match it, scripts inside don't
+        // run. DIALOG_JS materializes the dialog on first
+        // `data-open-dialog` click, REAUTH_CHAIN_JS materializes
+        // `dlg-reauth` the first time an action button chains, and
+        // INVITE_SWAP_TO_INVITE_JS materializes `dlg-invite` if the
+        // server's HX-Retarget swap fires before the operator
+        // opened it manually.
+        template id="tpl-dlg-invite" {
+            (invite_modal(ctx))
+        }
+        template id="tpl-dlg-reauth" {
+            (reauth_modal(ctx))
+        }
         // outside-click closes any open kebab. All vanilla JS, no
         // framework, no XHR.
         script {
@@ -1604,7 +1867,12 @@ const INVITE_SWAP_TO_INVITE_JS: &str = r#"
 (function() {
     document.body.addEventListener('switch-to-invite-modal', function() {
         var reauth = document.getElementById('dlg-reauth');
-        var invite = document.getElementById('dlg-invite');
+        // dlg-invite is normally materialized when the operator clicks
+        // "+ Invite member", but materialize defensively here too in
+        // case the chain fired without an opening user gesture.
+        var invite = window.hearthMaterializeDialog
+            ? window.hearthMaterializeDialog('dlg-invite')
+            : document.getElementById('dlg-invite');
         if (reauth && reauth.open) reauth.close();
         if (invite && !invite.open) invite.showModal();
     });
@@ -1626,14 +1894,15 @@ const INVITE_REFRESH_ON_CLOSE_JS: &str = r#"
     document.body.addEventListener('invite-success', function() {
         needsRefresh = true;
     });
-    var dlg = document.getElementById('dlg-invite');
-    if (dlg) {
-        dlg.addEventListener('close', function() {
-            if (needsRefresh) {
-                window.location.reload();
-            }
-        });
-    }
+    // dlg-invite is lazily materialized so we can't bind directly to
+    // its `close` event at script-load time. Capture-phase document
+    // listener catches the close from whichever live dialog matches
+    // (close events don't bubble, hence `true` for capture).
+    document.addEventListener('close', function(e) {
+        if (e.target && e.target.id === 'dlg-invite' && needsRefresh) {
+            window.location.reload();
+        }
+    }, true);
 })();
 "#;
 
@@ -1739,7 +2008,11 @@ const REAUTH_CHAIN_JS: &str = r#"
         if (!btn) return;
         e.preventDefault();
         var sourceForm = document.getElementById(btn.getAttribute('data-reauth-confirm'));
-        var reauthDialog = document.getElementById('dlg-reauth');
+        // Lazy-mount dlg-reauth from its <template> if this is the
+        // first chain run since page load.
+        var reauthDialog = window.hearthMaterializeDialog
+            ? window.hearthMaterializeDialog('dlg-reauth')
+            : document.getElementById('dlg-reauth');
         var reauthContent = document.getElementById('reauth-modal-content');
         var reauthForm = reauthContent ? reauthContent.querySelector('form') : null;
         if (!sourceForm || !reauthDialog || !reauthForm) return;
@@ -1927,9 +2200,6 @@ fn member_row(
     pending: Option<&pending::TransitionRow>,
 ) -> Markup {
     let is_self = viewer.id == target.id;
-    let initial = display_initial(&target.display_name);
-    let color = avatar_color(&target.id.0);
-    let joined = short_date(target.created_at);
     // For the self row we render the menu the viewer *would* have on a
     // non-self target of their own role/lifecycle, but lock every item
     // visually so the operator sees what they can't do to themselves
@@ -1966,12 +2236,7 @@ fn member_row(
             }
             td class="col-member user-row-cell" {
                 div class="user-row-id" {
-                    span class="avatar-wrapper" {
-                        span class="avatar avatar-sm" style=(format!("background:{color}")) {
-                            (initial)
-                        }
-                        (avatar_status_dot(target.lifecycle))
-                    }
+                    (avatar_block(&target.display_name, &target.id.0, target.lifecycle))
                     div class="user-row-text" {
                         span class="user-name" {
                             (target.display_name)
@@ -1995,7 +2260,6 @@ fn member_row(
                     (role_label(target.instance_role))
                 }
             }
-            td class="col-date" { (joined) }
             td class="col-last-activity" {
                 @match last_activity {
                     Some(ts) => (short_date(ts)),
@@ -2020,7 +2284,6 @@ fn member_row(
 fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Markup {
     let initial = display_initial(&invitation.email);
     let color = avatar_color(&invitation.id.0);
-    let invited = short_date(invitation.created_at);
     let search_hay = invitation.email.to_lowercase();
     let id = invitation.id.0;
     let aria_label = format!("Select pending invite {}", invitation.email);
@@ -2052,7 +2315,6 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
                     (role_label(invitation.instance_role))
                 }
             }
-            td class="col-date" { (invited) }
             td class="col-last-activity" {
                 span class="muted-dash" { "—" }
             }
@@ -2201,7 +2463,7 @@ fn revoke_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup
                  method="post"
                  action=(format!("/members/invitations/{id}/revoke")) {
                 div class="dialog-header" {
-                    div class="dialog-icon dialog-icon-warning" {
+                    div class="dialog-icon dialog-icon-shield" {
                         (shield_icon())
                     }
                     button type="button" class="dialog-close" data-close-dialog
@@ -2489,7 +2751,7 @@ fn role_owner_confirm_dialog(id: uuid::Uuid, name: &str) -> Markup {
         dialog id=(format!("dlg-role-owner-confirm-{id}"))
                class="action-dialog action-dialog-centered" {
             div class="dialog-header" {
-                div class="dialog-icon dialog-icon-warning" {
+                div class="dialog-icon dialog-icon-shield" {
                     (crown_icon())
                 }
                 button type="button" class="dialog-close" data-close-dialog
@@ -2801,39 +3063,179 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
 // Banners
 // ────────────────────────────────────────────────────────────────────────
 
-fn render_banner(banner: &MembersBanner<'_>) -> Markup {
-    if let Some(error_code) = banner.error {
-        return error_banner(error_code);
-    }
-    if let Some(action) = banner.action {
-        return action_banner(action, banner.target);
-    }
+/// No-op now that toasts are dispatched client-side via HX-Trigger
+/// (see [`TOAST_JS`]). Kept on the signature so the page-render path
+/// can keep the same shape if we want to bring back server-side
+/// rendered banners for any niche case later.
+fn render_banner(_banner: &MembersBanner<'_>) -> Markup {
     html! {}
 }
 
-fn action_banner(action: &str, target: Option<&str>) -> Markup {
-    let name = target.unwrap_or("This member");
-    let msg = match action {
-        "deactivated" => format!("{name} has been deactivated."),
-        "reactivated" => format!("{name} has been reactivated."),
-        "deleted" => format!("{name}'s account has been deleted."),
-        "purged" => format!("{name}'s account has been purged."),
-        "role_changed" => format!("{name}'s role has been updated."),
-        "pending_deactivate" => "A 72-hour veto window has begun for the requested deactivation. The target Owner and any other Owner can cancel during that time.".to_string(),
-        "pending_delete" => "A 72-hour veto window has begun for the requested deletion.".to_string(),
-        "pending_purge" => "A 72-hour veto window has begun for the requested purge.".to_string(),
-        "pending_role_change" => "A 72-hour veto window has begun for the requested role change.".to_string(),
-        "invite_revoked" => "The invitation was revoked.".to_string(),
-        "vetoed" => "The pending action was vetoed.".to_string(),
-        _ => return html! {},
-    };
-    html! {
-        div class="banner banner-success" role="status" { (msg) }
+/// Kind of toast — drives the icon + colour palette. Three flavours:
+///
+/// * **Success** (green ✓) — a positive outcome (reactivated, role
+///   updated, veto applied successfully).
+/// * **Info** (neutral grey ⓘ) — a negative-but-reversible outcome
+///   (deactivated, invitation revoked, pending review queued for a
+///   reversible action). Matches the visual language operators
+///   already use for "noted, here's what happened" notifications.
+/// * **Error** (red !) — either a failed action or a completed but
+///   truly irreversible negative outcome (deleted, purged, or a
+///   pending row that will end in a delete/purge).
+///
+/// Serialized as snake_case on the wire so the client-side toast
+/// renderer can switch on the same token.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToastKind {
+    Success,
+    Info,
+    Error,
+}
+
+/// Toast payload sent from server → client via the `hearth-toast`
+/// HX-Trigger event. The client (see [`TOAST_JS`]) buffers it into
+/// sessionStorage so it survives the HX-Redirect navigation that
+/// usually accompanies the trigger, then renders it on the next
+/// page load. Drained-on-read so a manual reload doesn't replay a
+/// stale message.
+#[derive(serde::Serialize)]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub title: String,
+    pub message: String,
+}
+
+impl Toast {
+    pub fn new(kind: ToastKind, title: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            title: title.into(),
+            message: message.into(),
+        }
     }
 }
 
+/// Build a [`Toast`] payload for a successful action. Returns `None`
+/// for unrecognised tokens so a forged request can't surface an
+/// arbitrary banner via the HX-Trigger channel.
+///
+/// Kind picks the colour, following the reversibility rule:
+///
+/// * Positive outcome → `Success` (green): reactivated, role updated,
+///   veto applied.
+/// * Negative-but-reversible → `Info` (grey): deactivated, invitation
+///   revoked, plus pending versions of those.
+/// * Truly destructive → `Error` (red): deleted, purged, plus
+///   pending versions of those (the 72h window can veto, but the
+///   eventual outcome is permanent).
+pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
+    let name = target.unwrap_or("This member");
+    let (kind, title, message): (ToastKind, &str, String) = match action {
+        // Reversible negatives — grey info palette.
+        "deactivated" => (
+            ToastKind::Info,
+            "Deactivated",
+            format!("{name} can no longer sign in."),
+        ),
+        "invite_revoked" => (
+            ToastKind::Info,
+            "Invitation revoked",
+            "The pending invitation was revoked.".to_string(),
+        ),
+        "invitation_reissued" => (
+            ToastKind::Info,
+            "Invitation reissued",
+            "A fresh acceptance URL was generated.".to_string(),
+        ),
+        "pending_deactivate" => (
+            ToastKind::Info,
+            "Awaiting review",
+            "A 72-hour veto window has begun for the requested deactivation.".to_string(),
+        ),
+        "pending_role_change" => (
+            ToastKind::Info,
+            "Awaiting review",
+            "A 72-hour veto window has begun for the requested role change.".to_string(),
+        ),
+
+        // Positive outcomes — green success palette.
+        "reactivated" => (
+            ToastKind::Success,
+            "Reactivated",
+            format!("{name} can sign in again."),
+        ),
+        "role_changed" => (
+            ToastKind::Success,
+            "Role updated",
+            format!("{name}'s role has been updated."),
+        ),
+        "vetoed" => (
+            ToastKind::Success,
+            "Action vetoed",
+            "The pending action was cancelled.".to_string(),
+        ),
+
+        // Irreversible negatives — red error palette. The pending
+        // variants are red too because the eventual outcome (after
+        // the 72h window if no one vetoes) is destructive — the
+        // operator should still feel the weight of having queued it.
+        "deleted" => (
+            ToastKind::Error,
+            "Account deleted",
+            format!("{name}'s account has been anonymized."),
+        ),
+        "purged" => (
+            ToastKind::Error,
+            "Account purged",
+            format!("{name}'s account has been fully removed."),
+        ),
+        "pending_delete" => (
+            ToastKind::Error,
+            "Awaiting review",
+            "A 72-hour veto window has begun for the requested deletion.".to_string(),
+        ),
+        "pending_purge" => (
+            ToastKind::Error,
+            "Awaiting review",
+            "A 72-hour veto window has begun for the requested purge.".to_string(),
+        ),
+
+        _ => return None,
+    };
+    Some(Toast::new(kind, title, message))
+}
+
+/// Build a red error toast payload from one of the codes in the
+/// shared [`error_banner_message`] catalog.
+pub fn toast_for_error(error_code: &str) -> Toast {
+    Toast::new(
+        ToastKind::Error,
+        "Action failed",
+        error_banner_message(error_code),
+    )
+}
+
+/// Inline banner — kept for form-validation contexts that render
+/// _inside_ a modal or card (e.g. the invite modal's "email already
+/// in use" feedback). Page-level success/error notifications go
+/// through [`toast`] now; this is only for scoped messages that need
+/// to sit next to a specific input.
 fn error_banner(error: &str) -> Markup {
-    let msg = match error {
+    let msg = error_banner_message(error);
+    html! {
+        div class="banner banner-error" role="alert" { (msg) }
+    }
+}
+
+/// Shared catalog of human-readable copy for every error code the
+/// admin flows surface via `?error=` or inline form feedback. Pulled
+/// out so the inline [`error_banner`] and the page-level
+/// [`error_toast_for`] render the exact same wording — no drift
+/// between "missing email" said one way in a banner and another way
+/// in a toast.
+fn error_banner_message(error: &str) -> &'static str {
+    match error {
         "cannot_target_self" => "You can't target yourself.",
         "cannot_target_peer_or_higher" => "You can't target a peer or higher role.",
         "already_deactivated" => "That member is already deactivated.",
@@ -2862,12 +3264,9 @@ fn error_banner(error: &str) -> Markup {
         // /pending veto errors.
         "transition_not_found" => "That pending action no longer exists.",
         "not_pending" => {
-            "That action is no longer pending — another Owner may have just resolved it."
+            "That action is no longer pending. Another Owner may have just resolved it."
         }
         _ => "Something went wrong.",
-    };
-    html! {
-        div class="banner banner-error" role="alert" { (msg) }
     }
 }
 
@@ -2884,13 +3283,10 @@ pub struct PendingBanner<'a> {
     pub error: Option<&'a str>,
 }
 
-fn render_pending_banner(banner: &PendingBanner<'_>) -> Markup {
-    if let Some(error_code) = banner.error {
-        return error_banner(error_code);
-    }
-    if let Some(action) = banner.action {
-        return action_banner(action, None);
-    }
+/// No-op now that toasts are dispatched client-side. Same shape as
+/// [`render_banner`]; both stick around so the page renderers can
+/// keep their existing call without churn.
+fn render_pending_banner(_banner: &PendingBanner<'_>) -> Markup {
     html! {}
 }
 
@@ -2918,10 +3314,12 @@ pub fn pending_page(
 
     let content = html! {
         (render_pending_banner(&banner))
-        // Reauth modal lives at the page level so every per-row Veto
-        // dialog can chain into the same #dlg-reauth. Mirrors the
-        // structure used by the /members page.
-        (reauth_modal(ctx))
+        // Reauth modal lives inside a `<template>` so the page boots
+        // without a hidden dialog in the live DOM. REAUTH_CHAIN_JS
+        // materializes it from `tpl-dlg-reauth` on first chain run.
+        template id="tpl-dlg-reauth" {
+            (reauth_modal(ctx))
+        }
 
         @if active.is_empty() {
             (pending_empty_state())
@@ -3144,12 +3542,7 @@ fn time_remaining_short(effective_at: chrono::DateTime<chrono::Utc>) -> String {
 fn user_cell(u: &identity::User) -> Markup {
     html! {
         div class="user-row-id" {
-            span class="avatar-wrapper" {
-                span class="avatar avatar-sm"
-                     style=(format!("background:{}", avatar_color(&u.id.0))) {
-                    (display_initial(&u.display_name))
-                }
-            }
+            (avatar_block(&u.display_name, &u.id.0, u.lifecycle))
             div class="user-row-text" {
                 span class="user-name" { (u.display_name) }
                 span class="user-email" { (u.email) }
@@ -3174,7 +3567,7 @@ fn veto_pending_dialog(
                  method="post"
                  action=(format!("/pending/{transition_id}/veto")) {
                 div class="dialog-header" {
-                    div class="dialog-icon dialog-icon-warning" {
+                    div class="dialog-icon dialog-icon-shield" {
                         (shield_icon())
                     }
                     button type="button" class="dialog-close" data-close-dialog

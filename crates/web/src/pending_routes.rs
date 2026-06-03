@@ -10,7 +10,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    admin_routes::{LifecycleActionForm, is_htmx, redirect_or_hx_redirect, require_password},
+    admin_routes::{
+        LifecycleActionForm, is_htmx, redirect_with_action_toast, redirect_with_error_toast,
+        require_password,
+    },
     routes::{BrowserAuth, check_csrf_token, error_response},
     views,
 };
@@ -158,7 +161,9 @@ pub async fn veto_pending(
         Ok(_row) => {
             // Refresh the page so the now-resolved row drops out of
             // the active list and the sidebar count badge updates.
-            redirect_or_hx_redirect("/pending?action=vetoed", htmx)
+            // Toast travels via HX-Trigger (client-side renders it
+            // after the soft-navigation completes).
+            redirect_with_action_toast("/pending", htmx, "vetoed", None)
         }
         Err(admin_logic::VetoError::NotOwner) => {
             // Defense in depth — we already checked above, but
@@ -167,13 +172,13 @@ pub async fn veto_pending(
             error_response(axum::http::StatusCode::FORBIDDEN, "Owners only.")
         }
         Err(admin_logic::VetoError::NotFound) => {
-            redirect_or_hx_redirect("/pending?error=transition_not_found", htmx)
+            redirect_with_error_toast("/pending", htmx, "transition_not_found")
         }
         Err(admin_logic::VetoError::NotPending) => {
             // Race: someone else resolved (vetoed/cancelled/applied)
             // the row between page load and our submit. Bounce back to
             // the page so the operator sees the current state.
-            redirect_or_hx_redirect("/pending?error=not_pending", htmx)
+            redirect_with_error_toast("/pending", htmx, "not_pending")
         }
         Err(admin_logic::VetoError::Internal(err)) => {
             tracing::error!(?err, "vetoing pending transition (web)");

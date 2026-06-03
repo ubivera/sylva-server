@@ -617,25 +617,6 @@ pub(crate) fn require_admin(
     }
 }
 
-/// Percent-encode a string for safe use in a URL query value. Keeps
-/// unreserved ASCII verbatim and percent-encodes everything else
-/// (including non-ASCII UTF-8 bytes).
-pub(crate) fn url_encode(s: &str) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                let _ = write!(out, "%{byte:02X}");
-            }
-        }
-    }
-    out
-}
-
 /// `POST /logout` — revoke the current session, clear the cookie, bounce
 /// to `/login`. Idempotent (modulo CSRF — a missing/bad token still
 /// returns 403, so a malicious cross-site form can't log the user out).
