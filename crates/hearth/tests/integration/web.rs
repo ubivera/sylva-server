@@ -300,6 +300,152 @@ async fn logout_clears_cookie_and_revokes_session() {
     let _ = user;
 }
 
+/// `/logout` accepts an optional `next` form field that overrides the
+/// default `/login` redirect target. Used by the user-card popover's
+/// "quick switch to another account" rows: clicking one POSTs to
+/// `/logout` with `next=/login?email=…`, signing out the current user
+/// and landing them on the login form pre-filled with the other email.
+#[tokio::test]
+async fn logout_redirects_to_next_when_same_origin() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+    let next_target = "/login?email=other%40test.local";
+    let body = format!(
+        "csrf_token={}&next={}",
+        urlencoding(&csrf),
+        urlencoding(next_target)
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/logout")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some(next_target),
+        "logout should honour the same-origin `next` redirect"
+    );
+}
+
+/// Protocol-relative (`//host`) and absolute-URL `next` values are
+/// rejected so the logout endpoint can't be turned into an open
+/// redirect (e.g. phishing payload "sign out → land on attacker.com").
+/// We try a few common payload shapes and assert every one falls back
+/// to the safe default of `/login`.
+#[tokio::test]
+async fn logout_rejects_external_next() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+
+    let hostile = [
+        "//evil.example.com",           // protocol-relative
+        "https://evil.example.com",     // explicit scheme
+        "javascript:alert(1)",          // js: scheme
+        "login",                        // missing leading slash
+        "",                             // empty string
+    ];
+
+    for next in hostile {
+        let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+        let cookie = cookie_name_value(&set_cookie);
+        let session_id = app.session_id_for_cookie(&cookie).await;
+        let csrf = app.csrf_for(session_id);
+        let body = format!(
+            "csrf_token={}&next={}",
+            urlencoding(&csrf),
+            urlencoding(next)
+        );
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/logout")
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+        assert_eq!(
+            resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/login"),
+            "hostile next={next:?} should be rejected and fall back to /login"
+        );
+    }
+}
+
+/// The user-card popover wires up "quick switch to another account"
+/// rows client-side from a `<template>` that lives in the chrome.
+/// This is the regression guard for the markup — if someone drops the
+/// template or its hooks, `MULTI_ACCOUNT_JS` silently can't render the
+/// roster and the popover loses its multi-account feature.
+#[tokio::test]
+async fn app_shell_includes_user_card_popover_scaffolding() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let req = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/me")
+        .header(header::COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body_bytes);
+
+    // Current-account JSON blob stamped onto the accounts container.
+    assert!(
+        body.contains(r#"class="user-card-accounts""#),
+        "expected `.user-card-accounts` container in chrome"
+    );
+    assert!(
+        body.contains("data-current-account="),
+        "expected `data-current-account` JSON blob on the accounts container"
+    );
+    // Template that `MULTI_ACCOUNT_JS` clones for each other account.
+    assert!(
+        body.contains(r#"id="tpl-user-card-other-account""#),
+        "expected `<template id=tpl-user-card-other-account>` in chrome"
+    );
+    // Theme switcher buttons (auto/dark/light) — radio-group shape.
+    assert!(body.contains(r#"data-theme-choice="auto""#));
+    assert!(body.contains(r#"data-theme-choice="dark""#));
+    assert!(body.contains(r#"data-theme-choice="light""#));
+}
+
+/// `THEME_BOOT_JS` runs *before* the stylesheet link in both the
+/// authed shell and the public shell — without it, an operator who
+/// picks "Light" theme, signs out and lands on `/login` would flash
+/// system theme until they signed back in. This test asserts the
+/// public shell carries the bootstrap.
+#[tokio::test]
+async fn public_shell_includes_theme_bootstrap() {
+    let app = TestApp::new().await;
+    let resp = app.get("/login", None).await;
+    let body = resp.body_as_text();
+    // The bootstrap is wrapped in an IIFE that reads the saved
+    // choice; the storage key is the load-bearing string to look
+    // for since the rest of the script is implementation detail.
+    assert!(
+        body.contains("sylva-theme"),
+        "expected THEME_BOOT_JS to run in public shell head"
+    );
+}
+
 #[tokio::test]
 async fn root_redirects_based_on_auth() {
     let app = TestApp::new().await;

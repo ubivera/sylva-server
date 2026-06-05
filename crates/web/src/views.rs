@@ -276,6 +276,16 @@ pub fn shell_public(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · Hearth" }
+                // Theme bootstrap — mirrored from the authed shell
+                // so /login (and other public pages an operator
+                // lands on after sign-out) honor the same
+                // `data-theme` choice persisted in localStorage.
+                // Without this, the quick-switch flow flashes
+                // system theme on the login page before the user
+                // signs back in.
+                script {
+                    (maud::PreEscaped(THEME_BOOT_JS))
+                }
                 link rel="stylesheet"
                      href=(format!("/assets/css/app.css?v={}", asset_version()));
                 script src=(format!("/assets/vendor/htmx.min.js?v={}", asset_version()))

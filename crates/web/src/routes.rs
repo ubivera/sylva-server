@@ -637,10 +637,15 @@ pub(crate) fn require_admin(
     }
 }
 
-/// `POST /logout` — revoke the current session, clear the cookie, bounce
-/// to `/login` (or to `?next=` when that's a same-origin relative path).
-/// Idempotent (modulo CSRF — a missing/bad token still returns 403, so a
-/// malicious cross-site form can't log the user out).
+/// `POST /logout` — revoke the current session, clear the cookie, and
+/// bounce to `/login` by default. An optional `next` form field
+/// overrides the destination when it's a same-origin relative path
+/// (`/`-prefixed and not `//`-prefixed); anything else falls back to
+/// `/login` via [`safe_logout_next`], so the endpoint can't be used as
+/// an open redirect. Used by the user-card popover's quick-switch rows
+/// to land on `/login?email=…` pre-filled after signing out. CSRF-
+/// protected: a missing/bad token returns 403, so a malicious
+/// cross-site form can't log the user out.
 pub async fn logout_submit(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
