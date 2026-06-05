@@ -1156,11 +1156,11 @@ async fn accept_invite_submit_creates_account_and_sets_session_cookie() {
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
-        Some("/me")
-    );
+    // Success no longer redirects — the response body is the
+    // recovery-code interstitial, rendered directly so the one-time
+    // code never lands in a URL, history entry, or referer header.
+    // The session cookie still rides the same response.
+    assert_eq!(resp.status(), StatusCode::OK);
     let set_cookie = resp
         .headers()
         .get(header::SET_COOKIE)
@@ -1168,6 +1168,14 @@ async fn accept_invite_submit_creates_account_and_sets_session_cookie() {
         .unwrap();
     assert!(set_cookie.starts_with("hearth_session="));
     assert!(set_cookie.contains("HttpOnly"));
+
+    let body = body_text(resp).await;
+    // Interstitial markers: heading + readonly code input + Continue
+    // form pointing at /me. We don't assert the literal code text;
+    // that's covered by JSON-path tests.
+    assert!(body.contains("Save your recovery code"));
+    assert!(body.contains(r#"id="recovery-code""#));
+    assert!(body.contains(r#"action="/me""#));
 
     // DB: user row exists and is active.
     let row: (String, String) = sqlx::query_as(
@@ -1179,6 +1187,120 @@ async fn accept_invite_submit_creates_account_and_sets_session_cookie() {
     .unwrap();
     assert_eq!(row.0, "newbie@test.local");
     assert_eq!(row.1, "active");
+}
+
+/// The recovery-code interstitial renders the freshly-stamped code,
+/// and the SHA-256 of the rendered code matches the row in
+/// `auth.user_recovery_codes`. This is the regression guard for the
+/// "code surfaces exactly once, then ceases to exist" property: we
+/// pluck the code from the interstitial body, then assert the DB
+/// stores its canonical hash and the plaintext isn't logged or
+/// echoed anywhere else.
+#[tokio::test]
+async fn accept_invite_interstitial_renders_recovery_code_matching_db_hash() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "code@test.local").await;
+
+    let body = format!(
+        "display_name={}&password={}",
+        urlencoding("CodeUser"),
+        urlencoding("longenoughpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_text(resp).await;
+
+    // The code lives in the readonly input's value attribute. Pull it
+    // out by anchoring on the input id we render in the template.
+    let anchor = r#"id="recovery-code""#;
+    let id_pos = body.find(anchor).expect("recovery-code input in body");
+    let value_anchor = "value=\"";
+    let value_start = body[id_pos..]
+        .find(value_anchor)
+        .expect("value attribute on recovery-code input")
+        + id_pos
+        + value_anchor.len();
+    let value_end = value_start
+        + body[value_start..]
+            .find('"')
+            .expect("closing quote on value");
+    let rendered_code = &body[value_start..value_end];
+
+    // Format sanity: 8 groups of 4 Crockford base32 chars + 7 hyphens.
+    assert_eq!(rendered_code.len(), 39, "got: {rendered_code:?}");
+    assert_eq!(rendered_code.split('-').count(), 8);
+
+    // The hash stored against the new user's row matches the rendered
+    // plaintext canonicalized via `recovery_code::hash_code`.
+    let row: (Vec<u8>,) = sqlx::query_as(
+        "SELECT urc.code_hash
+         FROM auth.user_recovery_codes urc
+         JOIN identity.users u ON u.id = urc.user_id
+         WHERE u.display_name = $1",
+    )
+    .bind("CodeUser")
+    .fetch_one(&app.pool)
+    .await
+    .expect("user_recovery_codes row should exist after accept");
+    let expected = auth::recovery_code::hash_code(rendered_code);
+    assert_eq!(row.0.as_slice(), &expected[..]);
+}
+
+/// Re-posting the same `/invite/{token}` after a successful acceptance
+/// must NOT leak a second copy of the recovery code. The token is
+/// already burned, so the route renders the standard "invitation
+/// unavailable" page — same behaviour as any other already-accepted
+/// invite. Critical for the interstitial's refresh-safety story.
+#[tokio::test]
+async fn resubmitting_used_invite_renders_invalid_page_not_recovery_code() {
+    let app = TestApp::new().await;
+    let token = seed_pending_invite(&app, "refresh@test.local").await;
+
+    let form_body = format!(
+        "display_name={}&password={}",
+        urlencoding("Refresh"),
+        urlencoding("longenoughpw"),
+    );
+
+    // First accept — renders the interstitial with the code.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(form_body.clone()))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first_body = body_text(resp).await;
+    assert!(first_body.contains("Save your recovery code"));
+
+    // Second accept (mimics browser refresh that resubmits the POST):
+    // invitation is already accepted, so the route falls back to the
+    // "invitation unavailable" page — *not* a second recovery code.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/invite/{token}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(form_body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let second_body = body_text(resp).await;
+    assert!(second_body.contains("Invitation unavailable"));
+    assert!(
+        !second_body.contains("Save your recovery code"),
+        "second POST must not re-render the recovery interstitial"
+    );
+    assert!(
+        !second_body.contains(r#"id="recovery-code""#),
+        "second POST must not echo a recovery code input"
+    );
 }
 
 #[tokio::test]
@@ -1210,7 +1332,9 @@ async fn accept_invite_submit_second_time_returns_unavailable() {
     let app = TestApp::new().await;
     let token = seed_pending_invite(&app, "newbie@test.local").await;
 
-    // First accept — success.
+    // First accept — success. Body is the recovery-code interstitial
+    // (rendered with 200 OK rather than a redirect so the code rides
+    // one HTTP response and never lands in a URL/history).
     let body = format!(
         "display_name={}&password={}",
         urlencoding("Newbie"),
@@ -1223,7 +1347,7 @@ async fn accept_invite_submit_second_time_returns_unavailable() {
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     // Second accept with the same token — invalid (marked accepted).
     let body = format!(

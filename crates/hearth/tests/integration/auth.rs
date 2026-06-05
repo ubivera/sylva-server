@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::common::{LoginBody, SeededUser, TestApp};
+use super::common::{AcceptInviteBody, LoginBody, SeededUser, TestApp};
 
 const OWNER_PW: &str = "ownerpw";
 
@@ -371,6 +371,138 @@ async fn accept_invite_assigns_role_from_invitation() {
 
     let me: MeBody = app.get("/api/me", Some(&body.token)).await.json();
     assert_eq!(me.instance_role, InstanceRole::Admin);
+}
+
+/// Accepting an invitation bootstraps an offline recovery code: the
+/// plaintext is returned in the response body once, and the SHA-256
+/// of its canonical form lands in `auth.user_recovery_codes`. The
+/// stored hash never matches some other code (sanity check that we're
+/// hashing the actual returned value, not an accidental constant).
+#[tokio::test]
+async fn accept_invite_returns_and_stores_recovery_code() {
+    let (app, owner) = app_with_owner().await;
+    let (_inv_id, token) =
+        seed_pending_invite(&app.pool, owner.id, "rc@test.local", InstanceRole::Member).await;
+
+    let resp = app
+        .post(
+            "/api/auth/accept-invite",
+            None,
+            Some(json!({
+                "token": token,
+                "display_name": "RC",
+                "password": "rcpw",
+            })),
+        )
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let body: AcceptInviteBody = resp.json();
+
+    // Plaintext matches the published format: 8 groups of 4 Crockford
+    // base32 chars separated by hyphens (35 chars total).
+    assert_eq!(body.recovery_code.len(), 39, "got: {}", body.recovery_code);
+    assert_eq!(body.recovery_code.split('-').count(), 8);
+
+    // Hash stored in the DB matches the canonicalized plaintext.
+    let row: (Vec<u8>,) = sqlx::query_as(
+        "SELECT code_hash FROM auth.user_recovery_codes WHERE user_id = $1",
+    )
+    .bind(body.user_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("user_recovery_codes row should exist post-accept");
+    let expected = auth::recovery_code::hash_code(&body.recovery_code);
+    assert_eq!(
+        row.0.as_slice(),
+        &expected[..],
+        "stored code_hash should be SHA-256 of canonicalized plaintext"
+    );
+}
+
+/// Two separate invite-accept flows mint distinct recovery codes — the
+/// generation is per-acceptance, not derived from anything shared
+/// (account id, time, etc.). 160-bit entropy; collisions are
+/// computationally impossible.
+#[tokio::test]
+async fn accept_invite_recovery_codes_are_unique() {
+    let (app, owner) = app_with_owner().await;
+    let (_, t1) =
+        seed_pending_invite(&app.pool, owner.id, "rc1@test.local", InstanceRole::Member).await;
+    let (_, t2) =
+        seed_pending_invite(&app.pool, owner.id, "rc2@test.local", InstanceRole::Member).await;
+
+    let b1: AcceptInviteBody = app
+        .post(
+            "/api/auth/accept-invite",
+            None,
+            Some(json!({ "token": t1, "display_name": "One", "password": "p" })),
+        )
+        .await
+        .json();
+    let b2: AcceptInviteBody = app
+        .post(
+            "/api/auth/accept-invite",
+            None,
+            Some(json!({ "token": t2, "display_name": "Two", "password": "p" })),
+        )
+        .await
+        .json();
+    assert_ne!(b1.recovery_code, b2.recovery_code);
+}
+
+/// Successful invite acceptance writes a `recovery_code_generated`
+/// audit event alongside the existing `invite_accepted` event, so an
+/// ops reader can see the code's birth in the timeline. The event's
+/// payload intentionally omits the plaintext — the audit log must
+/// never carry recoverable credentials.
+#[tokio::test]
+async fn accept_invite_audits_recovery_code_generated() {
+    let (app, owner) = app_with_owner().await;
+    let (_inv_id, token) =
+        seed_pending_invite(&app.pool, owner.id, "audit@test.local", InstanceRole::Member).await;
+
+    let body: AcceptInviteBody = app
+        .post(
+            "/api/auth/accept-invite",
+            None,
+            Some(json!({
+                "token": token,
+                "display_name": "Audit",
+                "password": "pw",
+            })),
+        )
+        .await
+        .json();
+
+    // The recovery_code_generated event references the new user as
+    // both actor and subject of generation. The audit table uses
+    // `event_type` (not `kind`) and `event_data` (not `payload`).
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'recovery_code_generated'
+           AND actor_user_id = $1",
+    )
+    .bind(body.user_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(count.0, 1);
+
+    // event_data never carries the plaintext.
+    let payload: (serde_json::Value,) = sqlx::query_as(
+        "SELECT event_data FROM audit.events
+         WHERE event_type = 'recovery_code_generated'
+           AND actor_user_id = $1",
+    )
+    .bind(body.user_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    let serialized = payload.0.to_string();
+    assert!(
+        !serialized.contains(&body.recovery_code),
+        "recovery code plaintext leaked into audit payload: {serialized}"
+    );
 }
 
 #[tokio::test]

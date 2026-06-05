@@ -226,7 +226,15 @@ pub async fn accept_invite_submit(
 
     match perform_accept_invite(&state, &token, &form.display_name, &form.password).await {
         Ok(outcome) => {
-            let mut response = Redirect::to("/me").into_response();
+            // Render the recovery-code interstitial as the POST
+            // response body — no redirect. Lets the code ride one HTTP
+            // exchange and never appear in a URL, history entry, or
+            // referer. Session cookie is set on the same response so
+            // the user is signed in when they click "Continue" (which
+            // is a plain GET to /me).
+            let body = views::accept_invite_recovery_code_page(&outcome.recovery_code)
+                .into_string();
+            let mut response = Html(body).into_response();
             set_cookie_header(
                 &mut response,
                 &cookie_value(

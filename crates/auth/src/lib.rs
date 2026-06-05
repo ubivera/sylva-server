@@ -12,6 +12,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod recovery_code;
+pub mod user_recovery_code;
 
 #[derive(Debug, Error)]
 pub enum AuthError {

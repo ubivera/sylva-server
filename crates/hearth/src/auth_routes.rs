@@ -345,14 +345,35 @@ pub struct AcceptInviteRequest {
     pub password: String,
 }
 
+/// `POST /auth/accept-invite` success response. Mirrors `LoginResponse`'s
+/// session shape and adds the one-time `recovery_code` plaintext. The
+/// code is the offline-first recovery factor for forgot-password / lost-
+/// MFA / lost-passkey flows; the caller must surface it to the new user
+/// once and warn them that it won't be shown again.
+#[derive(Serialize)]
+pub struct AcceptInviteResponse {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+    pub user_id: Uuid,
+    pub recovery_code: String,
+}
+
 /// What `perform_accept_invite` returns on success: the new user id,
-/// the issued session row, and the raw session token to hand to the
-/// caller (cookie for web, JSON for API). The session row is included
-/// for `expires_at` so JSON callers can mirror the `/auth/login` shape.
+/// the issued session row, the raw session token to hand to the caller
+/// (cookie for web, JSON for API), and the one-time-display recovery
+/// code stamped into `auth.user_recovery_codes`. The session row is
+/// included for `expires_at` so JSON callers can mirror the
+/// `/auth/login` shape.
+///
+/// `recovery_code` is plaintext — the only place it ever leaves the DB.
+/// The web caller renders it in a one-time interstitial; the JSON caller
+/// returns it in the response body. Callers must treat it like a
+/// password: never log, never persist.
 pub struct AcceptInviteOutcome {
     pub user_id: UserId,
     pub session: auth::Session,
     pub raw_session_token: String,
+    pub recovery_code: String,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -441,6 +462,20 @@ pub async fn perform_accept_invite(
         )
         .await?;
 
+        // Generate the user's offline recovery code and bootstrap the
+        // `auth.user_recovery_codes` row in the same transaction so the
+        // code's existence is atomic with the account itself — we never
+        // ship a member account without a recovery code. Plaintext is
+        // returned to the caller for one-time display; only the SHA-256
+        // hash goes to the DB.
+        let recovery_code = auth::recovery_code::generate_code();
+        auth::user_recovery_code::bootstrap(
+            &mut tx,
+            UserId::new(new_user_id),
+            &recovery_code,
+        )
+        .await?;
+
         let actor = Actor {
             user_id: UserId::new(new_user_id),
             display_name: display_name_owned.clone(),
@@ -458,6 +493,22 @@ pub async fn perform_accept_invite(
             }),
         )
         .await?;
+        // Separate audit row for the recovery code so an ops reader can
+        // see "code was generated at invite acceptance" in the log
+        // without having to infer it from the `invite_accepted` payload.
+        // The plaintext is intentionally *not* in the event — only the
+        // fact that a code was issued.
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "recovery_code_generated",
+            serde_json::json!({
+                "via": "invite_accepted",
+                "user_id": new_user_id,
+            }),
+        )
+        .await?;
 
         tx.commit().await?;
 
@@ -465,6 +516,7 @@ pub async fn perform_accept_invite(
             user_id: UserId::new(new_user_id),
             session,
             raw_session_token,
+            recovery_code,
         })
     }
     .await;
@@ -483,10 +535,16 @@ pub async fn accept_invite(
 ) -> Response {
     match perform_accept_invite(&state, &req.token, &req.display_name, &req.password).await {
         Ok(outcome) => {
-            let resp = LoginResponse {
+            // Distinct shape from `LoginResponse` so the recovery code
+            // surfaces exactly here and nowhere else — sign-in via
+            // `/auth/login` doesn't and shouldn't return it. Adding it
+            // to `LoginResponse` would be additive and backward-compat
+            // but would imply the code rides every auth response.
+            let resp = AcceptInviteResponse {
                 token: outcome.raw_session_token,
                 expires_at: outcome.session.expires_at,
                 user_id: outcome.user_id.0,
+                recovery_code: outcome.recovery_code,
             };
             (StatusCode::CREATED, Json(resp)).into_response()
         }

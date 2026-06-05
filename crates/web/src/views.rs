@@ -4407,6 +4407,76 @@ pub fn accept_invite_page(
     shell_public("Accept invitation", content)
 }
 
+/// `POST /invite/{token}` success — the one-time recovery-code
+/// interstitial. Rendered as the POST response body (not a redirect)
+/// so the code rides exactly one HTTP exchange and never lands in the
+/// URL bar, browser history, referer header, or access log. The
+/// session cookie is already set by the caller before this view
+/// renders, so the new user is signed in — clicking "Continue" is a
+/// plain GET to `/me`.
+///
+/// Refresh-safety: refreshing this page re-posts the original form, the
+/// invitation is already accepted, and the route renders
+/// [`accept_invite_invalid_page`] instead. That's fine for security
+/// (the code never re-renders) but the messaging on the invalid page
+/// would benefit from a "if you saw a recovery code, you're already
+/// signed in — go to /me" hint. Treat as a polish follow-up.
+pub fn accept_invite_recovery_code_page(recovery_code: &str) -> Markup {
+    let content = html! {
+        h1 { "Save your recovery code" }
+        div class="card recovery-code-card" {
+            p class="recovery-code-intro" {
+                "This is your account recovery code. You'll need it if "
+                "you ever forget your password or lose access to a second "
+                "factor. Sylva is offline-first — we won't email you a "
+                "reset link, so this code is the only way back in."
+            }
+            div class="recovery-code-display" {
+                // Readonly text input so INVITE_COPY_JS (loaded below)
+                // can grab the value via the same `data-copy-target`
+                // pattern used by the invite-URL copy button.
+                input id="recovery-code"
+                      type="text"
+                      class="recovery-code-input"
+                      value=(recovery_code)
+                      readonly
+                      aria-label="Account recovery code";
+                button type="button"
+                       class="btn-secondary"
+                       data-copy-target="recovery-code" {
+                    "Copy"
+                }
+            }
+            div class="dialog-alert dialog-alert-danger" role="alert" {
+                (alert_circle_icon())
+                span {
+                    "Save it somewhere safe before continuing. We won't "
+                    "show this code again. If you lose it, regenerating "
+                    "a new one from settings will replace this one — any "
+                    "saved copy will stop working."
+                }
+            }
+            form method="get" action="/me" class="recovery-code-actions" {
+                label class="recovery-code-confirm" {
+                    input type="checkbox"
+                          class="member-checkbox"
+                          required;
+                    span {
+                        "I've saved my recovery code somewhere safe."
+                    }
+                }
+                button type="submit" class="btn" {
+                    "Continue to your account"
+                }
+            }
+        }
+        script {
+            (maud::PreEscaped(INVITE_COPY_JS))
+        }
+    };
+    shell_public("Save your recovery code", content)
+}
+
 /// Rendered when the token in the URL doesn't match an active invitation
 /// — expired, revoked, already accepted, or never existed. We
 /// intentionally don't distinguish these cases publicly to avoid leaking
