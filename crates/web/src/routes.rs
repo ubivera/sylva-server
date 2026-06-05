@@ -58,13 +58,29 @@ pub async fn root_redirect(auth: Option<BrowserAuth>) -> Redirect {
 }
 
 /// `GET /login` — render the login form. If the visitor is already
-/// authenticated, bounce them to `/me` instead.
-pub async fn login_page(auth: Option<BrowserAuth>) -> Response {
+/// authenticated, bounce them to `/me` instead. The optional
+/// `?email=…` query param pre-fills the email input — used by the
+/// user-card popover's "quick switch" rows to drop the operator
+/// into the login form with the other account already typed.
+pub async fn login_page(
+    auth: Option<BrowserAuth>,
+    Query(prefill): Query<LoginPrefill>,
+) -> Response {
     if auth.is_some() {
         Redirect::to("/me").into_response()
     } else {
-        Html(views::login_page(None).into_string()).into_response()
+        Html(views::login_page(None, prefill.email.as_deref()).into_string())
+            .into_response()
     }
+}
+
+/// Optional `?email=…` query param accepted on `GET /login` so the
+/// user-card popover can pre-fill the email input on quick switch.
+/// Everything is optional and untrusted — the value is rendered as
+/// an `<input value>` attribute by Maud, which HTML-escapes it.
+#[derive(Deserialize, Default)]
+pub struct LoginPrefill {
+    pub email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,8 +110,12 @@ pub async fn login_submit(
     let user = match outcome {
         Ok(user) => user,
         Err(_) => {
+            // Re-render with the email pre-filled so the operator
+            // doesn't have to retype it after a bad password — the
+            // password field stays empty and gets focus.
+            let prefill = Some(form.email.as_str());
             return Html(
-                views::login_page(Some("Invalid email or password."))
+                views::login_page(Some("Invalid email or password."), prefill)
                     .into_string(),
             )
             .into_response();
@@ -617,15 +637,21 @@ pub(crate) fn require_admin(
     }
 }
 
-/// `POST /logout` — revoke the current session, clear the cookie, bounce
-/// to `/login`. Idempotent (modulo CSRF — a missing/bad token still
-/// returns 403, so a malicious cross-site form can't log the user out).
+/// `POST /logout` — revoke the current session, clear the cookie, and
+/// bounce to `/login` by default. An optional `next` form field
+/// overrides the destination when it's a same-origin relative path
+/// (`/`-prefixed and not `//`-prefixed); anything else falls back to
+/// `/login` via [`safe_logout_next`], so the endpoint can't be used as
+/// an open redirect. Used by the user-card popover's quick-switch rows
+/// to land on `/login?email=…` pre-filled after signing out. CSRF-
+/// protected: a missing/bad token returns 403, so a malicious
+/// cross-site form can't log the user out.
 pub async fn logout_submit(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
-    Form(form): Form<CsrfForm>,
+    Form(form): Form<LogoutForm>,
 ) -> Response {
-    if let Err(resp) = check_csrf(&state, auth.session_id, &form) {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
         return resp;
     }
 
@@ -652,12 +678,37 @@ pub async fn logout_submit(
         // Best-effort: still clear the cookie and redirect.
     }
 
-    let mut response = Redirect::to("/login").into_response();
+    let target = safe_logout_next(form.next.as_deref());
+    let mut response = Redirect::to(target).into_response();
     set_cookie_header(
         &mut response,
         &cookie_value(SESSION_COOKIE_NAME, "", /* clearing = */ true),
     );
     response
+}
+
+/// Form posted to `/logout`. Carries the CSRF token plus an
+/// optional `next` redirect target — used by the user-card
+/// popover's "quick switch" rows to drop the operator on the
+/// login form pre-filled with the other email after signing
+/// out.
+#[derive(Deserialize)]
+pub struct LogoutForm {
+    pub csrf_token: String,
+    pub next: Option<String>,
+}
+
+/// Sanitize the optional `next` redirect target so the logout
+/// endpoint can't be weaponized as an open redirect. Only
+/// same-origin relative paths starting with a single `/` are
+/// accepted; `//attacker.example.com` (protocol-relative) is
+/// rejected. Anything missing or malformed falls back to
+/// `/login`.
+fn safe_logout_next(next: Option<&str>) -> &str {
+    match next {
+        Some(n) if n.starts_with('/') && !n.starts_with("//") => n,
+        _ => "/login",
+    }
 }
 
 /// Attach a `Set-Cookie` header to a response. The cookie strings this

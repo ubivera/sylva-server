@@ -469,7 +469,8 @@ async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
     assert_eq!(hx_redirect(&resp), "/members");
     let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
     assert_eq!(toast["kind"], "error");
-    assert_eq!(toast["title"], "Account deleted");
+    // UI calls the soft-delete action "Anonymize".
+    assert_eq!(toast["title"], "Account anonymized");
 
     // DB-side: soft-deleted.
     let lifecycle: String = sqlx::query_scalar(
@@ -790,7 +791,8 @@ async fn htmx_delete_emits_error_toast() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
     assert_eq!(toast["kind"], "error");
-    assert_eq!(toast["title"], "Account deleted");
+    // UI calls the soft-delete action "Anonymize"; backend route stays /delete.
+    assert_eq!(toast["title"], "Account anonymized");
 }
 
 #[tokio::test]
@@ -1308,6 +1310,31 @@ async fn invite_submit_htmx_error_returns_form_partial_with_banner() {
     // the Continue button carries `data-reauth-confirm` so the reauth
     // modal's POST is what actually submits.
     assert!(body.contains(r#"data-reauth-confirm="form-invite-modal""#));
+}
+
+#[tokio::test]
+async fn members_page_includes_invite_copy_handler() {
+    // Regression guard. The invite + reissue success modals render
+    // a Copy URL button into the dlg-invite dialog via HX-Retarget;
+    // without INVITE_COPY_JS on /members the button has no click
+    // handler. (The standalone /members/invite fallback page bundles
+    // it separately; the modal-only flow needs the script here too.)
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, "/members", &cookie).await;
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("data-copy-target"),
+        "the copy-handler hook (data-copy-target) must be present"
+    );
+    // The IIFE's identifying selector — proves the script is on the page.
+    assert!(
+        body.contains("e.target.closest('[data-copy-target]')"),
+        "INVITE_COPY_JS must be wired into the /members script block"
+    );
 }
 
 #[tokio::test]
