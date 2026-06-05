@@ -342,6 +342,13 @@ fn shell_app_inner(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · " (ctx.instance_name) }
+                // Theme bootstrap runs before the stylesheet link so
+                // it can stamp `<html data-theme>` ahead of the first
+                // paint — no flash of system-theme before the saved
+                // user choice applies.
+                script {
+                    (maud::PreEscaped(THEME_BOOT_JS))
+                }
                 link rel="stylesheet"
                      href=(format!("/assets/css/app.css?v={}", asset_version()));
                 script src=(format!("/assets/vendor/htmx.min.js?v={}", asset_version()))
@@ -352,6 +359,18 @@ fn shell_app_inner(
                 main class=(main_class) {
                     h1 { (title) }
                     (content)
+                    // Decorative botanical trees graphic anchored
+                    // bottom-right of the main panel, above the
+                    // pagination border (when present). Absolute
+                    // positioning takes it out of flex flow so it
+                    // doesn't push pagination off the bottom; it
+                    // sits as ambient art behind the data. Wide-only
+                    // because the narrow-shell pages (/me, login)
+                    // are short single-column views where a
+                    // decorative panel would crowd the form.
+                    @if wide {
+                        div class="main-mark" aria-hidden="true" {}
+                    }
                 }
                 // Wire up [data-open-dialog] / [data-close-dialog] without
                 // pulling in a framework. Vanilla, ~10 lines, executes on
@@ -367,10 +386,204 @@ fn shell_app_inner(
                 script {
                     (maud::PreEscaped(TOAST_JS))
                 }
+                // Theme switcher click handler. Reflects the
+                // active choice on `.user-card-theme-btn` and
+                // persists to localStorage.
+                script {
+                    (maud::PreEscaped(THEME_SWITCH_JS))
+                }
+                // Multi-account roster: stamps the current user
+                // into localStorage and renders any other accounts
+                // signed into on this browser as additional rows
+                // in the user-card popover.
+                script {
+                    (maud::PreEscaped(MULTI_ACCOUNT_JS))
+                }
+                // Outside-click closes the user-card popover.
+                script {
+                    (maud::PreEscaped(USER_CARD_OUTSIDE_CLICK_JS))
+                }
             }
         }
     }
 }
+
+// Theme bootstrap — inlined in `<head>` so it runs *before* the CSS
+// is applied to the page. Reads `localStorage["sylva-theme"]` and
+// stamps `<html data-theme="…">` accordingly; the matching
+// `:root[data-theme="…"]` CSS rules then take effect on the
+// initial paint, avoiding a flash of system-theme content before
+// the user's choice is honored. Wrapped in try/catch because
+// privacy-mode browsers can throw on localStorage access.
+const THEME_BOOT_JS: &str = r#"
+(function() {
+    try {
+        var t = localStorage.getItem('sylva-theme');
+        if (t === 'dark' || t === 'light') {
+            document.documentElement.dataset.theme = t;
+        }
+    } catch (e) {}
+})();
+"#;
+
+// Theme switcher — wires the three buttons inside the user-card
+// popover (`.user-card-theme-btn[data-theme-choice]`) to flip
+// `<html data-theme="…">` and persist the choice in localStorage.
+// `auto` removes the attribute and the saved value so the system
+// preference takes over again. Runs once per page load.
+const THEME_SWITCH_JS: &str = r#"
+(function() {
+    var KEY = 'sylva-theme';
+    var html = document.documentElement;
+
+    function current() {
+        var t = html.dataset.theme;
+        return (t === 'dark' || t === 'light') ? t : 'auto';
+    }
+
+    function refresh() {
+        var c = current();
+        document.querySelectorAll('.user-card-theme-btn').forEach(function(btn) {
+            var choice = btn.dataset.themeChoice;
+            var on = (choice === c);
+            btn.classList.toggle('user-card-theme-btn-active', on);
+            btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+    }
+
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('.user-card-theme-btn');
+        if (!btn) return;
+        e.preventDefault();
+        var choice = btn.dataset.themeChoice;
+        try {
+            if (choice === 'dark' || choice === 'light') {
+                html.dataset.theme = choice;
+                localStorage.setItem(KEY, choice);
+            } else {
+                delete html.dataset.theme;
+                localStorage.removeItem(KEY);
+            }
+        } catch (err) {}
+        refresh();
+    });
+
+    refresh();
+})();
+"#;
+
+// Multi-account roster for the user-card popover. Reads the
+// current account from `.user-card-accounts[data-current-account]`
+// (a JSON blob stamped server-side), merges it into a
+// localStorage list keyed `sylva-accounts`, then renders the
+// *other* entries below the current row as `<a>` links. Clicking
+// an other-account row navigates to `/login?email=…` so the
+// email comes pre-filled — the closest we get to "quick switch"
+// without a real shared-session backend. Capped at 5 stored
+// accounts so the popover stays tidy. Wrapped in try/catch
+// because privacy-mode browsers can throw on localStorage.
+const MULTI_ACCOUNT_JS: &str = r#"
+(function() {
+    var KEY = 'sylva-accounts';
+    var MAX = 5;
+
+    var container = document.querySelector('.user-card-accounts');
+    var tpl = document.getElementById('tpl-user-card-other-account');
+    if (!container || !tpl) return;
+    var raw = container.dataset.currentAccount;
+    if (!raw) return;
+    var current;
+    try { current = JSON.parse(raw); } catch (e) { return; }
+    if (!current || !current.id) return;
+
+    function loadRoster() {
+        try {
+            var stored = localStorage.getItem(KEY);
+            if (!stored) return [];
+            var parsed = JSON.parse(stored);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (e) { return []; }
+    }
+    function saveRoster(r) {
+        try { localStorage.setItem(KEY, JSON.stringify(r)); } catch (e) {}
+    }
+
+    // Merge the current account into the roster (de-dup by id),
+    // cap, then persist.
+    var roster = loadRoster()
+        .filter(function(a) { return a && a.id && a.id !== current.id; });
+    roster.unshift(current);
+    if (roster.length > MAX) roster = roster.slice(0, MAX);
+    saveRoster(roster);
+
+    // Drop any existing other-account rows before re-rendering (this
+    // function runs once on load; the de-dup guard guards against a
+    // future re-render path).
+    container.querySelectorAll('.user-card-account-other')
+        .forEach(function(el) { el.remove(); });
+
+    function renderOther(acct) {
+        var frag = tpl.content.cloneNode(true);
+        var root = frag.querySelector('.user-card-account-other');
+        if (!root) return null;
+        root.dataset.otherAccount = acct.id;
+
+        var avatar = frag.querySelector('[data-other-avatar]');
+        if (avatar) {
+            avatar.style.background = acct.color || '#888';
+            avatar.textContent = acct.initial || '?';
+        }
+        var name = frag.querySelector('[data-other-name]');
+        if (name) name.textContent = acct.name || '';
+        var email = frag.querySelector('[data-other-email]');
+        if (email) email.textContent = acct.email || '';
+        var next = frag.querySelector('[data-other-next]');
+        if (next) {
+            next.value = '/login?email=' + encodeURIComponent(acct.email || '');
+        }
+        return frag;
+    }
+
+    roster.forEach(function(acct) {
+        if (!acct || acct.id === current.id) return;
+        var node = renderOther(acct);
+        if (node) container.appendChild(node);
+    });
+
+    // Delete (×) handler — drops the account from localStorage and
+    // removes the row. Stops propagation so the surrounding form's
+    // submit button doesn't also fire on the same click.
+    container.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-other-delete]');
+        if (!btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var row = btn.closest('.user-card-account-other');
+        if (!row) return;
+        var id = row.dataset.otherAccount;
+        var next = loadRoster().filter(function(a) { return a && a.id !== id; });
+        saveRoster(next);
+        row.remove();
+    });
+})();
+"#;
+
+// Outside-click closes any open user-card popover. The kebab
+// equivalent (`MEMBERS_KEBAB_OUTSIDE_CLICK_JS`) only targets
+// `.row-actions` `<details>` elements, so we register a separate
+// listener for the sidebar's user card. Clicking inside the
+// popover (account rows, theme buttons, sign-out form) keeps it
+// open; clicking the summary toggles it; anything else closes it.
+const USER_CARD_OUTSIDE_CLICK_JS: &str = r#"
+(function() {
+    document.addEventListener('click', function(e) {
+        var card = document.querySelector('details.user-card[open]');
+        if (!card) return;
+        if (card.contains(e.target)) return;
+        card.removeAttribute('open');
+    });
+})();
+"#;
 
 // Dynamic toast system. No page-level toast markup is server-rendered
 // anymore. Three parts:
@@ -582,6 +795,13 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
         aside class="sidebar" {
             div class="brand" {
                 a href="/" {
+                    // Brand logo — white botanical emblem on a black
+                    // rounded-square puck. Decorative; alt left empty
+                    // so screen readers fall through to the "Sylva ·
+                    // {instance}" text that follows.
+                    span class="brand-logo" aria-hidden="true" {
+                        img src="/assets/img/sylva-logo.svg" alt="";
+                    }
                     span class="brand-prefix" { "Sylva" }
                     span class="brand-sep" { " · " }
                     span class="brand-instance" { (ctx.instance_name) }
@@ -593,13 +813,13 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
             // when the modal lands users already know the shortcut.
             button class="search-trigger" type="button"
                    aria-label="Search (coming soon)" disabled {
-                span class="search-icon" { "🔍" }
+                span class="search-icon" { (search_glyph_icon()) }
                 span class="search-label" { "Search…" }
                 span class="search-shortcut" { "⌘K" }
             }
 
             nav class="nav-links" {
-                (nav_link("/me", "Profile", current == PageId::Profile))
+                (nav_link("/me", "Profile", current == PageId::Profile, user_icon()))
                 @if is_admin {
                     // Members carries the pending-action count badge
                     // for Owner viewers — the dedicated `/pending` nav
@@ -613,9 +833,17 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                         "Members",
                         current == PageId::Members,
                         ctx.pending_count,
+                        users_icon(),
                     ))
                 }
             }
+
+            // Decorative Sylva mark — abstract dotted "u" sitting in
+            // the empty stretch between nav and the bottom-pinned user
+            // card. Rendered as a `<div>` with the SVG masked over a
+            // currentColor background so the mark inherits the
+            // sidebar's text colour automatically across themes.
+            div class="sidebar-mark" aria-hidden="true" {}
 
             (user_card(ctx))
         }
@@ -630,21 +858,31 @@ fn is_owner(role: InstanceRole) -> bool {
     matches!(role, InstanceRole::Owner)
 }
 
-fn nav_link(href: &str, label: &str, active: bool) -> Markup {
+fn nav_link(href: &str, label: &str, active: bool, icon: Markup) -> Markup {
     let class = if active { "nav-link active" } else { "nav-link" };
     html! {
-        a class=(class) href=(href) { (label) }
+        a class=(class) href=(href) {
+            span class="nav-link-icon" aria-hidden="true" { (icon) }
+            span class="nav-link-label" { (label) }
+        }
     }
 }
 
 /// Nav link with an optional count badge. The badge only renders when
 /// `count` is `Some(n)` with `n > 0` — so the layout collapses cleanly
 /// for the empty-queue case (the link still shows, just no number).
-fn nav_link_with_badge(href: &str, label: &str, active: bool, count: Option<u32>) -> Markup {
+fn nav_link_with_badge(
+    href: &str,
+    label: &str,
+    active: bool,
+    count: Option<u32>,
+    icon: Markup,
+) -> Markup {
     let class = if active { "nav-link active" } else { "nav-link" };
     let show_badge = count.is_some_and(|n| n > 0);
     html! {
         a class=(class) href=(href) {
+            span class="nav-link-icon" aria-hidden="true" { (icon) }
             span class="nav-link-label" { (label) }
             @if show_badge {
                 span class="nav-link-badge" aria-label=(format!("{} pending", count.unwrap())) {
@@ -659,13 +897,21 @@ fn user_card(ctx: &ChromeContext) -> Markup {
     let user = ctx.user;
     let initial = display_initial(&user.display_name);
     let color = avatar_color(&user.id.0);
-    let lifecycle_note: Option<&'static str> = match user.lifecycle {
-        UserLifecycle::Active => None,
-        UserLifecycle::Deactivated => Some("Account deactivated"),
-        UserLifecycle::PendingInvite => Some("Pending invitation"),
-        UserLifecycle::SoftDeleted => Some("Account deleted"),
-        UserLifecycle::HardDeleted => Some("Account purged"),
-    };
+    // JSON blob describing the current account — stamped onto the
+    // `.user-card-accounts` container's data attribute so
+    // `MULTI_ACCOUNT_JS` can read it without parsing HTML. The
+    // value rides through Maud's attribute interpolation, which
+    // HTML-escapes characters that could break out of the
+    // attribute (quotes, `<`, `>`), so display names containing
+    // any of those stay safely bottled.
+    let current_account_json = serde_json::json!({
+        "id": user.id.0.to_string(),
+        "name": user.display_name,
+        "email": user.email,
+        "color": color,
+        "initial": initial.to_string(),
+    })
+    .to_string();
 
     html! {
         details class="user-card" {
@@ -677,20 +923,130 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                     span class="user-name" { (user.display_name) }
                     span class="user-email" { (user.email) }
                 }
+                // Vertical 3-dot affordance on the far right of
+                // the summary, telegraphing that the card is a
+                // menu trigger. Faint at rest, brightens with the
+                // rest of the row on hover.
+                span class="user-card-summary-kebab" aria-hidden="true" {
+                    (dots_vertical_icon())
+                }
             }
+            // Popover menu — positioned to the right of the sidebar
+            // panel via `position: fixed` so it escapes the sidebar's
+            // `overflow: hidden`. Layered as: signed-in accounts list,
+            // separator, account-level actions (settings + theme
+            // switcher + sign out). The role pill that used to lead
+            // this menu was retired — operators rarely need a
+            // self-reminder of their own role here, and Owners
+            // visiting /members already see role chips on every row.
             div class="user-card-menu" {
-                div class="user-card-role" {
-                    span class=(role_class(user.instance_role)) {
-                        (role_label(user.instance_role))
-                    }
-                    @if let Some(note) = lifecycle_note {
-                        span class="user-card-note" { (note) }
+                // Multi-account list. The current account renders
+                // server-side with a filled radio indicator; previous
+                // accounts the operator has signed into on this
+                // browser get appended client-side by
+                // `MULTI_ACCOUNT_JS`, which reads the JSON blob on
+                // `data-current-account` (below) plus the
+                // browser-local roster in localStorage. Clicking an
+                // other-account row navigates to `/login?email=…`
+                // so the email comes pre-filled — that's the
+                // "quick switch" today (no shared-session machinery
+                // yet, just a shortcut back to the login form).
+                div class="user-card-accounts" role="list"
+                    data-current-account=(current_account_json) {
+                    div class="user-card-account user-card-account-current"
+                        role="listitem" {
+                        span class="avatar" style=(format!("background:{color}")) {
+                            (initial)
+                        }
+                        span class="user-card-text" {
+                            span class="user-name" { (user.display_name) }
+                            span class="user-email" { (user.email) }
+                        }
+                        span class="user-card-account-radio"
+                             aria-label="Current account" {
+                            (radio_on_icon())
+                        }
                     }
                 }
-                a class="user-card-action" href="/me" { "Profile" }
-                form method="post" action="/logout" class="user-card-action-form" {
+                div class="user-card-divider" {}
+                // Theme switcher first — three icon buttons (auto/
+                // dark/light) on one horizontal row. Sits above
+                // Account settings because it's the most-frequent
+                // tweak operators reach for here. Wired by
+                // `THEME_SWITCH_JS` (below) to set
+                // `<html data-theme="…">` and persist to
+                // localStorage; CSS in `app.css` reacts to the
+                // attribute to override the prefers-color-scheme
+                // baseline.
+                div class="user-card-theme" role="radiogroup"
+                    aria-label="Theme" {
+                    button type="button" class="user-card-theme-btn"
+                           data-theme-choice="auto"
+                           aria-label="Match system theme" {
+                        (theme_auto_icon())
+                    }
+                    button type="button" class="user-card-theme-btn"
+                           data-theme-choice="dark"
+                           aria-label="Dark theme" {
+                        (theme_dark_icon())
+                    }
+                    button type="button" class="user-card-theme-btn"
+                           data-theme-choice="light"
+                           aria-label="Light theme" {
+                        (theme_light_icon())
+                    }
+                }
+                // Account settings — placeholder link until the
+                // per-user settings page lands.
+                a class="user-card-action" href="/me" {
+                    span class="user-card-action-icon" { (settings_icon()) }
+                    span { "Account settings" }
+                }
+                form method="post" action="/logout"
+                     class="user-card-action-form" {
                     (csrf_input(ctx.csrf_token))
-                    button type="submit" class="user-card-signout" { "Sign out" }
+                    button type="submit"
+                           class="user-card-action user-card-signout" {
+                        span class="user-card-action-icon" { (signout_icon()) }
+                        span { "Sign out" }
+                    }
+                }
+                // Template for the other-account rows rendered
+                // client-side by `MULTI_ACCOUNT_JS`. Carries the
+                // CSRF token + a logout form so clicking a row
+                // actually signs the current session out and
+                // bounces the operator to /login with the other
+                // email pre-filled. The delete `<button>` (×) is
+                // a sibling of the submit button so JS can wire
+                // it without conflicting with form submission.
+                template id="tpl-user-card-other-account" {
+                    div class="user-card-account user-card-account-other"
+                        data-other-account="" {
+                        form method="post" action="/logout"
+                             class="user-card-account-form" {
+                            (csrf_input(ctx.csrf_token))
+                            input type="hidden" name="next"
+                                  value="" data-other-next;
+                            button type="submit"
+                                   class="user-card-account-body" {
+                                span class="avatar" data-other-avatar {}
+                                span class="user-card-text" {
+                                    span class="user-name" data-other-name {}
+                                    span class="user-email" data-other-email {}
+                                }
+                                span class="user-card-account-radio"
+                                     aria-hidden="true" {
+                                    (radio_off_icon())
+                                }
+                            }
+                            button type="button"
+                                   class="user-card-account-delete"
+                                   data-other-delete
+                                   aria-label="Remove from quick switch" {
+                                (close_icon())
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -720,30 +1076,17 @@ fn role_label(role: InstanceRole) -> &'static str {
     }
 }
 
-/// Small colored dot rendered at the bottom-right of the member avatar,
-/// communicating the lifecycle state in-line with the identity. Replaces
-/// the dedicated Status column. The dot carries `title` + `aria-label`
-/// so the lifecycle label is available on hover and to screen readers
-/// even though the column header is gone.
-fn avatar_status_dot(lifecycle: UserLifecycle) -> Markup {
-    let (variant, label) = match lifecycle {
-        UserLifecycle::Active => ("avatar-status-active", "Active"),
-        UserLifecycle::PendingInvite => ("avatar-status-pending", "Pending invite"),
-        UserLifecycle::Deactivated => ("avatar-status-deactivated", "Deactivated"),
-        UserLifecycle::SoftDeleted => ("avatar-status-deleted", "Deleted"),
-        UserLifecycle::HardDeleted => ("avatar-status-deleted", "Purged"),
-    };
-    let class = format!("avatar-status {variant}");
-    html! {
-        span class=(class) title=(label) aria-label=(label) {}
-    }
-}
-
-/// Renders the avatar circle + the lifecycle status dot inside the
-/// standard `.avatar-wrapper`. Deactivated users get an extra
-/// treatment: the avatar dims to 50% opacity and a small lock icon
-/// is overlaid in the middle so the disabled state reads at a glance
-/// even when the row is scanned without looking at the status pill.
+/// Renders the avatar circle inside the standard `.avatar-wrapper`.
+/// Deactivated users get an extra treatment: the avatar dims to 50%
+/// opacity and a small lock icon is overlaid in the middle so the
+/// disabled state reads at a glance.
+///
+/// Previously this also rendered a coloured status dot in the
+/// bottom-right of each avatar (active/pending/deactivated). That
+/// dot was dropped: every active member painting a green dot just
+/// added visual noise without conveying anything beyond what the
+/// row's presence already does, and the deactivated state stays
+/// legible via the lock overlay + greyed avatar.
 fn avatar_block(display_name: &str, user_id: &uuid::Uuid, lifecycle: UserLifecycle) -> Markup {
     let initial = display_initial(display_name);
     let color = avatar_color(user_id);
@@ -760,14 +1103,13 @@ fn avatar_block(display_name: &str, user_id: &uuid::Uuid, lifecycle: UserLifecyc
             }
             @if deactivated {
                 // Lock overlay sits above the avatar inside the same
-                // wrapper. `aria-hidden` because the status pill +
-                // user-name "Deactivated" tag already announce the
-                // state to assistive tech.
+                // wrapper. `aria-hidden` because the user-name
+                // "Deactivated" tag already announces the state to
+                // assistive tech.
                 span class="avatar-lock" aria-hidden="true" {
                     (lock_icon())
                 }
             }
-            (avatar_status_dot(lifecycle))
         }
     }
 }
@@ -798,7 +1140,12 @@ fn avatar_color(user_id: &uuid::Uuid) -> &'static str {
 
 /// `GET /login` page. `error` is rendered above the form when present
 /// (e.g. after a failed credential submission). No left-nav chrome.
-pub fn login_page(error: Option<&str>) -> Markup {
+pub fn login_page(error: Option<&str>, prefill_email: Option<&str>) -> Markup {
+    // When the user-card popover quick-switches to another account
+    // it lands here with `?email=…`. Pre-fill the email input and
+    // shift autofocus to the password field so the operator only
+    // types the credential they actually need to.
+    let has_prefill = prefill_email.is_some_and(|e| !e.is_empty());
     let content = html! {
         h1 { "Sign in" }
         div class="card" {
@@ -808,13 +1155,23 @@ pub fn login_page(error: Option<&str>) -> Markup {
                 }
                 div class="field" {
                     label for="email" { "Email" }
-                    input type="email" name="email" id="email" required
-                          autocomplete="username" autofocus;
+                    @if let Some(email) = prefill_email.filter(|e| !e.is_empty()) {
+                        input type="email" name="email" id="email" required
+                              autocomplete="username" value=(email);
+                    } @else {
+                        input type="email" name="email" id="email" required
+                              autocomplete="username" autofocus;
+                    }
                 }
                 div class="field" {
                     label for="password" { "Password" }
-                    input type="password" name="password" id="password" required
-                          autocomplete="current-password";
+                    @if has_prefill {
+                        input type="password" name="password" id="password" required
+                              autocomplete="current-password" autofocus;
+                    } @else {
+                        input type="password" name="password" id="password" required
+                              autocomplete="current-password";
+                    }
                 }
                 button type="submit" class="btn" { "Sign in" }
             }
@@ -1315,9 +1672,9 @@ fn alert_circle_icon() -> Markup {
 }
 
 /// 22px trash-can icon used as the centered feature icon on the
-/// Delete and Purge modals. Stroke uses `currentColor` so the icon
-/// inherits the `.dialog-icon-danger` red tint without needing a
-/// dedicated fill rule.
+/// Purge modal (terminal hard-delete). Stroke uses `currentColor`
+/// so the icon inherits the `.dialog-icon-danger` red tint without
+/// needing a dedicated fill rule.
 fn trash_icon() -> Markup {
     html! {
         svg xmlns="http://www.w3.org/2000/svg"
@@ -1330,6 +1687,211 @@ fn trash_icon() -> Markup {
             path d="M10 11v6" {}
             path d="M14 11v6" {}
             path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" {}
+        }
+    }
+}
+
+/// Multi-user silhouette — used on the `/members` nav link. Same
+/// shoulder + head construction as `user_icon` but with a second
+/// (partial) person stepped behind so the glyph reads as a group.
+/// Stroke uses `currentColor` so the icon picks up the nav-link's
+/// active/inactive tint without per-state overrides.
+fn users_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="20" height="20" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" {}
+            circle cx="9" cy="7" r="4" {}
+            path d="M22 21v-2a4 4 0 0 0-3-3.87" {}
+            path d="M16 3.13a4 4 0 0 1 0 7.75" {}
+        }
+    }
+}
+
+/// Magnifying-glass glyph used as the leading icon on the
+/// sidebar's search trigger. Replaces the previous "🔍" emoji,
+/// which rendered with the OS's pictorial emoji palette and
+/// clashed with the monochrome nav chrome. Stroke uses
+/// `currentColor`.
+fn search_glyph_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="11" cy="11" r="7" {}
+            line x1="21" y1="21" x2="16.65" y2="16.65" {}
+        }
+    }
+}
+
+/// 22px incognito glyph (fedora + sunglasses) used as the feature
+/// icon on the Anonymize modal. The classic browser-incognito
+/// imagery telegraphs "identity is scrubbed; the row stays" more
+/// accurately than a trash can, which reads as terminal delete and
+/// blurs the distinction with the Purge modal. Stroke + fill both
+/// use `currentColor` so the icon inherits the
+/// `.dialog-icon-danger` red tint; the sunglass lenses fill solid
+/// for the iconic dark-lens silhouette.
+fn incognito_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="22" height="22" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            // Hat crown — a flat-topped arch from shoulder to shoulder.
+            path d="M6 10 Q6 5 12 5 Q18 5 18 10" {}
+            // Hat brim — straight line wider than the crown.
+            line x1="3" y1="11" x2="21" y2="11" {}
+            // Left sunglass lens (filled).
+            circle cx="7.5" cy="16" r="3" fill="currentColor" {}
+            // Right sunglass lens (filled).
+            circle cx="16.5" cy="16" r="3" fill="currentColor" {}
+            // Bridge connecting the two lenses.
+            line x1="10.5" y1="16" x2="13.5" y2="16" {}
+        }
+    }
+}
+
+/// Gear icon — leading glyph on the user-card popover's "Account
+/// settings" row. Stroke uses `currentColor`.
+fn settings_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="3" {}
+            path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" {}
+        }
+    }
+}
+
+/// Door + arrow — leading glyph on the user-card popover's
+/// "Sign out" row. Suggests "leave this session" without resorting
+/// to a power-button glyph (which could be misread as "shut down
+/// the instance"). Stroke uses `currentColor`.
+fn signout_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" {}
+            polyline points="16 17 21 12 16 7" {}
+            line x1="21" y1="12" x2="9" y2="12" {}
+        }
+    }
+}
+
+/// Half-shaded circle — "Auto" theme button in the user-card
+/// theme switcher. The left half is filled, the right half is
+/// outlined, so the glyph reads as "system-controlled, neither
+/// pinned to light nor dark". Stroke + fill use `currentColor`.
+fn theme_auto_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="9" {}
+            // Half-fill the left side of the circle so the icon
+            // reads as a dial split between two modes.
+            path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none" {}
+        }
+    }
+}
+
+/// Crescent moon — "Dark" theme button in the user-card theme
+/// switcher. Stroke uses `currentColor`.
+fn theme_dark_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" {}
+        }
+    }
+}
+
+/// Vertical 3-dot affordance — placed on the right of the
+/// user-card summary to telegraph that the row opens a menu.
+/// Three small filled circles stacked vertically, in
+/// `currentColor` so the dots pick up the summary's text colour.
+fn dots_vertical_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="currentColor"
+            aria-hidden="true" {
+            circle cx="12" cy="5"  r="1.6" {}
+            circle cx="12" cy="12" r="1.6" {}
+            circle cx="12" cy="19" r="1.6" {}
+        }
+    }
+}
+
+/// Filled radio — current-account indicator on the user-card
+/// popover. Outer ring + filled inner dot. Stroke + fill use
+/// `currentColor`. Pairs with `radio_off_icon` (hollow) for the
+/// "other accounts" rows below.
+fn radio_on_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="9" {}
+            circle cx="12" cy="12" r="4" fill="currentColor" stroke="none" {}
+        }
+    }
+}
+
+/// Hollow radio — "other accounts" indicator on the user-card
+/// popover. Just the outer ring, no inner dot. Stroke uses
+/// `currentColor`.
+fn radio_off_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="9" {}
+        }
+    }
+}
+
+/// Sun with rays — "Light" theme button in the user-card theme
+/// switcher. Stroke uses `currentColor`.
+fn theme_light_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="4" {}
+            // Eight evenly-spaced rays.
+            line x1="12" y1="2"  x2="12" y2="4"  {}
+            line x1="12" y1="20" x2="12" y2="22" {}
+            line x1="2"  y1="12" x2="4"  y2="12" {}
+            line x1="20" y1="12" x2="22" y2="12" {}
+            line x1="4.93" y1="4.93"   x2="6.34"  y2="6.34"  {}
+            line x1="17.66" y1="17.66" x2="19.07" y2="19.07" {}
+            line x1="4.93" y1="19.07"  x2="6.34"  y2="17.66" {}
+            line x1="17.66" y1="6.34"  x2="19.07" y2="4.93"  {}
         }
     }
 }
@@ -1593,12 +2155,18 @@ pub fn members_page(
             (maud::PreEscaped(MEMBERS_SEARCH_JS))
             (maud::PreEscaped(MEMBERS_SELECT_ALL_JS))
             (maud::PreEscaped(MEMBERS_KEBAB_OUTSIDE_CLICK_JS))
+            (maud::PreEscaped(DROPDOWN_FLIP_JS))
             (maud::PreEscaped(REAUTH_CHAIN_JS))
             (maud::PreEscaped(CONFIRM_NAME_JS))
             (maud::PreEscaped(ROLE_PICKER_GATE_JS))
             (maud::PreEscaped(CONFIRM_CHECKBOX_JS))
             (maud::PreEscaped(INVITE_SWAP_TO_INVITE_JS))
             (maud::PreEscaped(INVITE_REFRESH_ON_CLOSE_JS))
+            // Copy-URL handler — needed on /members because the
+            // invite-sent success modal that opens via HX-Retarget
+            // renders inside dlg-invite here. The standalone
+            // /members/invite fallback page loads it separately.
+            (maud::PreEscaped(INVITE_COPY_JS))
         }
     };
     shell_app_wide(ctx, "Members", PageId::Members, content)
@@ -1915,6 +2483,51 @@ const MEMBERS_KEBAB_OUTSIDE_CLICK_JS: &str = r#"
             }
         });
     });
+})();
+"#;
+
+// Dropdown viewport-flip. Every <details>-based dropdown opens its
+// menu downward + right-aligned by default. Near the bottom of the
+// viewport (rows-per-page in the pinned pagination, kebab on the
+// last row of a table) or near the right edge that overflows the
+// visible area, so we flip the menu by adding `.flip-up` / `.flip-
+// left` classes the CSS uses to swap the anchoring offsets.
+//
+// Uses the `toggle` event which fires after `<details>` opens/closes.
+// `toggle` doesn't bubble, so we attach in the capture phase. The
+// measure-then-flip happens synchronously inside the handler, so the
+// browser doesn't paint the default position before the flipped one.
+const DROPDOWN_FLIP_JS: &str = r#"
+(function() {
+    var GUTTER = 8;  // viewport-edge margin we always keep clear
+
+    function flipIfNeeded(details) {
+        if (!details.open) {
+            details.classList.remove('flip-up', 'flip-left');
+            return;
+        }
+        var menu = details.querySelector(
+            '.filter-menu-list, .row-actions-menu'
+        );
+        if (!menu) return;
+        // Strip any prior flip so the measurement reflects the
+        // default-anchored position.
+        details.classList.remove('flip-up', 'flip-left');
+        var rect = menu.getBoundingClientRect();
+        if (rect.bottom + GUTTER > window.innerHeight) {
+            details.classList.add('flip-up');
+        }
+        if (rect.left - GUTTER < 0) {
+            details.classList.add('flip-left');
+        }
+    }
+
+    document.addEventListener('toggle', function(e) {
+        var d = e.target;
+        if (!(d instanceof HTMLDetailsElement)) return;
+        if (!(d.matches('details.filter-menu, details.row-actions'))) return;
+        flipIfNeeded(d);
+    }, true);
 })();
 "#;
 
@@ -2368,7 +2981,6 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
                         span class="avatar avatar-sm" style=(format!("background:{color}")) {
                             (initial)
                         }
-                        (avatar_status_dot(UserLifecycle::PendingInvite))
                     }
                     div class="user-row-text" {
                         span class="user-name" { (invitation.email) }
@@ -2715,16 +3327,23 @@ fn render_action_item(
                 "Change role…"
             }
         },
+        // RowAction::Delete = soft delete (anonymize). The kebab
+        // label calls it "Anonymize…" so operators understand it
+        // keeps shared content under an anonymized account. The
+        // internal `Delete` enum + `/delete` URL stay as historical
+        // names — only the visible label changed.
         RowAction::Delete => html! {
             button type="button" class="row-action-item row-action-danger"
                    data-open-dialog=(format!("dlg-delete-{id}")) {
-                "Delete…"
+                "Anonymize…"
             }
         },
+        // RowAction::Purge = hard delete (full removal). The kebab
+        // label calls it "Delete…" — the terminal, total action.
         RowAction::Purge => html! {
             button type="button" class="row-action-item row-action-danger"
                    data-open-dialog=(format!("dlg-purge-{id}")) {
-                "Purge…"
+                "Delete…"
             }
         },
     }
@@ -2739,8 +3358,8 @@ fn render_locked_item(action: RowAction) -> Markup {
         RowAction::Deactivate => ("Deactivate", false),
         RowAction::Reactivate => ("Reactivate", false),
         RowAction::ChangeRole => ("Change role…", false),
-        RowAction::Delete => ("Delete…", true),
-        RowAction::Purge => ("Purge…", true),
+        RowAction::Delete => ("Anonymize…", true),
+        RowAction::Purge => ("Delete…", true),
     };
     let class = if danger {
         "row-action-item row-action-locked row-action-danger"
@@ -3036,11 +3655,12 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
             }
             (role_owner_confirm_dialog(id, name))
         },
-        // Delete = anonymize. Account row stays so any non-orphaned
-        // content (comments on shared docs, shared list ownership, etc.)
-        // keeps its byline; just the person's identity is scrubbed.
-        // Uses the centered-chrome variant + danger-red feature icon so
-        // the destructive nature is immediately visible.
+        // RowAction::Delete = soft delete, surfaced as "Anonymize".
+        // Account row stays so any non-orphaned content (comments on
+        // shared docs, shared list ownership, etc.) keeps its byline;
+        // just the person's identity is scrubbed. Centered chrome +
+        // danger-red feature icon so the destructive nature is
+        // immediately visible.
         RowAction::Delete => html! {
             dialog id=(format!("dlg-delete-{id}"))
                    class="action-dialog action-dialog-centered" {
@@ -3048,20 +3668,22 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                      method="post" action=(format!("/members/{id}/delete")) {
                     div class="dialog-header" {
                         div class="dialog-icon dialog-icon-danger" {
-                            (trash_icon())
+                            // Incognito glyph (not trash) — the row is
+                            // *anonymized*, not deleted. Trash is reserved
+                            // for the Purge modal below.
+                            (incognito_icon())
                         }
                         button type="button" class="dialog-close" data-close-dialog
                                aria-label="Close" {
                             (close_icon())
                         }
                     }
-                    h2 { "Delete " (name) "?" }
+                    h2 { "Anonymize " (name) "?" }
                     p class="dialog-description" {
-                        "This anonymizes the account. Sign-in is revoked, "
-                        "credentials are removed, and the email is redacted. "
-                        "Any content " (name) " created that other members "
-                        "still rely on stays in place, attributed to the "
-                        "anonymized account."
+                        "Sign-in is revoked, credentials are removed, and "
+                        "the email is redacted. Any content " (name) " "
+                        "created that other members still rely on stays "
+                        "in place, attributed to the anonymized account."
                     }
                     div class="dialog-alert dialog-alert-danger" role="alert" {
                         (alert_circle_icon())
@@ -3074,16 +3696,17 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                         button type="button" class="btn-danger"
                                data-reauth-confirm=(format!("form-delete-{id}"))
                                disabled {
-                            "Delete"
+                            "Anonymize"
                         }
                     }
                 }
             }
         },
-        // Purge = total removal. The account and every piece of content
-        // it created is dropped, even if other members were collaborating
-        // on that content. Heavier hammer than Delete; same chrome so
-        // the two read as a pair, same alert because both are terminal.
+        // RowAction::Purge = hard delete, surfaced as "Delete". The
+        // account and every piece of content it created is dropped,
+        // even if other members were collaborating on that content.
+        // Heavier hammer than Anonymize; same chrome so the two read
+        // as a pair, same alert because both are terminal.
         RowAction::Purge => html! {
             dialog id=(format!("dlg-purge-{id}"))
                    class="action-dialog action-dialog-centered" {
@@ -3098,12 +3721,13 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                             (close_icon())
                         }
                     }
-                    h2 { "Purge " (name) "?" }
+                    h2 { "Delete " (name) "?" }
                     p class="dialog-description" {
-                        "This fully removes the account and every piece of "
+                        "Fully removes the account and every piece of "
                         "content " (name) " created, regardless of whether "
-                        "other members were collaborating on it. Use Delete "
-                        "instead if you only want to anonymize the account."
+                        "other members were collaborating on it. Use "
+                        "Anonymize instead if you only want to scrub the "
+                        "identity but keep the shared content."
                     }
                     div class="dialog-alert dialog-alert-danger" role="alert" {
                         (alert_circle_icon())
@@ -3116,7 +3740,7 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                         button type="button" class="btn-danger"
                                data-reauth-confirm=(format!("form-purge-{id}"))
                                disabled {
-                            "Purge"
+                            "Delete"
                         }
                     }
                 }
@@ -3246,25 +3870,31 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
         // variants are red too because the eventual outcome (after
         // the 72h window if no one vetoes) is destructive — the
         // operator should still feel the weight of having queued it.
+        //
+        // Token names match the new UI vocabulary: "anonymized" =
+        // the soft-delete (which keeps shared content), "deleted" =
+        // the hard-delete (full removal). The backend handlers were
+        // renamed to emit these new tokens; backend routes + audit
+        // events keep their original names.
+        "anonymized" => (
+            ToastKind::Error,
+            "Account anonymized",
+            format!("{name}'s identity has been scrubbed."),
+        ),
         "deleted" => (
             ToastKind::Error,
             "Account deleted",
-            format!("{name}'s account has been anonymized."),
-        ),
-        "purged" => (
-            ToastKind::Error,
-            "Account purged",
             format!("{name}'s account has been fully removed."),
+        ),
+        "pending_anonymize" => (
+            ToastKind::Error,
+            "Awaiting review",
+            "A 72-hour veto window has begun for the requested anonymization.".to_string(),
         ),
         "pending_delete" => (
             ToastKind::Error,
             "Awaiting review",
             "A 72-hour veto window has begun for the requested deletion.".to_string(),
-        ),
-        "pending_purge" => (
-            ToastKind::Error,
-            "Awaiting review",
-            "A 72-hour veto window has begun for the requested purge.".to_string(),
         ),
 
         _ => return None,
@@ -3669,8 +4299,11 @@ fn pending_action_label(row: &pending::TransitionRow) -> String {
     use pending::TransitionKind;
     match row.kind {
         TransitionKind::Deactivate => "Deactivate".to_string(),
-        TransitionKind::SoftDelete => "Delete".to_string(),
-        TransitionKind::HardDelete => "Purge".to_string(),
+        // Soft-delete is surfaced as "Anonymize" in the UI; the
+        // internal `TransitionKind::SoftDelete` enum keeps its
+        // historical name. Hard-delete becomes "Delete".
+        TransitionKind::SoftDelete => "Anonymize".to_string(),
+        TransitionKind::HardDelete => "Delete".to_string(),
         TransitionKind::RoleChange => match row.role_payload() {
             Ok(payload) => match payload.to_role {
                 InstanceRole::Owner => "Promote to Owner".to_string(),

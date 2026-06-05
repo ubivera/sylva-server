@@ -172,8 +172,10 @@ async fn app_shell_includes_instance_name_and_user_card() {
     assert!(body.contains(r#"class="user-card""#));
     assert!(body.contains("Big Boss"));
     assert!(body.contains("o@test.local"));
-    // Owner role badge with the right class.
-    assert!(body.contains("role-owner"));
+    // Role pill in the sidebar user-card was retired with the
+    // popover redesign; the role still surfaces inside /me's page
+    // content as a plain label (see
+    // `role_label_renders_on_me_page` below).
     // Search trigger placeholder.
     assert!(body.contains(r#"class="search-trigger""#));
 }
@@ -195,7 +197,14 @@ async fn login_page_uses_public_shell_not_app_shell() {
 }
 
 #[tokio::test]
-async fn role_badge_class_matches_user_role() {
+async fn role_label_renders_on_me_page() {
+    // /me used to surface the viewer's role via the sidebar
+    // user-card role pill (`role-member`, etc.); that pill was
+    // retired when the user-card became a popover. Today the role
+    // is still shown inside /me's content card as a plain label —
+    // this test asserts the label is present in the rendered page
+    // for the Member viewer and that the Owner / Admin labels
+    // don't accidentally leak in.
     let app = TestApp::new().await;
     app.seed_user("u@test.local", "Reg User", "userpw", InstanceRole::Member)
         .await;
@@ -213,9 +222,9 @@ async fn role_badge_class_matches_user_role() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body_bytes);
-    assert!(body.contains("role-member"));
-    assert!(!body.contains("role-owner"));
-    assert!(!body.contains("role-admin"));
+    assert!(body.contains("Member"));
+    assert!(!body.contains(">Owner<"));
+    assert!(!body.contains(">Admin<"));
 }
 
 #[tokio::test]
@@ -440,11 +449,11 @@ async fn users_page_lists_all_users_for_admin() {
     ] {
         assert!(body.contains(needle), "expected {needle:?} in: {body}");
     }
-    // Role badges rendered. Status is now communicated by a dot on the
-    // avatar (see `.avatar-status` in CSS) rather than a column.
+    // Role badges rendered. Lifecycle is no longer communicated via
+    // a Status column or avatar-corner dot — just the row's presence
+    // (active accounts) and a lock overlay (deactivated accounts).
     assert!(body.contains("role-admin"));
     assert!(body.contains("role-member"));
-    assert!(body.contains("avatar-status-active"));
     // The viewing admin is tagged as "you".
     assert!(body.contains("row-self-tag"));
 }
@@ -614,7 +623,7 @@ async fn users_page_invalid_sort_param_falls_back_to_default() {
 }
 
 #[tokio::test]
-async fn users_page_renders_deactivated_avatar_status_dot() {
+async fn users_page_renders_deactivated_avatar_lock_overlay() {
     let app = TestApp::new().await;
     app.seed_user("owner@test.local", "Big Boss", "pw", InstanceRole::Owner)
         .await;
@@ -635,11 +644,17 @@ async fn users_page_renders_deactivated_avatar_status_dot() {
 
     let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
-    // Status is rendered as a colored dot on the avatar, not a column.
-    assert!(body.contains("avatar-status-active"));
+    // Deactivated members render with `avatar-deactivated` (greys the
+    // initial) plus an `avatar-lock` overlay containing the lock icon —
+    // the dual signal that replaced the retired status-dot in the
+    // bottom-right corner of the avatar.
     assert!(
-        body.contains("avatar-status-deactivated"),
-        "expected deactivated dot in: {body}"
+        body.contains("avatar-deactivated"),
+        "expected deactivated avatar class in: {body}"
+    );
+    assert!(
+        body.contains("avatar-lock"),
+        "expected lock overlay span in: {body}"
     );
     assert!(body.contains("Ghost"));
 }

@@ -280,15 +280,18 @@ pub async fn delete_member(
     {
         return resp;
     }
+    // The route + the admin_logic function keep the historical
+    // "delete" / "soft_delete" naming; the toast token is renamed
+    // because the UI surfaces this action as "Anonymize".
     match admin_logic::perform_soft_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
             htmx,
-            "deleted",
+            "anonymized",
             Some(&target.display_name),
         ),
         Ok(Outcome::Pending(_)) => {
-            redirect_with_action_toast("/members", htmx, "pending_delete", None)
+            redirect_with_action_toast("/members", htmx, "pending_anonymize", None)
         }
         Err(e) => lifecycle_error_to_response(e, htmx),
     }
@@ -316,15 +319,18 @@ pub async fn purge_member(
     {
         return resp;
     }
+    // Historical "purge" / "hard_delete" naming stays on the backend;
+    // the toast token is renamed because the UI surfaces this action
+    // as "Delete".
     match admin_logic::perform_hard_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
             htmx,
-            "purged",
+            "deleted",
             Some(&target.display_name),
         ),
         Ok(Outcome::Pending(_)) => {
-            redirect_with_action_toast("/members", htmx, "pending_purge", None)
+            redirect_with_action_toast("/members", htmx, "pending_delete", None)
         }
         Err(e) => lifecycle_error_to_response(e, htmx),
     }
