@@ -184,9 +184,9 @@ async fn regular_user_cannot_invoke_row_actions() {
 
 #[tokio::test]
 async fn admin_deactivates_user_redirects_to_clean_members_url() {
-    // Non-HTMX path: 303 to a clean /members. Toast detail used to ride
-    // in the query string; it now travels via HX-Trigger on the HTMX
-    // path only (see admin_deactivates_user_htmx_emits_info_toast).
+    // Non-HTMX path: 303 to a clean /members. Toast detail travels via
+    // HX-Trigger on the HTMX path only (see
+    // htmx_deactivate_emits_info_toast_via_hx_trigger).
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -206,7 +206,6 @@ async fn admin_deactivates_user_redirects_to_clean_members_url() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&resp), "/members");
 
-    // Confirm DB-side state changed.
     let lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle::text FROM identity.users WHERE id = $1",
     )
@@ -690,8 +689,7 @@ async fn kebab_shown_for_owner_viewing_other_owner() {
 
 #[tokio::test]
 async fn htmx_deactivate_emits_info_toast_via_hx_trigger() {
-    // Toast now ships via HX-Trigger on the HTMX response, not
-    // embedded in the page body via query params. Kind is `info`
+    // Toast ships via HX-Trigger on the HTMX response. Kind is `info`
     // because deactivate is reversible.
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
@@ -847,8 +845,8 @@ async fn delete_dialog_fetched_on_demand_with_csrf_input() {
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let target_id = target.id.0;
 
-    // The members page no longer ships the dialog markup — only the
-    // kebab item that fetches it on demand.
+    // The members page ships only the kebab item that fetches the
+    // dialog markup on demand, not the dialog itself.
     let page = body_text(get(&app, "/members", &cookie).await).await;
     assert!(
         !page.contains(&format!(r#"id="dlg-delete-{target_id}""#)),
@@ -920,9 +918,8 @@ async fn invite_form_renders_for_admin() {
     assert!(body.contains(r#"name="email""#));
     assert!(body.contains(r#"name="role""#));
     assert!(body.contains(r#"name="csrf_token""#));
-    // Per the modal redesign, admins no longer see role choice in the
-    // UI — they get a hidden role=member input. The segmented control
-    // with Admin/Owner segments only appears for Owner viewers.
+    // Admins don't see role choice in the UI — they get a hidden
+    // role=member input.
     assert!(
         body.contains(r#"type="hidden" name="role" value="member""#),
         "admin form should pin role=member via hidden input: {body}"
@@ -933,7 +930,7 @@ async fn invite_form_renders_for_admin() {
 
 #[tokio::test]
 async fn invite_form_renders_as_member_only_even_for_owner() {
-    // Invites are now always Member regardless of viewer. Promotion
+    // Invites are always Member regardless of viewer. Promotion
     // happens after acceptance via Change role. Owners see the same
     // simplified form as Admins: email field + hidden role=member.
     let app = TestApp::new().await;
@@ -1180,10 +1177,10 @@ async fn accept_invite_submit_creates_account_and_sets_session_cookie() {
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    // Success no longer redirects — the response body is the
-    // recovery-code interstitial, rendered directly so the one-time
-    // code never lands in a URL, history entry, or referer header.
-    // The session cookie still rides the same response.
+    // Success renders the recovery-code interstitial directly (no
+    // redirect) so the one-time code never lands in a URL, history
+    // entry, or referer header. The session cookie still rides the
+    // same response.
     assert_eq!(resp.status(), StatusCode::OK);
     let set_cookie = resp
         .headers()
@@ -1423,8 +1420,8 @@ async fn invite_submit_htmx_returns_success_partial_not_full_page() {
     assert!(body.contains("Invitation sent"));
     assert!(body.contains("/invite/"));
     assert!(body.contains("dialog-icon-success"));
-    // Single Close action — "Invite another" was dropped so each
-    // invite flow is one at a time.
+    // Single Close action — no "Invite another"; each invite flow is
+    // one at a time.
     assert!(body.contains(">Close<"));
     assert!(!body.contains("Invite another"));
 }
@@ -1576,7 +1573,7 @@ async fn shared_modals_not_baked_into_live_dom() {
         body.contains("hearthOpenModal"),
         "DIALOG_JS must expose the on-demand open helper"
     );
-    // Invite modal is now on-demand too — no template, no live dialog.
+    // Invite modal is on-demand — no template, no live dialog.
     assert!(
         !body.contains(r#"tpl-dlg-invite""#),
         "invite modal must NOT ship as a <template> — it's fetched on demand"
@@ -1585,8 +1582,8 @@ async fn shared_modals_not_baked_into_live_dom() {
         !body.contains(r#"id="dlg-invite""#),
         "invite dialog must NOT be in the page source"
     );
-    // Per-row action dialogs are gone from the source too — only the
-    // kebab triggers remain.
+    // Per-row action dialogs are not in the source — only the kebab
+    // triggers remain.
     assert!(
         !body.contains(r#"id="dlg-delete-"#),
         "per-row delete dialogs must NOT be inline"
@@ -1628,7 +1625,7 @@ async fn members_page_renders_invite_cta_and_modal() {
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
     // CTA fetches the invite modal on demand; the dialog markup itself
-    // is no longer in the page.
+    // is not in the page.
     let body = body_text(get(&app, "/members", &cookie).await).await;
     assert!(body.contains(r#"data-open-modal="/modals/invite""#));
     assert!(body.contains("Invite member"));
@@ -1760,7 +1757,7 @@ async fn revoke_invite_with_correct_password_htmx_responds_with_hx_redirect() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Reissue invitation — kebab action on pending invite rows (CP4)
+// Reissue invitation — kebab action on pending invite rows
 // ────────────────────────────────────────────────────────────────────────
 
 /// Pull the (token_hash, expires_at) pair for an invitation so tests
@@ -1929,7 +1926,6 @@ async fn reissue_rejected_for_already_accepted_invite() {
         .unwrap();
     tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
 
-    // Now try to reissue.
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
@@ -1996,7 +1992,7 @@ async fn pending_invite_row_reissue_dialog_fetched_on_demand() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// /pending — Owners-only veto review page (Checkpoint 1 MVP)
+// /pending — Owners-only veto review page
 // ────────────────────────────────────────────────────────────────────────
 
 /// Seed two Owners and trigger an Owner-on-Owner deactivate so a
@@ -2107,10 +2103,8 @@ async fn pending_page_active_row_veto_dialog_fetched_on_demand() {
 
 #[tokio::test]
 async fn members_sidebar_renders_count_badge_for_owner_with_pendings() {
-    // The pending-action count badge now lives on the Members nav
-    // entry (the dedicated Pending review link was retired in favour
-    // of the in-page alert card). Badge only renders when count > 0
-    // and the viewer is an Owner.
+    // The pending-action count badge lives on the Members nav entry
+    // and only renders when count > 0 and the viewer is an Owner.
     let app = TestApp::new().await;
     let (cookie, _target, _transition_id, _csrf) =
         seed_pending_owner_deactivate(&app).await;
@@ -2125,9 +2119,8 @@ async fn members_sidebar_renders_count_badge_for_owner_with_pendings() {
         body.contains(">1</span>"),
         "expected '1' inside the badge"
     );
-    // The dedicated Pending review nav entry no longer exists — the
-    // sidebar should not carry a nav-link pointing at /pending. (The
-    // /pending page itself still exists, reachable via the alert
+    // The sidebar should not carry a nav-link pointing at /pending.
+    // (The /pending page itself still exists, reachable via the alert
     // CTA's btn — that's not a `.nav-link`.)
     assert!(
         !body.contains(r#"<a class="nav-link" href="/pending">"#)
@@ -2153,10 +2146,9 @@ async fn members_sidebar_hides_badge_for_admin() {
 
 #[tokio::test]
 async fn members_page_renders_pending_alert_for_owner_with_pendings() {
-    // Replaces the dedicated /pending sidebar link: when at least
-    // one Owner-on-Owner pending transition is in flight, /members
-    // renders a primary-tinted alert card between the page header
-    // and the toolbar with a Review CTA linking to /pending.
+    // When at least one Owner-on-Owner pending transition is in
+    // flight, /members renders a primary-tinted alert card between the
+    // page header and the toolbar with a Review CTA linking to /pending.
     let app = TestApp::new().await;
     let (cookie, _target, _transition_id, _csrf) =
         seed_pending_owner_deactivate(&app).await;
@@ -2171,7 +2163,6 @@ async fn members_page_renders_pending_alert_for_owner_with_pendings() {
         body.contains("1 pending action awaiting review"),
         "expected singular title for count=1"
     );
-    // CTA links to /pending.
     assert!(body.contains(r#"href="/pending""#));
 }
 

@@ -97,8 +97,6 @@ pub async fn login_submit(
     State(state): State<AppState>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    // Verify credentials via the existing auth helper — same code path
-    // the JSON API uses, so behaviour stays consistent.
     let outcome = match auth::verify_credentials(&state.db, &form.email, &form.password).await {
         Ok(o) => o,
         Err(err) => {
@@ -122,8 +120,6 @@ pub async fn login_submit(
         }
     };
 
-    // Issue a session — same SessionRepository::create + audit shape as
-    // the JSON login handler.
     let actor = audit::Actor {
         user_id: user.id,
         display_name: user.display_name.clone(),
@@ -392,11 +388,11 @@ pub async fn me_profile_submit(
     let old_display_name = auth.user.display_name.clone();
     let result: anyhow::Result<identity::User> = async {
         let mut tx = state.db.begin().await?;
-        // `update_profile` still takes an optional `locale` slot. We
-        // pass `None` here because the settings UI no longer surfaces
-        // locale as an editable field — operators don't typically
-        // think about BCP-47 tags. Leaving the column intact keeps
-        // future server-side locale-aware rendering paths open.
+        // `update_profile` takes an optional `locale` slot. We pass
+        // `None` here because the settings UI doesn't surface locale as
+        // an editable field — operators don't typically think about
+        // BCP-47 tags. Leaving the column intact keeps future
+        // server-side locale-aware rendering paths open.
         let user = identity::UserRepository::update_profile(
             &mut tx,
             auth.user.id,
@@ -1109,10 +1105,9 @@ fn set_cookie_header(response: &mut Response, value: &str) {
 ///   defense-in-depth posture we want for session credentials).
 /// - `SameSite=Lax` — sent on top-level navigations + GET cross-site;
 ///   blocked on cross-site POST. Good default for an admin UI.
-/// - **`Secure` is intentionally omitted** for this checkpoint because
-///   we ship plain HTTP in dev. TLS lands near-MVP; that checkpoint
-///   should flip `Secure` on conditionally based on the public base URL
-///   scheme.
+/// - **`Secure` is intentionally omitted** because dev ships plain
+///   HTTP. Once TLS lands, `Secure` should be flipped on conditionally
+///   based on the public base URL scheme.
 fn cookie_value(name: &str, value: &str, clearing: bool) -> String {
     if clearing {
         format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")

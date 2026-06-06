@@ -146,7 +146,6 @@ async fn logout_revokes_the_session() {
     let logout = app.post("/api/auth/logout", Some(&token), None).await;
     logout.assert_status(StatusCode::NO_CONTENT);
 
-    // Same token must no longer work.
     let me = app.get("/api/me", Some(&token)).await;
     me.assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("invalid_session");
@@ -193,7 +192,6 @@ async fn accept_invite_creates_user_and_issues_session() {
     let body: LoginBody = resp.json();
     assert!(!body.token.is_empty());
 
-    // The returned session should authenticate.
     let me: MeBody = app.get("/api/me", Some(&body.token)).await.json();
     assert_eq!(me.email, "alice@test.local");
     assert_eq!(me.instance_role, InstanceRole::Member);
@@ -223,7 +221,6 @@ async fn accept_invite_rejects_expired_token() {
     let (inv_id, token) =
         seed_pending_invite(&app.pool, owner.id, "exp@test.local", InstanceRole::Member).await;
 
-    // Forcibly expire it.
     sqlx::query("UPDATE identity.invitations SET expires_at = now() - interval '1 hour' WHERE id = $1")
         .bind(inv_id)
         .execute(&app.pool)
@@ -278,7 +275,6 @@ async fn accept_invite_rejects_already_accepted_token() {
     let (_inv_id, token) =
         seed_pending_invite(&app.pool, owner.id, "twice@test.local", InstanceRole::Member).await;
 
-    // First accept succeeds.
     let first = app
         .post(
             "/api/auth/accept-invite",
@@ -292,7 +288,6 @@ async fn accept_invite_rejects_already_accepted_token() {
         .await;
     first.assert_status(StatusCode::CREATED);
 
-    // Second accept with the same token must fail.
     let second = app
         .post(
             "/api/auth/accept-invite",

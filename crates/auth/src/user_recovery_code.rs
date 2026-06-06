@@ -40,9 +40,8 @@ pub async fn bootstrap(
 
 /// Replace a user's existing recovery code with a fresh one. UPSERTs so
 /// the call is idempotent against "the user somehow doesn't have a code
-/// yet" (e.g. an account predating CP1 — none today, but the safety
-/// belt is cheap). `generated_at` is reset; `last_used_at` is cleared
-/// because the freshly-issued code has never been used.
+/// yet". `generated_at` is reset; `last_used_at` is cleared because the
+/// freshly-issued code has never been used.
 pub async fn rotate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: UserId,
@@ -65,10 +64,9 @@ pub async fn rotate(
 }
 
 /// Look up the active recovery code metadata for a user. Returns
-/// `Ok(None)` when the user has no recovery code on file yet — should
-/// only happen for accounts that predate CP1 or were created via a path
-/// that doesn't bootstrap a code (none today). Never returns the raw or
-/// the hash — those stay sealed in the DB.
+/// `Ok(None)` when the user has no recovery code on file yet — only
+/// happens for accounts created via a path that doesn't bootstrap a
+/// code. Never returns the raw or the hash — those stay sealed in the DB.
 pub async fn metadata(
     pool: &PgPool,
     user_id: UserId,
@@ -89,7 +87,7 @@ pub async fn metadata(
 /// via the WHERE clause). Returns `Ok(true)` on success, `Ok(false)` on
 /// mismatch or no-row.
 ///
-/// Used by the forgot-password recovery flow (CP5) — the caller is
+/// Used by the forgot-password recovery flow — the caller is
 /// responsible for whatever follows (issuing a single-use reset session,
 /// requiring the user to set a new password, rotating the code to a
 /// fresh one after the reset completes, etc.).

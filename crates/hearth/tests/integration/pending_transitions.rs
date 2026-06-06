@@ -225,7 +225,6 @@ async fn veto_after_resolution_returns_409() {
     .await
     .assert_status(StatusCode::OK);
 
-    // Second veto returns 409.
     let resp = app
         .post(
             &format!("/api/admin/pending-transitions/{}/veto", pending.id),
@@ -782,7 +781,7 @@ async fn worker_applies_due_lifecycle_delete_with_redaction() {
 
 #[tokio::test]
 async fn owner_can_reactivate_peer_deactivated_owner() {
-    // After 15b: a deactivated Owner can be reactivated by another Owner.
+    // A deactivated Owner can be reactivated by another Owner.
     // Reactivate stays immediate (no pending — it's restorative).
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     // Bypass-deactivate B first so we have a deactivated Owner to act on.
@@ -843,7 +842,7 @@ async fn second_owner_on_owner_lifecycle_action_is_blocked() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// CP3: peer-Owner email fan-out on pending initiation
+// Peer-Owner email fan-out on pending initiation
 // ────────────────────────────────────────────────────────────────────────
 
 /// Fetch the `(kind, recipient_email)` pairs of every outbox row,

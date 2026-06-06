@@ -63,7 +63,7 @@ pub enum PageId {
 }
 
 /// Sortable column on `/users`. Default is `Joined` ascending, which
-/// matches the historical behavior of `UserRepository::list_all`.
+/// matches the ordering of `UserRepository::list_all`.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortColumn {
     Name,
@@ -312,8 +312,7 @@ pub fn shell_public(title: &str, content: Markup) -> Markup {
 /// trigger, page navigation, and the user card at the bottom. Main page
 /// content fills the remaining width.
 ///
-/// The search trigger is decorative for now (no modal wired up) — see
-/// `hearth-web.md` for the follow-up scope that adds it.
+/// The search trigger is decorative (no modal wired up).
 pub fn shell_app(
     ctx: &ChromeContext,
     title: &str,
@@ -369,15 +368,9 @@ fn shell_app_inner(
                 main class=(main_class) {
                     h1 { (title) }
                     (content)
-                    // Decorative botanical trees graphic anchored
-                    // bottom-right of the main panel, above the
-                    // pagination border (when present). Absolute
-                    // positioning takes it out of flex flow so it
-                    // doesn't push pagination off the bottom; it
-                    // sits as ambient art behind the data. Wide-only
-                    // because the narrow-shell pages (/me, login)
-                    // are short single-column views where a
-                    // decorative panel would crowd the form.
+                    // Absolute positioning takes the graphic out of
+                    // flex flow so it doesn't push pagination off the
+                    // bottom.
                     @if wide {
                         div class="main-mark" aria-hidden="true" {}
                     }
@@ -387,40 +380,20 @@ fn shell_app_inner(
                 // ships in the page source. The client fetches a
                 // modal's HTML from its `/modals/*` endpoint when it's
                 // opened (appending the `<dialog>` here), then removes
-                // it from the DOM on close. See `MODAL_HOST_JS`. This
-                // replaced the old `<template>`-per-modal approach,
-                // which left inert template blocks in every page and a
-                // materialized dialog lingering in the DOM after first
-                // open.
+                // it from the DOM on close.
                 div id="modal-host" {}
-                // Wire up [data-open-dialog] / [data-close-dialog] without
-                // pulling in a framework. Vanilla, ~10 lines, executes on
-                // every authed page (cheap when no dialogs are present).
                 script {
                     (maud::PreEscaped(DIALOG_JS))
                 }
-                // Toast auto-dismiss + close-button handler. Runs once
-                // per page load and wires up any `.toast` element
-                // present in the page (typically zero or one — emitted
-                // by render_banner / render_pending_banner after a
-                // post-action redirect). No-op on pages without toasts.
                 script {
                     (maud::PreEscaped(TOAST_JS))
                 }
-                // Theme switcher click handler. Reflects the
-                // active choice on `.user-card-theme-btn` and
-                // persists to localStorage.
                 script {
                     (maud::PreEscaped(THEME_SWITCH_JS))
                 }
-                // Multi-account roster: stamps the current user
-                // into localStorage and renders any other accounts
-                // signed into on this browser as additional rows
-                // in the user-card popover.
                 script {
                     (maud::PreEscaped(MULTI_ACCOUNT_JS))
                 }
-                // Outside-click closes the user-card popover.
                 script {
                     (maud::PreEscaped(USER_CARD_OUTSIDE_CLICK_JS))
                 }
@@ -569,17 +542,12 @@ const MULTI_ACCOUNT_JS: &str = r#"
         try { localStorage.setItem(KEY, JSON.stringify(r)); } catch (e) {}
     }
 
-    // Merge the current account into the roster (de-dup by id),
-    // cap, then persist.
     var roster = loadRoster()
         .filter(function(a) { return a && a.id && a.id !== current.id; });
     roster.unshift(current);
     if (roster.length > MAX) roster = roster.slice(0, MAX);
     saveRoster(roster);
 
-    // Drop any existing other-account rows before re-rendering (this
-    // function runs once on load; the de-dup guard guards against a
-    // future re-render path).
     container.querySelectorAll('.user-card-account-other')
         .forEach(function(el) { el.remove(); });
 
@@ -611,9 +579,8 @@ const MULTI_ACCOUNT_JS: &str = r#"
         if (node) container.appendChild(node);
     });
 
-    // Delete (×) handler — drops the account from localStorage and
-    // removes the row. Stops propagation so the surrounding form's
-    // submit button doesn't also fire on the same click.
+    // Stops propagation so the surrounding form's submit button
+    // doesn't also fire on the same click.
     container.addEventListener('click', function(e) {
         var btn = e.target.closest('[data-other-delete]');
         if (!btn) return;
@@ -646,8 +613,8 @@ const USER_CARD_OUTSIDE_CLICK_JS: &str = r#"
 })();
 "#;
 
-// Dynamic toast system. No page-level toast markup is server-rendered
-// anymore. Three parts:
+// Dynamic toast system. No page-level toast markup is server-rendered.
+// Three parts:
 //
 //   1. Server: action handlers attach an `HX-Trigger` header with a
 //      `hearth-toast` event carrying `{kind, title, message}`.
@@ -671,10 +638,9 @@ const TOAST_JS: &str = r#"
     var DURATION_MS = 15000;
     var MAX_AGE_MS = 30000;
 
-    // Inline SVG strings used by the client-side renderer. Kept in
-    // sync with the Maud helpers (check_circle_icon / info_circle_icon
-    // / alert_circle_icon / close_icon) — they're small enough that a
-    // copy here beats fetching them dynamically.
+    // Kept in sync with the Maud helpers (check_circle_icon /
+    // info_circle_icon / alert_circle_icon / close_icon) — they're
+    // small enough that a copy here beats fetching them dynamically.
     var ICONS = {
         success:
             '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" ' +
@@ -856,9 +822,7 @@ window.hearthEnsureModal = function(id, url) {
 
 document.addEventListener('click', function(e) {
     // Every modal opens on demand: fetch its fragment, inject it into
-    // #modal-host, showModal(). There are no longer any inline /
-    // template dialogs opened by element id — `data-open-modal` is the
-    // only open path.
+    // #modal-host, showModal(). `data-open-modal` is the only open path.
     var openModal = e.target.closest('[data-open-modal]');
     if (openModal) {
         e.preventDefault();
@@ -902,10 +866,9 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
         aside class="sidebar" {
             div class="brand" {
                 a href="/" {
-                    // Brand logo — white botanical emblem on a black
-                    // rounded-square puck. Decorative; alt left empty
-                    // so screen readers fall through to the "Sylva ·
-                    // {instance}" text that follows.
+                    // Decorative; alt left empty so screen readers fall
+                    // through to the "Sylva · {instance}" text that
+                    // follows.
                     span class="brand-logo" aria-hidden="true" {
                         img src="/assets/img/sylva-logo.svg" alt="";
                     }
@@ -915,9 +878,8 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                 }
             }
 
-            // Decorative search trigger. Clickable but currently inert —
-            // the modal is a follow-up checkpoint. Cmd-K hint included so
-            // when the modal lands users already know the shortcut.
+            // Decorative search trigger — inert/disabled (no modal
+            // wired up).
             button class="search-trigger" type="button"
                    aria-label="Search (coming soon)" disabled {
                 span class="search-icon" { (search_glyph_icon()) }
@@ -929,12 +891,8 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                 (nav_link("/me", "Profile", current == PageId::Profile, user_icon()))
                 @if is_admin {
                     // Members carries the pending-action count badge
-                    // for Owner viewers — the dedicated `/pending` nav
-                    // entry was retired in favour of an alert card on
-                    // the Members page itself (so the queue is
-                    // discovered alongside the directory it's about).
-                    // For Admin viewers the badge is None and the
-                    // helper renders just the plain label.
+                    // for Owner viewers. For Admin viewers the badge is
+                    // None and the helper renders just the plain label.
                     (nav_link_with_badge(
                         "/members",
                         "Members",
@@ -945,11 +903,9 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                 }
             }
 
-            // Decorative Sylva mark — abstract dotted "u" sitting in
-            // the empty stretch between nav and the bottom-pinned user
-            // card. Rendered as a `<div>` with the SVG masked over a
-            // currentColor background so the mark inherits the
-            // sidebar's text colour automatically across themes.
+            // Decorative Sylva mark. Rendered as a `<div>` with the SVG
+            // masked over a currentColor background so the mark inherits
+            // the sidebar's text colour automatically across themes.
             div class="sidebar-mark" aria-hidden="true" {}
 
             (user_card(ctx))
@@ -1030,10 +986,6 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                     span class="user-name" { (user.display_name) }
                     span class="user-email" { (user.email) }
                 }
-                // Vertical 3-dot affordance on the far right of
-                // the summary, telegraphing that the card is a
-                // menu trigger. Faint at rest, brightens with the
-                // rest of the row on hover.
                 span class="user-card-summary-kebab" aria-hidden="true" {
                     (dots_vertical_icon())
                 }
@@ -1042,10 +994,7 @@ fn user_card(ctx: &ChromeContext) -> Markup {
             // panel via `position: fixed` so it escapes the sidebar's
             // `overflow: hidden`. Layered as: signed-in accounts list,
             // separator, account-level actions (settings + theme
-            // switcher + sign out). The role pill that used to lead
-            // this menu was retired — operators rarely need a
-            // self-reminder of their own role here, and Owners
-            // visiting /members already see role chips on every row.
+            // switcher + sign out).
             div class="user-card-menu" {
                 // Multi-account list. The current account renders
                 // server-side with a filled radio indicator; previous
@@ -1055,9 +1004,7 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                 // `data-current-account` (below) plus the
                 // browser-local roster in localStorage. Clicking an
                 // other-account row navigates to `/login?email=…`
-                // so the email comes pre-filled — that's the
-                // "quick switch" today (no shared-session machinery
-                // yet, just a shortcut back to the login form).
+                // so the email comes pre-filled.
                 div class="user-card-accounts" role="list"
                     data-current-account=(current_account_json) {
                     div class="user-card-account user-card-account-current"
@@ -1076,15 +1023,8 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                     }
                 }
                 div class="user-card-divider" {}
-                // Theme switcher first — three icon buttons (auto/
-                // dark/light) on one horizontal row. Sits above
-                // Account settings because it's the most-frequent
-                // tweak operators reach for here. Wired by
-                // `THEME_SWITCH_JS` (below) to set
-                // `<html data-theme="…">` and persist to
-                // localStorage; CSS in `app.css` reacts to the
-                // attribute to override the prefers-color-scheme
-                // baseline.
+                // Theme switcher — three icon buttons (auto/dark/light)
+                // on one horizontal row. Wired by `THEME_SWITCH_JS`.
                 div class="user-card-theme" role="radiogroup"
                     aria-label="Theme" {
                     button type="button" class="user-card-theme-btn"
@@ -1103,11 +1043,8 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                         (theme_light_icon())
                     }
                 }
-                // Account settings — opens the shell-mounted modal
-                // (`tpl-dlg-account-settings` → `dlg-account-settings`)
-                // via the standard `data-open-dialog` hook. Rendered
-                // as a button (not an anchor) because there's no URL
-                // to navigate to — the modal lives in-page.
+                // Rendered as a button (not an anchor) because there's
+                // no URL to navigate to — the modal lives in-page.
                 button type="button" class="user-card-action"
                        data-open-modal="/modals/account-settings" {
                     span class="user-card-action-icon" { (settings_icon()) }
@@ -1191,13 +1128,6 @@ fn role_label(role: InstanceRole) -> &'static str {
 /// Deactivated users get an extra treatment: the avatar dims to 50%
 /// opacity and a small lock icon is overlaid in the middle so the
 /// disabled state reads at a glance.
-///
-/// Previously this also rendered a coloured status dot in the
-/// bottom-right of each avatar (active/pending/deactivated). That
-/// dot was dropped: every active member painting a green dot just
-/// added visual noise without conveying anything beyond what the
-/// row's presence already does, and the deactivated state stays
-/// legible via the lock overlay + greyed avatar.
 fn avatar_block(display_name: &str, user_id: &uuid::Uuid, lifecycle: UserLifecycle) -> Markup {
     let initial = display_initial(display_name);
     let color = avatar_color(user_id);
@@ -1584,14 +1514,14 @@ pub(crate) fn invite_modal(ctx: &ChromeContext) -> Markup {
 /// next to the invite + reauth ones, so it's available regardless of
 /// the page the operator is on.
 ///
-/// Layout is a **left-rail tab nav + right pane**. Three tabs:
+/// Layout is a **left-rail tab nav + right pane**. Tabs:
 ///
-/// - **Profile** (CP2 live) — display name (HTMX inline save) + email
+/// - **Profile** — display name (HTMX inline save) + email
 ///   (reauth-chained: clicking Update email hands off to `dlg-reauth`,
 ///   the operator re-enters their password there, and on success the
 ///   handler HX-Redirects to `/me`).
-/// - **Security** (CP3 placeholder) — change password, sessions, etc.
-/// - **Data Control** (CP4+ placeholder) — recovery code, export,
+/// - **Security** (placeholder) — change password, sessions, etc.
+/// - **Data Control** (placeholder) — recovery code, export,
 ///   account deletion.
 ///
 /// Each panel's content lives in a `data-settings-panel="<tab>"`
@@ -1742,11 +1672,8 @@ pub fn account_settings_modal(ctx: &ChromeContext) -> Markup {
 
 /// Profile panel. One section card ("Account Information") with two
 /// rows inside — display name (HTMX inline save) and email (reauth-
-/// chained). The section header carries a leading icon + subtag the
-/// same way other panels will (Security: lock + "Credentials and
-/// session controls"; Devices: laptop + "Browsers and phones…"). The
-/// rows split on the reauth axis: the display name save is friction-
-/// less; the email save funnels through `dlg-reauth`.
+/// chained). The rows split on the reauth axis: the display name save
+/// is frictionless; the email save funnels through `dlg-reauth`.
 fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
     html! {
         section class="settings-section" {
@@ -1775,8 +1702,8 @@ fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
 }
 
 /// Stand-in for the sections that aren't built yet. Keeps the
-/// tab-nav structure honest at CP2 without pretending we have
-/// settings to show; CP3 / CP4 replace the body with a real form.
+/// tab-nav structure honest without pretending we have settings to
+/// show.
 fn settings_placeholder_panel(title: &str, body: &str) -> Markup {
     html! {
         div class="settings-placeholder" {
@@ -2467,29 +2394,17 @@ pub fn members_invite_result_page(
     shell_app(ctx, "Invitation sent", PageId::Members, content)
 }
 
-// `can_invite_with_role` + `role_rank` were used by the old
-// per-option `<select>` rendering; the new segmented control only
-// branches between Owner (sees all 3 options) and non-Owner (gets a
-// hidden Member input). The backend still gates with `authz::satisfies`
-// — this helper just isn't needed at the view layer anymore.
-
 // Copy-URL handler for the invite + reissue result modals.
 //
-// The earlier version called `input.select()` on the visible readonly
-// input as its `execCommand` fallback. Inside an open `<dialog>`
-// (via showModal), the dialog gets its own top layer; calling
-// `.select()` on an input from a click that originated on a sibling
-// button doesn't always update the platform selection — empirically
-// the Copy button no-op'd unless the operator had manually selected
-// the URL text first.
-//
-// Fix: append a temporary off-screen textarea *into the dialog
-// itself* (same top layer as the click), focus + select that, then
-// execCommand('copy'). This is the standard "modal clipboard"
-// workaround and is reliable across browsers. We still try the
-// modern `navigator.clipboard.writeText` path first — in a secure
-// context it's preferred — and only fall back if writeText rejects
-// or the API isn't exposed (insecure context).
+// The `execCommand` fallback appends a temporary off-screen textarea
+// *into the dialog itself* (same top layer as the click), focuses +
+// selects that, then runs execCommand('copy'). Selecting an input
+// from a click that originated on a sibling button inside an open
+// `<dialog>` (its own top layer) doesn't reliably update the platform
+// selection, so the textarea has to live in the same top layer. The
+// modern `navigator.clipboard.writeText` path is tried first — in a
+// secure context it's preferred — and we only fall back if writeText
+// rejects or the API isn't exposed (insecure context).
 const INVITE_COPY_JS: &str = r#"
 document.addEventListener('click', function(e) {
     var btn = e.target.closest('[data-copy-target]');
@@ -2580,10 +2495,7 @@ pub fn members_page(
         // Pending-actions alert. Renders for Owner viewers when at
         // least one Owner-on-Owner action is in flight; sits between
         // the page header and the toolbar so it's the first thing the
-        // operator sees on entering the directory. Replaces the
-        // dedicated "Pending review" sidebar item (the count badge on
-        // the Members link still flags the queue at a glance; this
-        // alert provides the call-to-action).
+        // operator sees on entering the directory.
         @if is_owner(ctx.user.instance_role)
             && let Some(n) = ctx.pending_count
             && n > 0
@@ -2608,7 +2520,7 @@ pub fn members_page(
         } @else {
             // No `.card` wrapper — the table sits directly on the page
             // background, with subtle row dividers carrying the visual
-            // structure. See the design-ref screenshot.
+            // structure.
             table class="users-table" {
                 thead {
                     tr {
@@ -2649,7 +2561,6 @@ pub fn members_page(
                 }
             }
         }
-        // Inline page scripts: search filter + select-all wiring +
         // Pagination always renders, even at 1 page total — keeps the
         // toolbar/table rhythm stable as rows come and go and gives
         // the operator a fixed place to find the rows-per-page control.
@@ -2658,13 +2569,9 @@ pub fn members_page(
         // shell's `#modal-host`: the invite modal from `/modals/invite`,
         // each per-row action dialog from `/members/{id}/modal/{action}`,
         // and the reauth modal from `/modals/reauth` (via the chain).
-        // Nothing ships in the page source.
-        // `tpl-dlg-reauth` is mounted once at the shell level (see
-        // `shell_app_inner`) so it's available on every authed page,
-        // not just here — the account-settings modal's email reauth
-        // chain can fire from anywhere. No per-page copy needed.
-        // outside-click closes any open kebab. All vanilla JS, no
-        // framework, no XHR.
+        // Nothing ships in the page source. The reauth chain is also
+        // wired at the shell level so it can fire from anywhere; the
+        // per-page load here is deduped by REAUTH_CHAIN_JS's guard.
         script {
             (maud::PreEscaped(MEMBERS_SEARCH_JS))
             (maud::PreEscaped(MEMBERS_SELECT_ALL_JS))
@@ -2979,10 +2886,6 @@ const MEMBERS_SELECT_ALL_JS: &str = r#"
 })();
 "#;
 
-// Close any open <details class="row-actions"> when the user clicks
-// outside it. Without this the dropdown stays open until the user
-// clicks the kebab again — confusing UX. Skip if the click landed
-// inside the open details (so clicking a menu item still submits).
 // Generalized outside-click handler — closes any open <details> menu
 // (row-actions kebab, filter-menu, future dropdowns) when the user
 // clicks outside it. New menus opt in by giving their <details> a
@@ -3045,12 +2948,6 @@ const DROPDOWN_FLIP_JS: &str = r#"
 })();
 "#;
 
-// Type-display-name gate. Destructive dialogs (Delete / Purge) render
-// a `data-confirm-name="<expected>"` text input + a sibling
-// `data-reauth-confirm` button that ships disabled. On every keystroke
-// we compare the input to the expected name and toggle the button.
-// Pure UX guard against accidental clicks; the real security is the
-// password reauth in the next step.
 // Invite chain post-reauth handoff. The reauth modal's POST returns
 // content targeted at #invite-modal-content (via HX-Retarget) and
 // fires `switch-to-invite-modal`. We close the reauth dialog and open
@@ -3198,11 +3095,11 @@ const REAUTH_CHAIN_JS: &str = r#"
 (function() {
     // Idempotency guard. The shell wires this script for every
     // authed page (the account-settings modal opens from anywhere
-    // and uses the chain for email/password edits), but /members
-    // also loads it in its own script block for historical reasons.
-    // Double-binding the document click listener would stage the
-    // payload twice on each click; the guard keeps the first
-    // binding and short-circuits subsequent loads.
+    // and uses the chain for email/password edits), and /members
+    // also loads it in its own script block. Double-binding the
+    // document click listener would stage the payload twice on each
+    // click; the guard keeps the first binding and short-circuits
+    // subsequent loads.
     if (window.__hearthReauthChainLoaded) return;
     window.__hearthReauthChainLoaded = true;
     document.addEventListener('click', function(e) {
@@ -3509,10 +3406,10 @@ fn member_row(
 /// only option is "Revoke invite". Slots into the same `<tr>` shape as
 /// `member_row` so the table layout is uniform.
 fn pending_invite_row(invitation: &identity::Invitation, _csrf_token: &str) -> Markup {
-    // `_csrf_token` is unused now that the reissue/revoke dialogs are
-    // fetched on demand (each fragment renders its own CSRF input from
-    // the modal endpoint). Kept on the signature so the members-page
-    // call site doesn't need a special case.
+    // `_csrf_token` is unused — the reissue/revoke dialogs are fetched
+    // on demand and each fragment renders its own CSRF input. Kept on
+    // the signature so the members-page call site doesn't need a
+    // special case.
     let initial = display_initial(&invitation.email);
     let color = avatar_color(&invitation.id.0);
     let search_hay = invitation.email.to_lowercase();
@@ -3576,8 +3473,6 @@ fn pending_invite_row(invitation: &identity::Invitation, _csrf_token: &str) -> M
                         }
                     }
                 }
-                // Dialogs fetched on demand from the modal endpoints
-                // above — no inline markup.
             }
         }
     }
@@ -3799,9 +3694,8 @@ pub(crate) fn available_actions(
     if !can_act {
         return Vec::new();
     }
-    // PendingInvite users can't be acted on at all this round — the API
-    // returns `not_active` for them. Future "Resend invite" / "Revoke
-    // invite" actions live in the invitations checkpoint.
+    // PendingInvite users can't be acted on at all — the API returns
+    // `not_active` for them.
     if !matches!(
         target_lifecycle,
         UserLifecycle::Active | UserLifecycle::Deactivated
@@ -3851,12 +3745,11 @@ fn row_actions_kebab(
     actions: &[RowAction],
     locked: bool,
 ) -> Markup {
-    // No inline dialog markup anymore. Each kebab item opens its dialog
-    // on demand via `data-open-modal="/members/{id}/modal/{action}"`
+    // No inline dialog markup. Each kebab item opens its dialog on
+    // demand via `data-open-modal="/members/{id}/modal/{action}"`
     // (see `render_action_item`); the client fetches the fragment,
-    // injects it into `#modal-host`, and removes it on close. This keeps
-    // the members table free of the N×actions dialog markup that used to
-    // ship with every row.
+    // injects it into `#modal-host`, and removes it on close. This
+    // keeps the members table free of N×actions dialog markup per row.
     html! {
         details class="row-actions" {
             summary class="row-actions-trigger" aria-label="Row actions" {
@@ -3904,8 +3797,8 @@ fn render_action_item(
         // RowAction::Delete = soft delete (anonymize). The kebab
         // label calls it "Anonymize…" so operators understand it
         // keeps shared content under an anonymized account. The
-        // internal `Delete` enum + `/delete` URL stay as historical
-        // names — only the visible label changed.
+        // internal `Delete` enum + `/delete` URL keep their names;
+        // only the visible label differs.
         RowAction::Delete => html! {
             button type="button" class="row-action-item row-action-danger"
                    data-open-modal=(format!("/members/{id}/modal/delete")) {
@@ -4242,10 +4135,10 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                     }
                 }
             }
-            // Owner-confirm is NOT rendered inline anymore — under the
-            // on-demand model the owner-promotion intercept fetches
-            // `/members/{id}/modal/role-owner-confirm` separately once
-            // the operator picks Owner. See REAUTH_CHAIN_JS.
+            // Owner-confirm is not rendered inline — the owner-promotion
+            // intercept fetches `/members/{id}/modal/role-owner-confirm`
+            // separately once the operator picks Owner. See
+            // REAUTH_CHAIN_JS.
         },
         // RowAction::Delete = soft delete, surfaced as "Anonymize".
         // Account row stays so any non-orphaned content (comments on
@@ -4345,10 +4238,10 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
 // Banners
 // ────────────────────────────────────────────────────────────────────────
 
-/// No-op now that toasts are dispatched client-side via HX-Trigger
-/// (see [`TOAST_JS`]). Kept on the signature so the page-render path
-/// can keep the same shape if we want to bring back server-side
-/// rendered banners for any niche case later.
+/// No-op — toasts are dispatched client-side via HX-Trigger (see
+/// [`TOAST_JS`]). Kept on the signature so the page-render path keeps
+/// the same shape, leaving room to bring back server-side rendered
+/// banners for a niche case.
 fn render_banner(_banner: &MembersBanner<'_>) -> Markup {
     html! {}
 }
@@ -4463,11 +4356,10 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
         // the 72h window if no one vetoes) is destructive — the
         // operator should still feel the weight of having queued it.
         //
-        // Token names match the new UI vocabulary: "anonymized" =
-        // the soft-delete (which keeps shared content), "deleted" =
-        // the hard-delete (full removal). The backend handlers were
-        // renamed to emit these new tokens; backend routes + audit
-        // events keep their original names.
+        // Token names match the UI vocabulary: "anonymized" = the
+        // soft-delete (which keeps shared content), "deleted" = the
+        // hard-delete (full removal). Backend routes + audit events
+        // keep their original names.
         "anonymized" => (
             ToastKind::Error,
             "Account anonymized",
@@ -4524,11 +4416,11 @@ pub fn toast_for_error(error_code: &str) -> Toast {
     )
 }
 
-/// Inline banner — kept for form-validation contexts that render
-/// _inside_ a modal or card (e.g. the invite modal's "email already
-/// in use" feedback). Page-level success/error notifications go
-/// through [`toast`] now; this is only for scoped messages that need
-/// to sit next to a specific input.
+/// Inline banner — for form-validation contexts that render _inside_
+/// a modal or card (e.g. the invite modal's "email already in use"
+/// feedback). Page-level success/error notifications go through
+/// [`toast`]; this is only for scoped messages that need to sit next
+/// to a specific input.
 fn error_banner(error: &str) -> Markup {
     let msg = error_banner_message(error);
     html! {
@@ -4591,9 +4483,9 @@ pub struct PendingBanner<'a> {
     pub error: Option<&'a str>,
 }
 
-/// No-op now that toasts are dispatched client-side. Same shape as
-/// [`render_banner`]; both stick around so the page renderers can
-/// keep their existing call without churn.
+/// No-op — toasts are dispatched client-side. Same shape as
+/// [`render_banner`]; both stay so the page renderers can keep their
+/// existing call without churn.
 fn render_pending_banner(_banner: &PendingBanner<'_>) -> Markup {
     html! {}
 }
@@ -4712,8 +4604,8 @@ fn pending_active_row(
     row: &pending::TransitionRow,
     by_id: &std::collections::HashMap<uuid::Uuid, &identity::User>,
 ) -> Markup {
-    // `_ctx` is unused now that the veto dialog is fetched on demand
-    // (the fragment endpoint renders its own CSRF input). Kept on the
+    // `_ctx` is unused — the veto dialog is fetched on demand and the
+    // fragment endpoint renders its own CSRF input. Kept on the
     // signature so the /pending page call site stays uniform.
     let target = row.target_user_id.and_then(|id| by_id.get(&id).copied());
     let initiator = row.initiator_user_id.and_then(|id| by_id.get(&id).copied());
@@ -4744,7 +4636,6 @@ fn pending_active_row(
                        data-open-modal=(format!("/pending/{}/modal/veto", row.id)) {
                     "Veto"
                 }
-                // Veto dialog fetched on demand from the endpoint above.
             }
         }
     }
@@ -4909,8 +4800,8 @@ pub(crate) fn pending_action_label(row: &pending::TransitionRow) -> String {
     match row.kind {
         TransitionKind::Deactivate => "Deactivate".to_string(),
         // Soft-delete is surfaced as "Anonymize" in the UI; the
-        // internal `TransitionKind::SoftDelete` enum keeps its
-        // historical name. Hard-delete becomes "Delete".
+        // internal `TransitionKind::SoftDelete` enum keeps its name.
+        // Hard-delete is surfaced as "Delete".
         TransitionKind::SoftDelete => "Anonymize".to_string(),
         TransitionKind::HardDelete => "Delete".to_string(),
         TransitionKind::RoleChange => match row.role_payload() {
@@ -5016,10 +4907,7 @@ pub fn accept_invite_page(
 ///
 /// Refresh-safety: refreshing this page re-posts the original form, the
 /// invitation is already accepted, and the route renders
-/// [`accept_invite_invalid_page`] instead. That's fine for security
-/// (the code never re-renders) but the messaging on the invalid page
-/// would benefit from a "if you saw a recovery code, you're already
-/// signed in — go to /me" hint. Treat as a polish follow-up.
+/// [`accept_invite_invalid_page`] instead. The code never re-renders.
 pub fn accept_invite_recovery_code_page(recovery_code: &str) -> Markup {
     let content = html! {
         h1 { "Save your recovery code" }
@@ -5167,9 +5055,8 @@ mod tests {
             nums(page_items(5, 10)),
             vec![Some(1), None, Some(4), Some(5), Some(6), None, Some(10)],
         );
-        // 1 … 6 7 8 … 10 (current at last-3 boundary still middle)
-        // wait — current=7 with total=10: total-3 = 7, so current >= total-3 triggers the
-        // left-leaning case. Confirm:
+        // current=7, total=10: total-3 = 7, so current >= total-3
+        // triggers the left-leaning case → 1 … 6 7 8 9 10.
         assert_eq!(
             nums(page_items(7, 10)),
             vec![Some(1), None, Some(6), Some(7), Some(8), Some(9), Some(10)],

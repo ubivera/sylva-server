@@ -224,9 +224,8 @@ pub async fn delete_credentials(
     Ok(())
 }
 
-/// Session lifetime for this checkpoint. The design spec eventually wants
-/// a 15-minute access token + 90-day sliding refresh token; we use a flat
-/// 24-hour session for now and refactor when refresh tokens land.
+/// Session lifetime: a flat 24-hour session. The design spec eventually
+/// wants a 15-minute access token + 90-day sliding refresh token.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::hours(24);
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]

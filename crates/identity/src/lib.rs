@@ -507,8 +507,8 @@ pub struct Invitation {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// Default time an invitation stays valid. Design spec calls for 7 days
-/// (configurable); we hardcode for now.
+/// Default time an invitation stays valid. Design spec calls for this to
+/// be configurable; currently hardcoded to 7 days.
 pub const DEFAULT_INVITATION_TTL: Duration = Duration::days(7);
 
 /// Generate a 32-byte random invitation token (64-char hex). Mirrors the

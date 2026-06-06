@@ -230,7 +230,7 @@ pub async fn change_password(
 pub struct UpdateProfileRequest {
     /// `Some(name)` to set; `None` (or absent) to leave unchanged.
     pub display_name: Option<String>,
-    /// Same semantics. Locale is stored as a free-form string for now.
+    /// Same semantics. Locale is stored as a free-form string.
     pub locale: Option<String>,
 }
 

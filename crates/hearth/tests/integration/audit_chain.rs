@@ -166,7 +166,6 @@ async fn tampering_with_event_data_is_detectable() {
         .await;
     let _ = app.login(&owner.email, "pw").await; // adds a signin_success event
 
-    // Mutate one row's event_data.
     sqlx::query(
         "UPDATE audit.events SET event_data = $1 WHERE seqno = (SELECT MIN(seqno) FROM audit.events)",
     )

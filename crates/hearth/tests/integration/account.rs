@@ -76,7 +76,7 @@ async fn change_password_empty_new_returns_400() {
 #[tokio::test]
 async fn change_password_revokes_other_sessions_but_keeps_caller() {
     let (app, user, token1) = app_with_user().await;
-    let token2 = app.login(&user.email, PW).await; // second session
+    let token2 = app.login(&user.email, PW).await;
 
     let resp = app
         .post(
@@ -89,18 +89,15 @@ async fn change_password_revokes_other_sessions_but_keeps_caller() {
     let body: ChangePasswordBody = resp.json();
     assert_eq!(body.sessions_revoked, 1);
 
-    // token2 is now dead.
     app.get("/api/me", Some(&token2))
         .await
         .assert_status(StatusCode::UNAUTHORIZED)
         .assert_error("invalid_session");
 
-    // token1 (caller) still works.
     app.get("/api/me", Some(&token1))
         .await
         .assert_status(StatusCode::OK);
 
-    // New password lets login through; old does not.
     app.post(
         "/api/auth/login",
         None,
@@ -278,11 +275,9 @@ async fn revoke_own_session_succeeds_and_kills_token() {
         .await;
     revoke.assert_status(StatusCode::NO_CONTENT);
 
-    // token1 (the revoked one) is dead.
     app.get("/api/me", Some(&token1))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
-    // token2 (the revoker) still works.
     app.get("/api/me", Some(&token2))
         .await
         .assert_status(StatusCode::OK);
@@ -300,14 +295,12 @@ async fn revoke_another_users_session_returns_404() {
     let alice_token = app.login(&alice.email, "alpw").await;
     let bob_token = app.login(&bob.email, "bopw").await;
 
-    // Get bob's session id.
     let bob_sessions: Vec<SessionView> = app
         .get("/api/account/sessions", Some(&bob_token))
         .await
         .json();
     let bob_session_id = bob_sessions[0].id;
 
-    // Alice tries to revoke it.
     let resp = app
         .post(
             &format!("/api/account/sessions/{bob_session_id}/revoke"),
@@ -318,7 +311,6 @@ async fn revoke_another_users_session_returns_404() {
     resp.assert_status(StatusCode::NOT_FOUND)
         .assert_error("session_not_found");
 
-    // Bob's session is still alive.
     app.get("/api/me", Some(&bob_token))
         .await
         .assert_status(StatusCode::OK);
@@ -371,7 +363,6 @@ async fn activity_scopes_to_caller() {
     for item in &body.items {
         assert_eq!(item.actor_user_id, Some(alice.id.0), "leaked event: {:?}", item.event_type);
     }
-    // Single page should fit; cursor should be None.
     assert!(body.next_cursor.is_none());
     // seqno must be strictly decreasing (newest first).
     let seqnos: Vec<i64> = body.items.iter().map(|i| i.seqno).collect();

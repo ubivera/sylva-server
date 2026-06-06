@@ -158,25 +158,16 @@ async fn app_shell_includes_instance_name_and_user_card() {
         .unwrap();
     let body = String::from_utf8_lossy(&body_bytes);
 
-    // Instance name appears in title + brand line.
     assert!(
         body.contains("test-instance"),
         "instance name should be visible in chrome: {body}"
     );
-    // Brand line uses the "Sylva · {name}" format.
     assert!(body.contains("Sylva"));
-    // Sidebar nav present.
     assert!(body.contains(r#"class="sidebar""#));
     assert!(body.contains(r#"href="/me""#));
-    // User card present with avatar + email.
     assert!(body.contains(r#"class="user-card""#));
     assert!(body.contains("Big Boss"));
     assert!(body.contains("o@test.local"));
-    // Role pill in the sidebar user-card was retired with the
-    // popover redesign; the role still surfaces inside /me's page
-    // content as a plain label (see
-    // `role_label_renders_on_me_page` below).
-    // Search trigger placeholder.
     assert!(body.contains(r#"class="search-trigger""#));
 }
 
@@ -190,21 +181,15 @@ async fn login_page_uses_public_shell_not_app_shell() {
     assert!(!body.contains(r#"class="sidebar""#));
     assert!(!body.contains(r#"class="user-card""#));
     assert!(!body.contains(r#"class="search-trigger""#));
-    // But should be styled (CSS link present).
     assert!(body.contains("/assets/css/app.css"));
-    // And the public wordmark should be there.
     assert!(body.contains("Sylva Hearth"));
 }
 
 #[tokio::test]
 async fn role_label_renders_on_me_page() {
-    // /me used to surface the viewer's role via the sidebar
-    // user-card role pill (`role-member`, etc.); that pill was
-    // retired when the user-card became a popover. Today the role
-    // is still shown inside /me's content card as a plain label —
-    // this test asserts the label is present in the rendered page
-    // for the Member viewer and that the Owner / Admin labels
-    // don't accidentally leak in.
+    // The viewer's role is shown inside /me's content card as a plain
+    // label. Asserts the label is present for the Member viewer and that
+    // the Owner / Admin labels don't accidentally leak in.
     let app = TestApp::new().await;
     app.seed_user("u@test.local", "Reg User", "userpw", InstanceRole::Member)
         .await;
@@ -262,7 +247,6 @@ async fn logout_clears_cookie_and_revokes_session() {
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    // Logout (with CSRF token)
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
     let body = format!("csrf_token={}", urlencoding(&csrf));
@@ -595,9 +579,7 @@ async fn users_page_lists_all_users_for_admin() {
     ] {
         assert!(body.contains(needle), "expected {needle:?} in: {body}");
     }
-    // Role badges rendered. Lifecycle is no longer communicated via
-    // a Status column or avatar-corner dot — just the row's presence
-    // (active accounts) and a lock overlay (deactivated accounts).
+    // Role badges rendered.
     assert!(body.contains("role-admin"));
     assert!(body.contains("role-member"));
     // The viewing admin is tagged as "you".
@@ -662,13 +644,11 @@ async fn users_page_renders_search_input_and_data_search_attributes() {
 
     let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
-    // The search input is present.
     assert!(body.contains(r#"id="users-search""#));
     assert!(body.contains("Search by name or email"));
     // Each row carries a lowercased data-search haystack of name + email.
     assert!(body.contains(r#"data-search="alice alice@test.local""#));
     assert!(body.contains(r#"data-search="adm in admin@test.local""#));
-    // The inline filter script is on the page.
     assert!(body.contains("users-search"));
 }
 
@@ -696,9 +676,8 @@ async fn users_page_sort_default_is_joined_ascending() {
     assert!(admin_pos < alice_pos, "admin should appear before alice");
     assert!(alice_pos < bob_pos, "alice should appear before bob");
 
-    // Joined column was removed from the UI but `created_at` still
-    // drives the default sort, so row order verifies the ordering
-    // logic without needing an `aria-sort` chevron to test against.
+    // `created_at` drives the default sort, so row order verifies the
+    // ordering logic without needing an `aria-sort` chevron to test against.
 }
 
 #[tokio::test]
@@ -735,13 +714,12 @@ async fn users_page_sort_header_link_flips_direction_on_active_column() {
     // Visit with sort=name&dir=asc — the "User" column should be active
     // (asc) and its link should flip to desc on the next click. Maud
     // HTML-escapes `&` in attribute values, so we match `&amp;`. The
-    // href now also carries `&filter=all` so flipping sort doesn't drop
+    // href also carries `&filter=all` so flipping sort doesn't drop
     // any active filter.
     let (_, body) = get_with_cookie(&app, "/members?sort=name&dir=asc", Some(&cookie)).await;
     assert!(body.contains(r#"href="/members?sort=name&amp;dir=desc&amp;filter=all""#));
     // Other visible sortable column (Type) resets to asc when clicked
-    // from a different sort. The Joined column was removed from the
-    // UI; only Member + Type remain user-facing.
+    // from a different sort.
     assert!(body.contains(r#"href="/members?sort=role&amp;dir=asc&amp;filter=all""#));
 }
 
@@ -761,10 +739,9 @@ async fn users_page_invalid_sort_param_falls_back_to_default() {
     .await;
     assert_eq!(status, StatusCode::OK);
     // Garbage params shouldn't crash; we fall back to joined asc.
-    // The Joined column header is gone from the UI but the sort still
-    // runs server-side — Member column's link should be the asc form
-    // even after the garbage `dir=sideways` is rejected (the unsorted
-    // default puts Member into the asc-clickable state).
+    // The sort runs server-side — Member column's link should be the
+    // asc form even after the garbage `dir=sideways` is rejected (the
+    // unsorted default puts Member into the asc-clickable state).
     assert!(body.contains(r#"sort=name&amp;dir=asc"#));
 }
 
@@ -791,9 +768,7 @@ async fn users_page_renders_deactivated_avatar_lock_overlay() {
     let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     // Deactivated members render with `avatar-deactivated` (greys the
-    // initial) plus an `avatar-lock` overlay containing the lock icon —
-    // the dual signal that replaced the retired status-dot in the
-    // bottom-right corner of the avatar.
+    // initial) plus an `avatar-lock` overlay containing the lock icon.
     assert!(
         body.contains("avatar-deactivated"),
         "expected deactivated avatar class in: {body}"
@@ -905,7 +880,7 @@ async fn members_pagination_rows_per_page_respects_url_param() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Account settings modal (CP2)
+// Account settings modal
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Modals are on-demand now: the page ships only an empty `#modal-host`
@@ -980,8 +955,7 @@ async fn account_settings_modal_fragment_renders_full_modal() {
     assert!(body.contains(r#"class="settings-header-icon""#));
     assert!(body.contains("Manage your preferences"));
     assert!(body.contains(r#"class="settings-header-signout-form""#));
-    // Email submit is a reauth-chain trigger; inline password + locale
-    // are both retired.
+    // Email submit is a reauth-chain trigger; no inline password or locale.
     assert!(body.contains(r#"data-reauth-confirm="form-settings-email""#));
     assert!(!body.contains(r#"id="settings-email-password""#));
     assert!(!body.contains(r#"id="settings-locale""#));
@@ -1029,9 +1003,7 @@ async fn user_card_popover_account_settings_opens_modal() {
 /// POST /me/profile updates the display name and writes a
 /// `profile_updated` audit event. The HTMX response body is the
 /// re-rendered name form partial (just the form contents), not a
-/// full page. Locale is no longer surfaced in the settings UI; the
-/// handler passes `None` to `update_profile` and leaves the column
-/// alone.
+/// full page.
 #[tokio::test]
 async fn me_profile_submit_updates_display_name() {
     let app = TestApp::new().await;
@@ -1064,9 +1036,8 @@ async fn me_profile_submit_updates_display_name() {
     // Success feedback tile + the updated value pre-filled.
     assert!(body.contains("Profile updated."));
     assert!(body.contains(r#"value="Updated Name""#));
-    // Locale field was retired from the settings UI — assert it's
-    // gone so a future regression that re-introduces a locale input
-    // fails this test immediately.
+    // Assert the locale field is absent so a future regression that
+    // re-introduces a locale input fails this test immediately.
     assert!(
         !body.contains(r#"name="locale""#),
         "locale field should be retired from the settings UI"
@@ -1128,7 +1099,6 @@ async fn me_profile_submit_rejects_empty_display_name() {
     .to_string();
     assert!(body.contains("Display name can't be blank."));
 
-    // DB unchanged.
     let row: (String,) = sqlx::query_as(
         "SELECT display_name FROM identity.users WHERE id = $1",
     )
@@ -1189,7 +1159,6 @@ async fn me_email_submit_changes_email_with_correct_password() {
         "HX-Trigger should carry the email_updated toast payload: {trigger}"
     );
 
-    // DB updated.
     let row: (String,) = sqlx::query_as(
         "SELECT email FROM identity.users WHERE id = $1",
     )
@@ -1199,7 +1168,6 @@ async fn me_email_submit_changes_email_with_correct_password() {
     .unwrap();
     assert_eq!(row.0, "new@test.local");
 
-    // Audit row written.
     let (audit_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM audit.events
          WHERE event_type = 'email_changed' AND actor_user_id = $1",

@@ -160,10 +160,10 @@ pub struct RoleChangeForm {
     pub password: String,
 }
 
-/// Reactivate now requires re-auth too (folded into the same gate as
-/// the destructive actions). Kept as its own struct so the handler
-/// can use a different success banner verb without sharing the
-/// `LifecycleActionForm`'s richer Pending-handling.
+/// Reactivate requires re-auth (the same gate as the destructive
+/// actions). Kept as its own struct so the handler can use a different
+/// success banner verb without sharing the `LifecycleActionForm`'s
+/// richer Pending-handling.
 #[derive(Deserialize)]
 pub struct ReactivateForm {
     pub csrf_token: String,
@@ -280,9 +280,9 @@ pub async fn delete_member(
     {
         return resp;
     }
-    // The route + the admin_logic function keep the historical
-    // "delete" / "soft_delete" naming; the toast token is renamed
-    // because the UI surfaces this action as "Anonymize".
+    // The route + the admin_logic function use "delete" / "soft_delete"
+    // naming; the toast token differs because the UI surfaces this
+    // action as "Anonymize".
     match admin_logic::perform_soft_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
@@ -319,9 +319,8 @@ pub async fn purge_member(
     {
         return resp;
     }
-    // Historical "purge" / "hard_delete" naming stays on the backend;
-    // the toast token is renamed because the UI surfaces this action
-    // as "Delete".
+    // The backend uses "purge" / "hard_delete" naming; the toast token
+    // differs because the UI surfaces this action as "Delete".
     match admin_logic::perform_hard_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
