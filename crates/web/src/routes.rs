@@ -314,13 +314,27 @@ pub async fn account_settings_modal(
     BrowserAuth(auth): BrowserAuth,
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    // Recovery-code metadata feeds the Data Control tab's "generated /
+    // last used" line. A missing row (e.g. accounts predating CP1, or
+    // the provisioned first owner) renders the "no code on file" state;
+    // a DB error degrades to the same rather than failing the modal.
+    let recovery_meta = auth::user_recovery_code::metadata(&state.db, auth.user.id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "loading recovery-code metadata for settings modal");
+            None
+        });
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
     };
-    Html(views::account_settings_modal(&ctx).into_string()).into_response()
+    Html(
+        views::account_settings_modal(&ctx, recovery_meta.as_ref())
+            .into_string(),
+    )
+    .into_response()
 }
 
 /// `GET /modals/reauth` — render the reauth dialog as a standalone
@@ -567,6 +581,213 @@ pub async fn me_email_submit(
         Ok(()) => redirect_to_me_with_action(htmx, "email_updated"),
         Err(err) => {
             tracing::error!(?err, "me_email_submit");
+            error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MePasswordForm {
+    pub csrf_token: String,
+    /// Current password, collected by the reauth modal.
+    pub password: String,
+    /// New password, staged from the Security tab's form.
+    pub new_password: String,
+}
+
+/// `POST /me/password` — change the operator's password. Driven from
+/// the Security tab via the reauth chain: the new password is staged
+/// into `dlg-reauth`, the operator confirms their current password
+/// there, and HTMX submits both here. Mirrors the JSON
+/// `account_routes::change_password` exactly — verify current, hash,
+/// replace the verifier, revoke every *other* session, audit
+/// `password_changed` — so the two surfaces can't drift.
+///
+/// Wrong current password (HTMX) re-renders the reauth modal with the
+/// `invalid_password` banner and the staged new password preserved.
+/// Success HX-Redirects to `/me` with a toast.
+pub async fn me_password_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<MePasswordForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let htmx = headers.contains_key("hx-request");
+
+    // Passwords are never trimmed — leading/trailing whitespace is
+    // significant. Empty is the one rejection (matches the JSON API).
+    if form.new_password.is_empty() {
+        return redirect_to_me_with_error(htmx, "new_password_required");
+    }
+
+    let password_ok = match auth::verify_user_password(
+        &state.db,
+        auth.user.id,
+        &form.password,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::error!(?err, "verify_user_password for password change");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+    if !password_ok {
+        return reauth_invalid_password_response(
+            &state,
+            auth.session_id,
+            &auth.user,
+            "/me/password",
+            &[("new_password", &form.new_password)],
+            htmx,
+        );
+    }
+
+    let new_phc = match auth::hash_password(&form.new_password) {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::error!(?err, "hashing new password");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        auth::update_password_hash(&mut tx, auth.user.id, &new_phc).await?;
+        // Revoke every other session so a stolen token stops working;
+        // the caller's own session is kept so they're not logged out by
+        // their own action.
+        let revoked = auth::SessionRepository::revoke_all_for_user_except(
+            &mut tx,
+            auth.user.id,
+            auth.session_id,
+        )
+        .await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "password_changed",
+            serde_json::json!({ "other_sessions_revoked": revoked }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => redirect_to_me_with_action(htmx, "password_changed"),
+        Err(err) => {
+            tracing::error!(?err, "me_password_submit");
+            error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+        }
+    }
+}
+
+/// Form for reauth-gated actions that carry no payload beyond the
+/// confirmation password (e.g. regenerate recovery code).
+#[derive(Deserialize)]
+pub struct MeReauthOnlyForm {
+    pub csrf_token: String,
+    pub password: String,
+}
+
+/// `POST /me/recovery-code/regenerate` — mint a fresh offline recovery
+/// code, invalidating the old one. Reauth-gated (the Data Control
+/// "Regenerate" button chains through `dlg-reauth` for the current
+/// password). On success the new plaintext is shown ONCE, swapped into
+/// the reauth modal via [`views::recovery_code_modal_content`] — it
+/// rides this single response and is never re-rendered. Only the
+/// SHA-256 hash is persisted (`auth::user_recovery_code::rotate`).
+pub async fn me_recovery_regenerate(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<MeReauthOnlyForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let htmx = headers.contains_key("hx-request");
+
+    let password_ok = match auth::verify_user_password(
+        &state.db,
+        auth.user.id,
+        &form.password,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::error!(?err, "verify_user_password for recovery regenerate");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+    if !password_ok {
+        return reauth_invalid_password_response(
+            &state,
+            auth.session_id,
+            &auth.user,
+            "/me/recovery-code/regenerate",
+            &[],
+            htmx,
+        );
+    }
+
+    let new_code = auth::recovery_code::generate_code();
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        auth::user_recovery_code::rotate(&mut tx, auth.user.id, &new_code).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "recovery_code_rotated",
+            serde_json::json!({ "via": "self_service" }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            // Swap the new code into the reauth modal (its form's
+            // hx-target is #reauth-modal-content). One-time display.
+            Html(views::recovery_code_modal_content(&new_code).into_string())
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(?err, "me_recovery_regenerate");
             error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal error",
@@ -955,11 +1176,6 @@ pub async fn members_page(
     .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct CsrfForm {
-    pub csrf_token: String,
-}
-
 /// Verify a presented CSRF token against the caller's session. On
 /// mismatch returns a 403 error page so the user sees an actionable
 /// "reload and try again" message rather than a silent failure.
@@ -981,14 +1197,6 @@ pub(crate) fn check_csrf_token(
             "Invalid form token. Reload the page and try again.",
         ))
     }
-}
-
-/// Convenience wrapper for handlers whose form has nothing but
-/// `csrf_token`. Action handlers with extra fields call
-/// [`check_csrf_token`] directly.
-#[allow(clippy::result_large_err)]
-fn check_csrf(state: &AppState, session_id: uuid::Uuid, form: &CsrfForm) -> Result<(), Response> {
-    check_csrf_token(state, session_id, &form.csrf_token)
 }
 
 /// Gate a handler on the caller having an admin-or-higher role. Returns

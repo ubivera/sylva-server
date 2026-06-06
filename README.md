@@ -1,6 +1,10 @@
-# Sylva Hearth
+![Hearth hero image](docs/images/header.png)
 
-The server for the Sylva ecosystem - a self-hosted, privacy-first, E2E-encrypted Rust modular monolith.
+<h1 align="center">
+    Ubivera.Sylva.Hearth
+</h1>
+
+The server for the Sylva ecosystem; a self-hosted, privacy-first, end-to-end encrypted modular monolith.
 
 ## Build Prerequisites
 

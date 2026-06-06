@@ -410,6 +410,16 @@ fn shell_app_inner(
                 script {
                     (maud::PreEscaped(SETTINGS_TABS_JS))
                 }
+                script {
+                    (maud::PreEscaped(CHANGE_PASSWORD_GATE_JS))
+                }
+                // Copy-to-clipboard for the recovery-code display that
+                // can surface in the reauth modal after a regenerate
+                // (Data Control tab). Delegated on document, so it's a
+                // no-op until such a button appears.
+                script {
+                    (maud::PreEscaped(INVITE_COPY_JS))
+                }
             }
         }
     }
@@ -502,6 +512,27 @@ const SETTINGS_TABS_JS: &str = r#"
             var on = p.getAttribute('data-settings-panel') === name;
             p.classList.toggle('settings-panel-active', on);
         });
+    });
+})();
+"#;
+
+// Gates the Change-password button: it stays disabled until the new
+// password is >= 8 chars and the confirm field matches. Fires on any
+// input within a form containing a `[data-pw-confirm]` field, so a
+// typo'd confirm can't reach the reauth step. The on-demand modal is
+// fetched fresh each open, so there's no reset-on-close to manage.
+const CHANGE_PASSWORD_GATE_JS: &str = r#"
+(function() {
+    document.addEventListener('input', function(e) {
+        var form = e.target.closest('form');
+        if (!form) return;
+        var confirmField = form.querySelector('[data-pw-confirm]');
+        if (!confirmField) return;
+        var newField = document.getElementById(confirmField.getAttribute('data-pw-confirm'));
+        var btn = form.querySelector('[data-reauth-confirm]');
+        if (!newField || !btn) return;
+        var val = newField.value;
+        btn.disabled = !(val.length >= 8 && val === confirmField.value);
     });
 })();
 "#;
@@ -942,14 +973,16 @@ fn nav_link_with_badge(
     icon: Markup,
 ) -> Markup {
     let class = if active { "nav-link active" } else { "nav-link" };
-    let show_badge = count.is_some_and(|n| n > 0);
+    // Only render the badge when count is Some(n) with n > 0; binding
+    // `n` here avoids unwrap() (the workspace denies `unwrap_used`).
+    let badge_count = count.filter(|&n| n > 0);
     html! {
         a class=(class) href=(href) {
             span class="nav-link-icon" aria-hidden="true" { (icon) }
             span class="nav-link-label" { (label) }
-            @if show_badge {
-                span class="nav-link-badge" aria-label=(format!("{} pending", count.unwrap())) {
-                    (count.unwrap())
+            @if let Some(n) = badge_count {
+                span class="nav-link-badge" aria-label=(format!("{n} pending")) {
+                    (n)
                 }
             }
         }
@@ -1528,7 +1561,10 @@ pub(crate) fn invite_modal(ctx: &ChromeContext) -> Markup {
 /// container; `SETTINGS_TABS_JS` swaps `.settings-panel-active` +
 /// `.settings-tab-active` on click. No URL state — operator's choice
 /// is per-open, not persisted.
-pub fn account_settings_modal(ctx: &ChromeContext) -> Markup {
+pub fn account_settings_modal(
+    ctx: &ChromeContext,
+    recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
+) -> Markup {
     html! {
         dialog id="dlg-account-settings"
                class="action-dialog action-dialog-large settings-dialog" {
@@ -1615,11 +1651,7 @@ pub fn account_settings_modal(ctx: &ChromeContext) -> Markup {
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="security" {
-                        (settings_placeholder_panel(
-                            "Security",
-                            "Password change and other credential-level \
-                             controls land here in a coming checkpoint.",
-                        ))
+                        (settings_security_panel(ctx))
                     }
                     div class="settings-panel"
                         role="tabpanel"
@@ -1657,12 +1689,7 @@ pub fn account_settings_modal(ctx: &ChromeContext) -> Markup {
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="data" {
-                        (settings_placeholder_panel(
-                            "Data control",
-                            "Account recovery code, data export, and \
-                             account deletion land here in a coming \
-                             checkpoint.",
-                        ))
+                        (settings_data_panel(ctx, recovery_meta))
                     }
                 }
             }
@@ -1701,9 +1728,188 @@ fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
     }
 }
 
-/// Stand-in for the sections that aren't built yet. Keeps the
-/// tab-nav structure honest without pretending we have settings to
-/// show.
+/// Security panel — the Change password section. New + confirm
+/// fields live here; the current password is collected by the reauth
+/// modal (the "Change password" button is a `data-reauth-confirm`
+/// trigger). The button stays disabled until the new password is at
+/// least 8 chars and matches the confirm field (see
+/// `CHANGE_PASSWORD_GATE_JS`), so a typo'd confirm never reaches the
+/// reauth step.
+fn settings_security_panel(ctx: &ChromeContext) -> Markup {
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" {
+                    (shield_icon())
+                }
+                div {
+                    h3 { "Password" }
+                    p class="settings-section-tagline" {
+                        "Change the password you use to sign in."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                form id="form-change-password"
+                     class="settings-row"
+                     method="post"
+                     action="/me/password" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row-label" {
+                        label for="change-pw-new" { "New password" }
+                        p class="settings-row-hint" {
+                            "At least 8 characters. You'll confirm your "
+                            "current password before the change applies. "
+                            "Changing it signs out your other devices."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        input type="password"
+                              id="change-pw-new"
+                              name="new_password"
+                              autocomplete="new-password"
+                              minlength="8"
+                              required;
+                        // No `name` — this confirm field is a client-side
+                        // typo guard only; it never reaches the server.
+                        input type="password"
+                              id="change-pw-confirm"
+                              data-pw-confirm="change-pw-new"
+                              autocomplete="new-password"
+                              placeholder="Confirm new password"
+                              required;
+                        div class="settings-row-actions" {
+                            button type="button" class="btn-secondary"
+                                   data-reauth-confirm="form-change-password"
+                                   disabled {
+                                "Change password"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Data Control panel — currently the offline recovery code section.
+/// Shows when the code was generated + last used (if a row exists),
+/// and a reauth-chained "Regenerate" button. Regenerating mints a
+/// fresh code (invalidating the old one) and shows it once via
+/// [`recovery_code_modal_content`] swapped into the reauth modal.
+fn settings_data_panel(
+    ctx: &ChromeContext,
+    recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
+) -> Markup {
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" {
+                    (database_icon())
+                }
+                div {
+                    h3 { "Recovery code" }
+                    p class="settings-section-tagline" {
+                        "Your offline way back in if you forget your "
+                        "password or lose a second factor."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                form id="form-regenerate-recovery"
+                     class="settings-row"
+                     method="post"
+                     action="/me/recovery-code/regenerate" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row-label" {
+                        label { "Status" }
+                        @match recovery_meta {
+                            Some(meta) => {
+                                p class="settings-row-hint" {
+                                    "Generated "
+                                    (meta.generated_at.format("%b %-d, %Y").to_string())
+                                    ". "
+                                    @match meta.last_used_at {
+                                        Some(used) => {
+                                            "Last used "
+                                            (used.format("%b %-d, %Y").to_string())
+                                            "."
+                                        }
+                                        None => { "Never used." }
+                                    }
+                                }
+                            }
+                            None => {
+                                p class="settings-row-hint" {
+                                    "No recovery code on file. Generate one "
+                                    "now so you can recover this account later."
+                                }
+                            }
+                        }
+                    }
+                    div class="settings-row-control" {
+                        p class="settings-row-hint" {
+                            "Regenerating shows a new code once and "
+                            "immediately invalidates the old one. You'll "
+                            "confirm your current password first."
+                        }
+                        div class="settings-row-actions" {
+                            button type="button" class="btn-secondary"
+                                   data-reauth-confirm="form-regenerate-recovery" {
+                                "Regenerate"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One-time display of a freshly regenerated recovery code, swapped
+/// into the reauth modal (`#reauth-modal-content`) after a successful
+/// `POST /me/recovery-code/regenerate`. The code rides this single
+/// HTTP response and is never re-rendered — same "shown once" contract
+/// as the invite-acceptance interstitial. Reuses `INVITE_COPY_JS` via
+/// the `data-copy-target` hook (loaded in the shell).
+pub fn recovery_code_modal_content(recovery_code: &str) -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-icon-success" {
+                (check_circle_icon())
+            }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Your new recovery code" }
+        p class="dialog-description dialog-center-text" {
+            "Save this somewhere safe. The previous code no longer "
+            "works, and we won't show this one again."
+        }
+        div class="recovery-code-display" {
+            input id="recovery-code"
+                  type="text"
+                  class="recovery-code-input"
+                  value=(recovery_code)
+                  readonly
+                  aria-label="Account recovery code";
+            button type="button" class="btn-secondary"
+                   data-copy-target="recovery-code" {
+                "Copy"
+            }
+        }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog {
+                "Done"
+            }
+        }
+    }
+}
+
+/// Stand-in for the sections that aren't built yet (Devices,
+/// Authenticators, Passkeys).
 fn settings_placeholder_panel(title: &str, body: &str) -> Markup {
     html! {
         div class="settings-placeholder" {
@@ -4400,6 +4606,11 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
             "Nothing to update",
             "That's already your email.".to_string(),
         ),
+        "password_changed" => (
+            ToastKind::Success,
+            "Password changed",
+            "Your password has been updated. Other devices were signed out.".to_string(),
+        ),
 
         _ => return None,
     };
@@ -4451,6 +4662,7 @@ fn error_banner_message(error: &str) -> &'static str {
         // Invite-form errors. These re-render the form with the input
         // preserved (see members_invite_form_page).
         "email_required" => "Enter an email address.",
+        "new_password_required" => "Enter a new password.",
         "cannot_invite_higher_role" => "You can't invite someone at a higher role than your own.",
         "email_already_in_use" => "A member with that email already exists.",
         "active_invite_exists" => "An open invitation already exists for that email.",

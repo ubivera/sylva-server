@@ -29,6 +29,11 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/me", get(routes::me_page))
         .route("/me/profile", post(routes::me_profile_submit))
         .route("/me/email", post(routes::me_email_submit))
+        .route("/me/password", post(routes::me_password_submit))
+        .route(
+            "/me/recovery-code/regenerate",
+            post(routes::me_recovery_regenerate),
+        )
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in

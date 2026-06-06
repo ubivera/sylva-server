@@ -563,6 +563,7 @@ pub struct LoginBody {
 /// round-trips through `auth::recovery_code::hash_code`.
 #[derive(serde::Deserialize)]
 pub struct AcceptInviteBody {
+    #[allow(dead_code)]
     pub token: String,
     #[allow(dead_code)]
     pub expires_at: DateTime<Utc>,
