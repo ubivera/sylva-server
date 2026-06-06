@@ -308,6 +308,45 @@ pub async fn me_page(
     Html(views::me_page(&ctx).into_string()).into_response()
 }
 
+/// `GET /modals/account-settings` — render the account-settings
+/// dialog as a standalone fragment. Modals are no longer baked into
+/// every page as `<template>` blocks; instead the shell ships an empty
+/// `#modal-host` and the client fetches a modal's markup on demand
+/// (then removes it from the DOM on close). See `MODAL_HOST_JS`.
+pub async fn account_settings_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::account_settings_modal(&ctx).into_string()).into_response()
+}
+
+/// `GET /modals/reauth` — render the reauth dialog as a standalone
+/// fragment. Fetched on demand by `REAUTH_CHAIN_JS` whenever an action
+/// chains through the password gate (account-settings email change,
+/// the /members destructive actions, /pending veto, invite). The
+/// chain repoints the form's action + stages the originating payload
+/// after the fragment lands.
+pub async fn reauth_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::reauth_modal(&ctx).into_string()).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct MeProfileForm {
     pub csrf_token: String,

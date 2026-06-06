@@ -679,11 +679,13 @@ async fn kebab_shown_for_owner_viewing_other_owner() {
         .unwrap();
     let body = String::from_utf8_lossy(&body_bytes);
 
-    // Other-owner actions should be present (they'll route to pending
-    // when invoked, but the UI surface is identical).
+    // Other-owner actions should be present as on-demand modal
+    // triggers (they'll route to pending when invoked, but the UI
+    // surface is identical). The dialog markup itself is fetched on
+    // open, not inline.
     let other_id = other.id.0;
-    assert!(body.contains(&format!("/members/{other_id}/deactivate")));
-    assert!(body.contains(&format!("/members/{other_id}/role")));
+    assert!(body.contains(&format!(r#"data-open-modal="/members/{other_id}/modal/deactivate""#)));
+    assert!(body.contains(&format!(r#"data-open-modal="/members/{other_id}/modal/role""#)));
 }
 
 #[tokio::test]
@@ -835,7 +837,7 @@ async fn htmx_failed_action_emits_error_toast() {
 }
 
 #[tokio::test]
-async fn delete_dialog_renders_with_csrf_input() {
+async fn delete_dialog_fetched_on_demand_with_csrf_input() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -843,24 +845,46 @@ async fn delete_dialog_renders_with_csrf_input() {
         .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
-
-    let req = axum::http::Request::builder()
-        .method(Method::GET)
-        .uri("/members")
-        .header(header::COOKIE, cookie)
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = String::from_utf8_lossy(&body_bytes);
-
-    // The delete dialog should be present with a csrf_token hidden input.
     let target_id = target.id.0;
-    assert!(body.contains(&format!(r#"id="dlg-delete-{target_id}""#)));
-    assert!(body.contains(r#"name="csrf_token""#));
-    assert!(body.contains(&format!(r#"action="/members/{target_id}/delete""#)));
+
+    // The members page no longer ships the dialog markup — only the
+    // kebab item that fetches it on demand.
+    let page = body_text(get(&app, "/members", &cookie).await).await;
+    assert!(
+        !page.contains(&format!(r#"id="dlg-delete-{target_id}""#)),
+        "delete dialog must NOT be inline in the members page"
+    );
+    assert!(
+        page.contains(&format!(r#"data-open-modal="/members/{target_id}/modal/delete""#)),
+        "kebab should carry the on-demand modal trigger"
+    );
+
+    // The fragment endpoint serves the dialog with its CSRF input + form.
+    let frag = body_text(
+        get(&app, &format!("/members/{target_id}/modal/delete"), &cookie).await,
+    )
+    .await;
+    assert!(!frag.contains("<html"), "fragment must not be a full page");
+    assert!(frag.contains(&format!(r#"id="dlg-delete-{target_id}""#)));
+    assert!(frag.contains(r#"name="csrf_token""#));
+    assert!(frag.contains(&format!(r#"action="/members/{target_id}/delete""#)));
+}
+
+/// The on-demand member-action modal endpoint enforces the same authz
+/// the kebab uses: an Admin can't fetch an action modal targeting an
+/// Owner (the kebab wouldn't show it), so a direct GET 403s.
+#[tokio::test]
+async fn member_action_modal_forbidden_for_admin_targeting_owner() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let owner = app
+        .seed_user("owner2@test.local", "Owner Two", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+
+    let resp = get(&app, &format!("/members/{}/modal/delete", owner.id.0), &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1518,28 +1542,58 @@ async fn assets_carry_cache_busting_version_query() {
 }
 
 #[tokio::test]
-async fn shared_modals_live_inside_templates_not_live_dom() {
-    // dlg-invite and dlg-reauth are wrapped in <template> elements so
-    // they don't contribute to initial DOM layout. DIALOG_JS clones
-    // them into the body on first use via hearthMaterializeDialog.
+async fn shared_modals_not_baked_into_live_dom() {
+    // No modal markup ships in the page source — everything (reauth,
+    // invite, per-row actions) is fetched on demand into #modal-host
+    // and removed on close. The page carries only the empty host, the
+    // fetch helpers, and the kebab/CTA triggers.
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    // Seed a non-self member so the kebab renders actionable (unlocked)
+    // items carrying the on-demand triggers.
+    app.seed_user("target@test.local", "Target", "pw", InstanceRole::Member)
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
     let resp = get(&app, "/members", &cookie).await;
     let body = body_text(resp).await;
     assert!(
-        body.contains(r#"template id="tpl-dlg-invite""#),
-        "dlg-invite must be wrapped in a <template>"
+        body.contains(r#"id="modal-host""#),
+        "the empty #modal-host injection point must be present"
+    );
+    // Reauth is on-demand: no template, no live dialog in the source.
+    assert!(
+        !body.contains(r#"tpl-dlg-reauth""#),
+        "reauth must NOT ship as a <template> — it's fetched on demand"
     );
     assert!(
-        body.contains(r#"template id="tpl-dlg-reauth""#),
-        "dlg-reauth must be wrapped in a <template>"
+        !body.contains(r#"id="dlg-reauth""#),
+        "reauth dialog must NOT be in the page source"
+    );
+    // The fetch helper is exposed for the on-demand open + reauth chain.
+    assert!(
+        body.contains("hearthOpenModal"),
+        "DIALOG_JS must expose the on-demand open helper"
+    );
+    // Invite modal is now on-demand too — no template, no live dialog.
+    assert!(
+        !body.contains(r#"tpl-dlg-invite""#),
+        "invite modal must NOT ship as a <template> — it's fetched on demand"
     );
     assert!(
-        body.contains("hearthMaterializeDialog"),
-        "DIALOG_JS must expose the materializer helper"
+        !body.contains(r#"id="dlg-invite""#),
+        "invite dialog must NOT be in the page source"
+    );
+    // Per-row action dialogs are gone from the source too — only the
+    // kebab triggers remain.
+    assert!(
+        !body.contains(r#"id="dlg-delete-"#),
+        "per-row delete dialogs must NOT be inline"
+    );
+    assert!(
+        body.contains(r#"data-open-modal="/members/"#),
+        "kebab items should carry on-demand modal triggers"
     );
 }
 
@@ -1573,15 +1627,33 @@ async fn members_page_renders_invite_cta_and_modal() {
         .await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
-    let resp = get(&app, "/members", &cookie).await;
-    let body = body_text(resp).await;
-    // CTA is now a button that opens the always-rendered <dialog>.
-    assert!(body.contains(r#"data-open-dialog="dlg-invite""#));
+    // CTA fetches the invite modal on demand; the dialog markup itself
+    // is no longer in the page.
+    let body = body_text(get(&app, "/members", &cookie).await).await;
+    assert!(body.contains(r#"data-open-modal="/modals/invite""#));
     assert!(body.contains("Invite member"));
-    // The dialog itself renders inline on /members.
-    assert!(body.contains(r#"id="dlg-invite""#));
-    // The dialog's form still POSTs to the same endpoint.
-    assert!(body.contains(r#"action="/members/invite""#));
+    assert!(
+        !body.contains(r#"id="dlg-invite""#),
+        "invite dialog must not be inline on /members"
+    );
+
+    // The /modals/invite fragment serves the dialog + its form.
+    let frag = body_text(get(&app, "/modals/invite", &cookie).await).await;
+    assert!(!frag.contains("<html"), "fragment must not be a full page");
+    assert!(frag.contains(r#"id="dlg-invite""#));
+    assert!(frag.contains(r#"action="/members/invite""#));
+    assert!(frag.contains(r#"data-keep-source"#), "invite send button must keep the source modal alive");
+}
+
+/// `/modals/invite` is admin-gated — a regular Member fetching it 403s.
+#[tokio::test]
+async fn invite_modal_fragment_forbidden_for_member() {
+    let app = TestApp::new().await;
+    app.seed_user("m@test.local", "Mem", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, _) = web_login_session(&app, "m@test.local", "pw").await;
+    let resp = get(&app, "/modals/invite", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1898,25 +1970,29 @@ async fn reissue_forbidden_for_member() {
 }
 
 #[tokio::test]
-async fn pending_invite_row_renders_reissue_dialog_with_csrf() {
+async fn pending_invite_row_reissue_dialog_fetched_on_demand() {
     let app = TestApp::new().await;
     let _ = seed_pending_invite(&app, "renders@test.local").await;
     let invitation_id = latest_invitation_id(&app).await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
-    let resp = get(&app, "/members", &cookie).await;
-    let body = body_text(resp).await;
-    let dialog_id = format!(r#"data-open-dialog="dlg-reissue-invite-{invitation_id}""#);
+    // The row carries the on-demand trigger, not the inline dialog.
+    let page = body_text(get(&app, "/members", &cookie).await).await;
+    let trigger = format!(r#"data-open-modal="/members/invitations/{invitation_id}/modal/reissue""#);
+    assert!(page.contains(&trigger), "kebab should fetch reissue dialog on demand");
     assert!(
-        body.contains(&dialog_id),
-        "kebab should open reissue dialog: {body}"
+        !page.contains(&format!(r#"id="dlg-reissue-invite-{invitation_id}""#)),
+        "reissue dialog must not be inline"
     );
-    let dlg = format!(r#"id="dlg-reissue-invite-{invitation_id}""#);
-    assert!(body.contains(&dlg));
-    let chain = format!(r#"data-reauth-confirm="form-reissue-invite-{invitation_id}""#);
-    assert!(body.contains(&chain));
-    let action = format!(r#"action="/members/invitations/{invitation_id}/reissue""#);
-    assert!(body.contains(&action));
+
+    // The fragment endpoint serves the dialog with form + chain hook.
+    let frag = body_text(
+        get(&app, &format!("/members/invitations/{invitation_id}/modal/reissue"), &cookie).await,
+    )
+    .await;
+    assert!(frag.contains(&format!(r#"id="dlg-reissue-invite-{invitation_id}""#)));
+    assert!(frag.contains(&format!(r#"data-reauth-confirm="form-reissue-invite-{invitation_id}""#)));
+    assert!(frag.contains(&format!(r#"action="/members/invitations/{invitation_id}/reissue""#)));
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1995,11 +2071,11 @@ async fn pending_page_renders_empty_state_for_owner_with_no_pendings() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_text(resp).await;
     assert!(body.contains("Nothing pending"), "empty state missing: {body}");
-    assert!(!body.contains("data-open-dialog=\"dlg-veto-"));
+    assert!(!body.contains("data-open-modal=\"/pending/"));
 }
 
 #[tokio::test]
-async fn pending_page_renders_active_row_for_owner_with_veto_dialog() {
+async fn pending_page_active_row_veto_dialog_fetched_on_demand() {
     let app = TestApp::new().await;
     let (cookie, target, transition_id, _csrf) =
         seed_pending_owner_deactivate(&app).await;
@@ -2011,16 +2087,22 @@ async fn pending_page_renders_active_row_for_owner_with_veto_dialog() {
     // The target's name + the action verb both appear in the row.
     assert!(body.contains(&target.display_name), "target name missing");
     assert!(body.contains("Deactivate"), "action verb missing");
-    // The kebab Veto button opens the per-row dialog.
-    let open = format!(r#"data-open-dialog="dlg-veto-{transition_id}""#);
-    assert!(body.contains(&open), "Veto open-dialog button missing");
-    // The dialog itself renders with the right form + reauth chain.
-    let dlg = format!(r#"id="dlg-veto-{transition_id}""#);
-    assert!(body.contains(&dlg), "veto dialog markup missing");
-    let chain = format!(r#"data-reauth-confirm="form-veto-{transition_id}""#);
-    assert!(body.contains(&chain), "reauth chain wiring missing");
-    let action = format!(r#"action="/pending/{transition_id}/veto""#);
-    assert!(body.contains(&action), "form action missing");
+    // The Veto button fetches the dialog on demand; no inline markup.
+    let open = format!(r#"data-open-modal="/pending/{transition_id}/modal/veto""#);
+    assert!(body.contains(&open), "Veto on-demand trigger missing");
+    assert!(
+        !body.contains(&format!(r#"id="dlg-veto-{transition_id}""#)),
+        "veto dialog must not be inline"
+    );
+
+    // The fragment endpoint serves the dialog + form + reauth chain.
+    let frag = body_text(
+        get(&app, &format!("/pending/{transition_id}/modal/veto"), &cookie).await,
+    )
+    .await;
+    assert!(frag.contains(&format!(r#"id="dlg-veto-{transition_id}""#)), "veto dialog markup missing");
+    assert!(frag.contains(&format!(r#"data-reauth-confirm="form-veto-{transition_id}""#)));
+    assert!(frag.contains(&format!(r#"action="/pending/{transition_id}/veto""#)));
 }
 
 #[tokio::test]
@@ -2371,25 +2453,27 @@ async fn members_page_no_pending_pill_when_no_pending() {
 }
 
 #[tokio::test]
-async fn pending_invite_row_renders_revoke_dialog_with_csrf() {
+async fn pending_invite_row_revoke_dialog_fetched_on_demand() {
     let app = TestApp::new().await;
     let _ = seed_pending_invite(&app, "viewable@test.local").await;
     let invitation_id = latest_invitation_id(&app).await;
     let (cookie, _) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
 
-    let resp = get(&app, "/members", &cookie).await;
-    let body = body_text(resp).await;
-    // Kebab item is now a dialog-opener, not a direct-submit form.
-    let dialog_id = format!(r#"data-open-dialog="dlg-revoke-invite-{invitation_id}""#);
-    assert!(body.contains(&dialog_id), "kebab should open revoke dialog");
-    // The dialog renders inline with its CSRF input and reauth-chain button.
-    let dialog = format!(r#"id="dlg-revoke-invite-{invitation_id}""#);
-    assert!(body.contains(&dialog), "revoke confirmation dialog should render");
-    assert!(body.contains(r#"name="csrf_token""#));
-    let chain_button =
-        format!(r#"data-reauth-confirm="form-revoke-invite-{invitation_id}""#);
+    // Kebab item fetches the revoke dialog on demand.
+    let page = body_text(get(&app, "/members", &cookie).await).await;
+    let trigger = format!(r#"data-open-modal="/members/invitations/{invitation_id}/modal/revoke""#);
+    assert!(page.contains(&trigger), "kebab should fetch revoke dialog on demand");
     assert!(
-        body.contains(&chain_button),
-        "Revoke button should chain to the shared reauth modal"
+        !page.contains(&format!(r#"id="dlg-revoke-invite-{invitation_id}""#)),
+        "revoke dialog must not be inline"
     );
+
+    // The fragment endpoint serves the dialog + CSRF + reauth-chain button.
+    let frag = body_text(
+        get(&app, &format!("/members/invitations/{invitation_id}/modal/revoke"), &cookie).await,
+    )
+    .await;
+    assert!(frag.contains(&format!(r#"id="dlg-revoke-invite-{invitation_id}""#)));
+    assert!(frag.contains(r#"name="csrf_token""#));
+    assert!(frag.contains(&format!(r#"data-reauth-confirm="form-revoke-invite-{invitation_id}""#)));
 }

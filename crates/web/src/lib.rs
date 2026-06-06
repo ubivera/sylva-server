@@ -29,6 +29,12 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/me", get(routes::me_page))
         .route("/me/profile", post(routes::me_profile_submit))
         .route("/me/email", post(routes::me_email_submit))
+        // On-demand modal fragments. The shell ships an empty
+        // `#modal-host`; the client fetches these when a modal is
+        // opened and removes the markup on close, so no modal lives in
+        // the page source at rest.
+        .route("/modals/account-settings", get(routes::account_settings_modal))
+        .route("/modals/reauth", get(routes::reauth_modal))
         .route("/members", get(routes::members_page))
         .route(
             "/members/invite",
@@ -42,6 +48,20 @@ pub fn ui_router(state: AppState) -> Router {
             "/members/invitations/{id}/reissue",
             post(admin_routes::reissue_invitation),
         )
+        // On-demand modal fragments for per-row member actions, the
+        // invite modal, pending-invitation actions, and veto — fetched
+        // when opened, removed on close. No modal markup ships in the
+        // page source. `{action}` is matched in the handler.
+        .route(
+            "/members/{id}/modal/{action}",
+            get(admin_routes::member_action_modal),
+        )
+        .route(
+            "/members/invitations/{id}/modal/{action}",
+            get(admin_routes::invitation_action_modal),
+        )
+        .route("/modals/invite", get(admin_routes::invite_modal_fragment))
+        .route("/pending/{id}/modal/veto", get(admin_routes::veto_modal))
         .route("/members/{id}/deactivate", post(admin_routes::deactivate_member))
         .route("/members/{id}/reactivate", post(admin_routes::reactivate_member))
         .route("/members/{id}/delete", post(admin_routes::delete_member))

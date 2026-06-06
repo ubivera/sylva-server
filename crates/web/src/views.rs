@@ -382,15 +382,17 @@ fn shell_app_inner(
                         div class="main-mark" aria-hidden="true" {}
                     }
                 }
-                // Account-settings modal template. Mounted in the shell
-                // (not per-page) because the user-card popover opens it
-                // from anywhere in the authed app. Lazy-mounted via the
-                // same `<template>` pattern as the invite + reauth
-                // dialogs — `DIALOG_JS` materializes it from the
-                // template on the first `data-open-dialog` click.
-                template id="tpl-dlg-account-settings" {
-                    (account_settings_modal(ctx))
-                }
+                // Modal host — the single injection point for all
+                // on-demand modals. Empty at rest: no modal markup
+                // ships in the page source. The client fetches a
+                // modal's HTML from its `/modals/*` endpoint when it's
+                // opened (appending the `<dialog>` here), then removes
+                // it from the DOM on close. See `MODAL_HOST_JS`. This
+                // replaced the old `<template>`-per-modal approach,
+                // which left inert template blocks in every page and a
+                // materialized dialog lingering in the DOM after first
+                // open.
+                div id="modal-host" {}
                 // Wire up [data-open-dialog] / [data-close-dialog] without
                 // pulling in a framework. Vanilla, ~10 lines, executes on
                 // every authed page (cheap when no dialogs are present).
@@ -813,42 +815,57 @@ const TOAST_JS: &str = r#"
 "#;
 
 const DIALOG_JS: &str = r#"
-// Some shared dialogs (dlg-invite, dlg-reauth, dlg-account-settings)
-// live inside `<template>` elements so the page boots without them
-// in the live DOM. When something needs one of them, we clone the
-// template's content into <body>, ask HTMX to scan the new subtree
-// so its hx-* attributes start firing, then return the live dialog.
-// Idempotent — the live-dialog check at the top short-circuits any
-// subsequent calls so we never end up with duplicates.
-window.hearthMaterializeDialog = function(id) {
+// ── On-demand modal host ───────────────────────────────────────────
+// Shared modals (account-settings, reauth) ship no markup in the page.
+// They're fetched from their `/modals/*` endpoint when opened, appended
+// to `#modal-host`, HTMX-processed so their hx-* attributes fire, then
+// removed from the DOM on close. `beforeend` append (not replace) lets
+// modals stack — e.g. the reauth modal opening over the settings modal,
+// both live in the dialog top layer, each removed on its own close.
+window.hearthOpenModal = function(url) {
+    var host = document.getElementById('modal-host');
+    if (!host) return Promise.resolve(null);
+    return fetch(url, { credentials: 'same-origin' })
+        .then(function(r) { return r.text(); })
+        .then(function(html) {
+            var tmp = document.createElement('div');
+            tmp.innerHTML = html;
+            var dlg = tmp.querySelector('dialog');
+            if (!dlg) return null;
+            host.appendChild(dlg);
+            // htmx.min.js scans on DOMContentLoaded + its own swap
+            // events, not raw DOM mutation. Process the injected
+            // subtree so the modal's hx-post/hx-target start firing —
+            // otherwise the form does a native POST and the server's
+            // partial loads as a bare page.
+            if (window.htmx && typeof window.htmx.process === 'function') {
+                window.htmx.process(dlg);
+            }
+            return dlg;
+        })
+        .catch(function() { return null; });
+};
+
+// Fetch-if-missing variant. Used by the reauth chain, which may be
+// re-entered while a previous reauth dialog is still mounted.
+window.hearthEnsureModal = function(id, url) {
     var live = document.getElementById(id);
-    if (live) return live;
-    var tpl = document.getElementById('tpl-' + id);
-    if (tpl && tpl.content) {
-        document.body.appendChild(tpl.content.cloneNode(true));
-        live = document.getElementById(id);
-        // Critical: htmx.min.js scans on DOMContentLoaded and on its
-        // own swap events, but not on raw DOM mutations. Without
-        // this call, any hx-post/hx-target inside the freshly-mounted
-        // template are dead strings — submitting one of those forms
-        // does a native POST and the server's partial fragment loads
-        // as a bare-page response. Manually processing the subtree
-        // wires the attributes into HTMX's request pipeline.
-        if (live && window.htmx && typeof window.htmx.process === 'function') {
-            window.htmx.process(live);
-        }
-        return live;
-    }
-    return null;
+    if (live) return Promise.resolve(live);
+    return window.hearthOpenModal(url);
 };
 
 document.addEventListener('click', function(e) {
-    var openId = e.target.closest('[data-open-dialog]');
-    if (openId) {
+    // Every modal opens on demand: fetch its fragment, inject it into
+    // #modal-host, showModal(). There are no longer any inline /
+    // template dialogs opened by element id — `data-open-modal` is the
+    // only open path.
+    var openModal = e.target.closest('[data-open-modal]');
+    if (openModal) {
         e.preventDefault();
-        var id = openId.getAttribute('data-open-dialog');
-        var d = window.hearthMaterializeDialog(id);
-        if (d && typeof d.showModal === 'function') d.showModal();
+        window.hearthOpenModal(openModal.getAttribute('data-open-modal'))
+            .then(function(d) {
+                if (d && typeof d.showModal === 'function') d.showModal();
+            });
         return;
     }
     var closeBtn = e.target.closest('[data-close-dialog]');
@@ -858,6 +875,25 @@ document.addEventListener('click', function(e) {
         if (dlg && typeof dlg.close === 'function') dlg.close();
     }
 });
+
+// Remove fetched modals from the DOM when they close, so nothing
+// lingers between opens. Scoped to dialogs parented by `#modal-host`.
+// Skips a close flagged `chainTransition` — that's a modal closing as
+// part of a hand-off (the invite modal closing while reauth opens),
+// which must survive to be reopened later. The flag is one-shot:
+// cleared as it's honored, so the next *real* close removes the modal.
+// Capture phase because `close` doesn't bubble.
+document.addEventListener('close', function(e) {
+    var dlg = e.target;
+    if (!(dlg instanceof HTMLDialogElement)) return;
+    if (dlg.parentElement && dlg.parentElement.id === 'modal-host') {
+        if (dlg.dataset.chainTransition === '1') {
+            dlg.dataset.chainTransition = '';
+            return;
+        }
+        dlg.remove();
+    }
+}, true);
 "#;
 
 fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
@@ -1073,7 +1109,7 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                 // as a button (not an anchor) because there's no URL
                 // to navigate to — the modal lives in-page.
                 button type="button" class="user-card-action"
-                       data-open-dialog="dlg-account-settings" {
+                       data-open-modal="/modals/account-settings" {
                     span class="user-card-action-icon" { (settings_icon()) }
                     span { "Account settings" }
                 }
@@ -1277,7 +1313,7 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
             }
             div class="me-actions" {
                 button type="button" class="btn"
-                       data-open-dialog="dlg-account-settings" {
+                       data-open-modal="/modals/account-settings" {
                     "Manage account"
                 }
             }
@@ -1379,7 +1415,7 @@ fn invite_form_fields(
 /// The form's `action` attribute is empty at render time; the JS
 /// chain in `REAUTH_CHAIN_JS` sets both `action` and `hx-post` to
 /// whichever per-row action URL the operator initiated.
-fn reauth_modal(ctx: &ChromeContext) -> Markup {
+pub fn reauth_modal(ctx: &ChromeContext) -> Markup {
     html! {
         dialog id="dlg-reauth" class="action-dialog reauth-dialog" {
             div id="reauth-modal-content" {
@@ -1442,6 +1478,59 @@ pub fn reauth_modal_content(
     }
 }
 
+/// Laptop icon — leading glyph on the "Devices" tab. Reads as
+/// "a device the user signs into". Stroke uses `currentColor`.
+fn laptop_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            rect x="3" y="4" width="18" height="12" rx="2" ry="2" {}
+            line x1="2" y1="20" x2="22" y2="20" {}
+        }
+    }
+}
+
+/// Key icon — leading glyph on the "Authenticators" tab. The
+/// classic "shared secret" metaphor reads more universally than
+/// the digit-grid alternative (which conflates with the 2FA code
+/// itself rather than the factor).
+fn key_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M21 2l-9.6 9.6" {}
+            circle cx="7.5" cy="15.5" r="5.5" {}
+            path d="M21 2l-2.5 2.5L21 7l-3 3-2.5-2.5" {}
+        }
+    }
+}
+
+/// Fingerprint icon — leading glyph on the "Passkeys" tab. Nested
+/// arcs evoke the WebAuthn / biometric story without locking us
+/// into a specific platform's affordance (Touch ID vs Windows
+/// Hello vs Android).
+fn fingerprint_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M6.5 3.5a10 10 0 0 1 11 0" {}
+            path d="M3 8a14 14 0 0 1 18 0" {}
+            path d="M5 12a12 12 0 0 1 14 0" {}
+            path d="M8 16a4 4 0 0 1 8 0v2" {}
+            path d="M12 12v6" {}
+        }
+    }
+}
+
 /// Database-cylinder icon — leading glyph on the "Data Control" tab
 /// of the account-settings modal. Three stacked ovals approximating a
 /// classic relational-database glyph; reads as "data" without forcing
@@ -1474,7 +1563,7 @@ fn shield_icon() -> Markup {
     }
 }
 
-fn invite_modal(ctx: &ChromeContext) -> Markup {
+pub(crate) fn invite_modal(ctx: &ChromeContext) -> Markup {
     html! {
         // `action-dialog-centered` so invite_modal_content_form + the
         // post-create / post-reissue success bodies all render with
@@ -1509,15 +1598,41 @@ fn invite_modal(ctx: &ChromeContext) -> Markup {
 /// container; `SETTINGS_TABS_JS` swaps `.settings-panel-active` +
 /// `.settings-tab-active` on click. No URL state — operator's choice
 /// is per-open, not persisted.
-fn account_settings_modal(ctx: &ChromeContext) -> Markup {
+pub fn account_settings_modal(ctx: &ChromeContext) -> Markup {
     html! {
         dialog id="dlg-account-settings"
                class="action-dialog action-dialog-large settings-dialog" {
             div class="settings-header" {
-                h2 { "Account settings" }
-                button type="button" class="dialog-close" data-close-dialog
-                       aria-label="Close" {
-                    (close_icon())
+                div class="settings-header-title" {
+                    span class="settings-header-icon" aria-hidden="true" {
+                        (settings_icon())
+                    }
+                    div class="settings-header-text" {
+                        h2 { "Account settings" }
+                        p class="settings-header-tagline" {
+                            "Manage your preferences."
+                        }
+                    }
+                }
+                div class="settings-header-actions" {
+                    // Sign-out lives at the top right of the modal
+                    // so it's reachable from anywhere in the
+                    // settings flow without backing out to the
+                    // user-card popover. CSRF-protected like the
+                    // user-card variant; same `/logout` target.
+                    form method="post" action="/logout"
+                         class="settings-header-signout-form" {
+                        (csrf_input(ctx.csrf_token))
+                        button type="submit"
+                               class="btn-secondary settings-header-signout" {
+                            (signout_icon())
+                            span { "Sign out" }
+                        }
+                    }
+                    button type="button" class="dialog-close"
+                           data-close-dialog aria-label="Close" {
+                        (close_icon())
+                    }
                 }
             }
             div class="settings-layout" {
@@ -1538,6 +1653,24 @@ fn account_settings_modal(ctx: &ChromeContext) -> Markup {
                     }
                     button type="button" class="settings-tab"
                            role="tab" aria-selected="false"
+                           data-settings-tab="devices" {
+                        span class="settings-tab-icon" { (laptop_icon()) }
+                        span { "Devices" }
+                    }
+                    button type="button" class="settings-tab"
+                           role="tab" aria-selected="false"
+                           data-settings-tab="authenticators" {
+                        span class="settings-tab-icon" { (key_icon()) }
+                        span { "Authenticators" }
+                    }
+                    button type="button" class="settings-tab"
+                           role="tab" aria-selected="false"
+                           data-settings-tab="passkeys" {
+                        span class="settings-tab-icon" { (fingerprint_icon()) }
+                        span { "Passkeys" }
+                    }
+                    button type="button" class="settings-tab"
+                           role="tab" aria-selected="false"
                            data-settings-tab="data" {
                         span class="settings-tab-icon" { (database_icon()) }
                         span { "Data Control" }
@@ -1554,8 +1687,40 @@ fn account_settings_modal(ctx: &ChromeContext) -> Markup {
                         data-settings-panel="security" {
                         (settings_placeholder_panel(
                             "Security",
-                            "Password, two-factor authentication, and \
-                             active sessions land here in a coming \
+                            "Password change and other credential-level \
+                             controls land here in a coming checkpoint.",
+                        ))
+                    }
+                    div class="settings-panel"
+                        role="tabpanel"
+                        data-settings-panel="devices" {
+                        (settings_placeholder_panel(
+                            "Devices",
+                            "Browsers and phones you're currently signed \
+                             into will be listed here, with the option \
+                             to sign each one out remotely. Coming in a \
+                             follow-up checkpoint.",
+                        ))
+                    }
+                    div class="settings-panel"
+                        role="tabpanel"
+                        data-settings-panel="authenticators" {
+                        (settings_placeholder_panel(
+                            "Authenticators",
+                            "Time-based one-time password apps \
+                             (Google Authenticator, 1Password, Authy, etc.) \
+                             will be enrolled here. Coming in a follow-up \
+                             checkpoint.",
+                        ))
+                    }
+                    div class="settings-panel"
+                        role="tabpanel"
+                        data-settings-panel="passkeys" {
+                        (settings_placeholder_panel(
+                            "Passkeys",
+                            "Passkeys let you sign in with a face / \
+                             fingerprint / hardware key instead of a \
+                             password. Enrollment lands in a follow-up \
                              checkpoint.",
                         ))
                     }
@@ -1575,21 +1740,37 @@ fn account_settings_modal(ctx: &ChromeContext) -> Markup {
     }
 }
 
-/// Profile panel. Two forms split on the reauth axis:
-///   - Display name (no reauth) — HTMX inline save, swaps the form
-///     back into place with a feedback tile.
-///   - Email (reauth-chained) — the Update email button is a
-///     `data-reauth-confirm` trigger; `REAUTH_CHAIN_JS` stages the
-///     new email value into the reauth modal and the user re-enters
-///     their password there. On success the handler HX-Redirects to
-///     /me with a toast (same shape as the admin destructive actions).
+/// Profile panel. One section card ("Account Information") with two
+/// rows inside — display name (HTMX inline save) and email (reauth-
+/// chained). The section header carries a leading icon + subtag the
+/// same way other panels will (Security: lock + "Credentials and
+/// session controls"; Devices: laptop + "Browsers and phones…"). The
+/// rows split on the reauth axis: the display name save is friction-
+/// less; the email save funnels through `dlg-reauth`.
 fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
     html! {
-        div id="settings-form-name" {
-            (settings_name_form(ctx, None))
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" {
+                    (user_icon())
+                }
+                div {
+                    h3 { "Account Information" }
+                    p class="settings-section-tagline" {
+                        "Manage your identity and sign-in credentials."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                div id="form-settings-name-wrap" {
+                    (settings_name_form(ctx, None))
+                }
+                div class="settings-row-divider" {}
+                div id="form-settings-email-wrap" {
+                    (settings_email_form(ctx))
+                }
+            }
         }
-        div class="settings-section-divider" {}
-        (settings_email_form(ctx))
     }
 }
 
@@ -1605,11 +1786,12 @@ fn settings_placeholder_panel(title: &str, body: &str) -> Markup {
     }
 }
 
-/// Display-name form. No reauth — display name isn't security-
-/// relevant, and the friction of "type your password to rename
-/// yourself" would feel hostile. HTMX-targeted to its own wrapper so
-/// the email form next to it doesn't disturb. `feedback` renders an
-/// inline tile above the form after a save.
+/// Display-name row inside the Account Information section. No
+/// reauth — display name isn't security-relevant, and the friction
+/// of "type your password to rename yourself" would feel hostile.
+/// HTMX-targeted to its own wrapper so the email row next to it
+/// doesn't disturb. `feedback` renders an inline tile above the row
+/// after a save.
 pub fn settings_name_form(
     ctx: &ChromeContext,
     feedback: Option<&SettingsFeedback>,
@@ -1620,62 +1802,73 @@ pub fn settings_name_form(
             (settings_feedback_tile(fb))
         }
         form id="form-settings-name"
-             class="settings-form"
+             class="settings-row"
              method="post"
              action="/me/profile"
              hx-post="/me/profile"
-             hx-target="#settings-form-name"
+             hx-target="#form-settings-name-wrap"
              hx-swap="innerHTML" {
             (csrf_input(ctx.csrf_token))
-            div class="field" {
+            div class="settings-row-label" {
                 label for="settings-display-name" { "Display name" }
+                p class="settings-row-hint" {
+                    "How you appear beside your sign-in everywhere on \
+                     this instance."
+                }
+            }
+            div class="settings-row-control" {
                 input type="text"
                       id="settings-display-name"
                       name="display_name"
                       value=(user.display_name)
                       autocomplete="name"
                       required;
-            }
-            div class="settings-form-actions" {
-                button type="submit" class="btn" { "Save name" }
+                div class="settings-row-actions" {
+                    button type="submit" class="btn-secondary" {
+                        "Save"
+                    }
+                }
             }
         }
     }
 }
 
-/// Email form. Submit is gated by the reauth chain: clicking
-/// `Update email` opens `dlg-reauth` with the staged new email in a
-/// hidden input. The operator enters their current password in the
-/// reauth modal; on success the handler HX-Redirects to /me with a
-/// "Email updated" toast. Inline password is intentionally absent —
-/// re-using the existing reauth pattern keeps "security-sensitive
-/// edits live in the reauth modal" as a one-sentence story.
+/// Email row inside the Account Information section. Submit is
+/// gated by the reauth chain: clicking `Update email` opens
+/// `dlg-reauth` with the staged new email in a hidden input. The
+/// operator enters their current password in the reauth modal; on
+/// success the handler HX-Redirects to /me with an "Email updated"
+/// toast. Inline password is intentionally absent — re-using the
+/// existing reauth pattern keeps "security-sensitive edits live in
+/// the reauth modal" as a one-sentence story.
 pub fn settings_email_form(ctx: &ChromeContext) -> Markup {
     let user = ctx.user;
     html! {
         form id="form-settings-email"
-             class="settings-form"
+             class="settings-row"
              method="post"
              action="/me/email" {
             (csrf_input(ctx.csrf_token))
-            div class="field" {
-                label for="settings-email" { "Email" }
+            div class="settings-row-label" {
+                label for="settings-email" { "Email address" }
+                p class="settings-row-hint" {
+                    "The address you sign in with. You'll be asked to \
+                     confirm your current password before the change \
+                     applies."
+                }
+            }
+            div class="settings-row-control" {
                 input type="email"
                       id="settings-email"
                       name="email"
                       value=(user.email)
                       autocomplete="email"
                       required;
-                p class="field-hint" {
-                    "This is the address you'll sign in with. You'll be "
-                    "asked to confirm your current password before the "
-                    "change applies."
-                }
-            }
-            div class="settings-form-actions" {
-                button type="button" class="btn"
-                       data-reauth-confirm="form-settings-email" {
-                    "Update email"
+                div class="settings-row-actions" {
+                    button type="button" class="btn-secondary"
+                           data-reauth-confirm="form-settings-email" {
+                        "Update email"
+                    }
                 }
             }
         }
@@ -1758,8 +1951,15 @@ pub fn invite_modal_content_form(
             div class="dialog-actions" {
                 button type="button" class="btn-secondary"
                        data-close-dialog { "Cancel" }
+                // `data-keep-source`: the reauth chain must NOT remove
+                // the invite modal when it opens reauth — the invite
+                // success partial is HX-Retargeted back into this
+                // modal's `#invite-modal-content`, so the modal has to
+                // survive (closed, hidden in #modal-host) until the
+                // switch-to-invite-modal event reopens it.
                 button type="button" class="btn"
-                       data-reauth-confirm="form-invite-modal" {
+                       data-reauth-confirm="form-invite-modal"
+                       data-keep-source {
                     "Send invitation"
                 }
             }
@@ -2396,7 +2596,7 @@ pub fn members_page(
                   aria-label="Search members";
             (filter_menu(filter, sort))
             button type="button" class="btn-secondary invite-cta"
-                   data-open-dialog="dlg-invite" {
+                   data-open-modal="/modals/invite" {
                 (plus_icon())
                 span { "Invite members" }
             }
@@ -2454,22 +2654,15 @@ pub fn members_page(
         // toolbar/table rhythm stable as rows come and go and gives
         // the operator a fixed place to find the rows-per-page control.
         (pagination_bar(pagination, sort, filter))
-        // Both shared modals (invite + reauth) live inside `<template>`
-        // elements until first use. The `<template>` content is parsed
-        // by the browser but isn't part of the live DOM — no layout
-        // cost, no DOM-API queries match it, scripts inside don't
-        // run. DIALOG_JS materializes the dialog on first
-        // `data-open-dialog` click, REAUTH_CHAIN_JS materializes
-        // `dlg-reauth` the first time an action button chains, and
-        // INVITE_SWAP_TO_INVITE_JS materializes `dlg-invite` if the
-        // server's HX-Retarget swap fires before the operator
-        // opened it manually.
-        template id="tpl-dlg-invite" {
-            (invite_modal(ctx))
-        }
-        template id="tpl-dlg-reauth" {
-            (reauth_modal(ctx))
-        }
+        // All modals on this page are fetched on demand into the
+        // shell's `#modal-host`: the invite modal from `/modals/invite`,
+        // each per-row action dialog from `/members/{id}/modal/{action}`,
+        // and the reauth modal from `/modals/reauth` (via the chain).
+        // Nothing ships in the page source.
+        // `tpl-dlg-reauth` is mounted once at the shell level (see
+        // `shell_app_inner`) so it's available on every authed page,
+        // not just here — the account-settings modal's email reauth
+        // chain can fire from anywhere. No per-page copy needed.
         // outside-click closes any open kebab. All vanilla JS, no
         // framework, no XHR.
         script {
@@ -2866,13 +3059,13 @@ const DROPDOWN_FLIP_JS: &str = r#"
 const INVITE_SWAP_TO_INVITE_JS: &str = r#"
 (function() {
     document.body.addEventListener('switch-to-invite-modal', function() {
+        // The reauth modal just POSTed the invite successfully; the
+        // server HX-Retargeted the success partial back into the kept
+        // invite modal's #invite-modal-content. Close reauth (which
+        // removes it) and reopen the invite modal — it survived in
+        // #modal-host via `data-keep-source` while reauth was up.
         var reauth = document.getElementById('dlg-reauth');
-        // dlg-invite is normally materialized when the operator clicks
-        // "+ Invite member", but materialize defensively here too in
-        // case the chain fired without an opening user gesture.
-        var invite = window.hearthMaterializeDialog
-            ? window.hearthMaterializeDialog('dlg-invite')
-            : document.getElementById('dlg-invite');
+        var invite = document.getElementById('dlg-invite');
         if (reauth && reauth.open) reauth.close();
         if (invite && !invite.open) invite.showModal();
     });
@@ -3017,94 +3210,105 @@ const REAUTH_CHAIN_JS: &str = r#"
         if (!btn) return;
         e.preventDefault();
         var sourceForm = document.getElementById(btn.getAttribute('data-reauth-confirm'));
+        if (!sourceForm) return;
         // Run native form validation before opening the reauth modal.
         // Without this, a malformed email + click on Update email would
         // open the reauth flow, the operator would type their password,
         // and only then see the rejection. Surfacing the invalidity at
         // the source form means the password prompt only appears for
         // requests that have a chance of succeeding.
-        if (sourceForm
-            && typeof sourceForm.checkValidity === 'function'
+        if (typeof sourceForm.checkValidity === 'function'
             && !sourceForm.checkValidity()) {
             if (typeof sourceForm.reportValidity === 'function') {
                 sourceForm.reportValidity();
             }
             return;
         }
-        // Lazy-mount dlg-reauth from its <template> if this is the
-        // first chain run since page load.
-        var reauthDialog = window.hearthMaterializeDialog
-            ? window.hearthMaterializeDialog('dlg-reauth')
-            : document.getElementById('dlg-reauth');
-        var reauthContent = document.getElementById('reauth-modal-content');
-        var reauthForm = reauthContent ? reauthContent.querySelector('form') : null;
-        if (!sourceForm || !reauthDialog || !reauthForm) return;
 
         // Role-aware intercept — if the source form has a role input
         // and "owner" is selected, route through the owner-confirm
-        // dialog instead of straight to reauth.
+        // dialog instead of straight to reauth. Under the on-demand
+        // model the owner-confirm is its own fetched fragment
+        // (`/members/{id}/modal/role-owner-confirm`) with a
+        // self-contained role=owner form; once it's shown we remove
+        // the role-picker dialog entirely (no cross-dialog form
+        // reference to preserve).
         if (btn.hasAttribute('data-role-aware')) {
             var roleInput = sourceForm.querySelector('input[name="role"]:checked');
             if (roleInput && roleInput.value === 'owner') {
                 var targetId = btn.getAttribute('data-target-id');
-                var ownerConfirm = document.getElementById('dlg-role-owner-confirm-' + targetId);
-                if (ownerConfirm) {
-                    var srcDialog = btn.closest('dialog');
-                    if (srcDialog && typeof srcDialog.close === 'function') {
-                        // Tell ROLE_PICKER_GATE_JS that this close is
-                        // part of a chain transition (role → owner-
-                        // confirm → reauth). Without this hint the
-                        // close handler unchecks the role radios, and
-                        // when Make Owner re-fires this chain it sees
-                        // no role selected → stages no role payload →
-                        // Verify POSTs missing data and HTMX silently
-                        // swaps a 422 body into the modal.
-                        srcDialog.dataset.chainTransition = '1';
-                        srcDialog.close();
-                    }
-                    ownerConfirm.showModal();
-                    return;
-                }
+                var roleDialog = btn.closest('dialog');
+                window.hearthOpenModal('/members/' + targetId + '/modal/role-owner-confirm')
+                    .then(function(oc) {
+                        if (oc && typeof oc.showModal === 'function') oc.showModal();
+                        // Remove the role picker — owner-confirm is
+                        // self-contained, so nothing depends on it.
+                        if (roleDialog) roleDialog.remove();
+                    });
+                return;
             }
         }
 
-        // Repoint the reauth form at the action URL.
-        reauthForm.setAttribute('action', sourceForm.getAttribute('action') || '');
-        reauthForm.setAttribute('hx-post', sourceForm.getAttribute('action') || '');
-        // Tell HTMX to re-scan the form so the new hx-post takes effect.
-        if (window.htmx && typeof window.htmx.process === 'function') {
-            window.htmx.process(reauthForm);
-        }
-
-        // Drop any previously-staged inputs from an earlier chain.
-        reauthForm.querySelectorAll('input[data-reauth-staged]').forEach(function(el) {
-            el.remove();
-        });
-        // Copy the source form's payload into the reauth form.
-        new FormData(sourceForm).forEach(function(value, key) {
-            if (key === 'csrf_token' || key === 'password') return;
-            var input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = key;
-            input.value = value;
-            input.setAttribute('data-reauth-staged', '');
-            reauthForm.appendChild(input);
-        });
-
-        // Clear the password input from any prior open.
-        var pwInput = reauthForm.querySelector('input[name="password"]');
-        if (pwInput) pwInput.value = '';
-
-        // Close the source dialog (the action setup is now staged),
-        // open the reauth modal, focus the password input.
+        // Fetch the reauth modal on demand (it ships no page markup).
+        // `hearthEnsureModal` reuses a still-mounted dlg-reauth if one
+        // exists, else fetches `/modals/reauth`. The staging + open
+        // happens in the promise callback once the fragment lands.
+        var actionUrl = sourceForm.getAttribute('action') || '';
         var sourceDialog = btn.closest('dialog');
-        if (sourceDialog && typeof sourceDialog.close === 'function') {
-            sourceDialog.close();
-        }
-        if (typeof reauthDialog.showModal === 'function') {
-            reauthDialog.showModal();
-        }
-        if (pwInput) pwInput.focus();
+        var keepSource = btn.hasAttribute('data-keep-source');
+        window.hearthEnsureModal('dlg-reauth', '/modals/reauth').then(function(reauthDialog) {
+            var reauthContent = document.getElementById('reauth-modal-content');
+            var reauthForm = reauthContent ? reauthContent.querySelector('form') : null;
+            if (!reauthDialog || !reauthForm) return;
+
+            // Repoint the reauth form at the action URL.
+            reauthForm.setAttribute('action', actionUrl);
+            reauthForm.setAttribute('hx-post', actionUrl);
+            if (window.htmx && typeof window.htmx.process === 'function') {
+                window.htmx.process(reauthForm);
+            }
+
+            // Drop any previously-staged inputs from an earlier chain.
+            reauthForm.querySelectorAll('input[data-reauth-staged]').forEach(function(el) {
+                el.remove();
+            });
+            // Copy the source form's payload into the reauth form.
+            new FormData(sourceForm).forEach(function(value, key) {
+                if (key === 'csrf_token' || key === 'password') return;
+                var input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = key;
+                input.value = value;
+                input.setAttribute('data-reauth-staged', '');
+                reauthForm.appendChild(input);
+            });
+
+            // Clear the password input from any prior open.
+            var pwInput = reauthForm.querySelector('input[name="password"]');
+            if (pwInput) pwInput.value = '';
+
+            // Dispose of the source dialog now that its payload is
+            // staged into the reauth form. Two modes:
+            //   • `data-keep-source` (invite): the source must survive
+            //     because the success partial gets HX-Retargeted back
+            //     into it. Close it (chainTransition flag stops
+            //     remove-on-close from deleting it) — the
+            //     switch-to-invite-modal event reopens it later.
+            //   • default (per-row actions): remove it outright; the
+            //     reauth form is now the source of truth.
+            if (sourceDialog) {
+                if (keepSource) {
+                    sourceDialog.dataset.chainTransition = '1';
+                    if (typeof sourceDialog.close === 'function') sourceDialog.close();
+                } else {
+                    sourceDialog.remove();
+                }
+            }
+            if (typeof reauthDialog.showModal === 'function') {
+                reauthDialog.showModal();
+            }
+            if (pwInput) pwInput.focus();
+        });
     });
 
     // Implicit form submission (Enter in a text input) bypasses the
@@ -3304,7 +3508,11 @@ fn member_row(
 /// display name + email, a "Pending" avatar dot, and a kebab whose
 /// only option is "Revoke invite". Slots into the same `<tr>` shape as
 /// `member_row` so the table layout is uniform.
-fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Markup {
+fn pending_invite_row(invitation: &identity::Invitation, _csrf_token: &str) -> Markup {
+    // `_csrf_token` is unused now that the reissue/revoke dialogs are
+    // fetched on demand (each fragment renders its own CSRF input from
+    // the modal endpoint). Kept on the signature so the members-page
+    // call site doesn't need a special case.
     let initial = display_initial(&invitation.email);
     let color = avatar_color(&invitation.id.0);
     let search_hay = invitation.email.to_lowercase();
@@ -3358,18 +3566,18 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
                         // lost URL is routine; revoking is terminal.
                         button type="button"
                                class="row-action-item"
-                               data-open-dialog=(format!("dlg-reissue-invite-{id}")) {
+                               data-open-modal=(format!("/members/invitations/{id}/modal/reissue")) {
                             "Reissue invitation…"
                         }
                         button type="button"
                                class="row-action-item row-action-danger"
-                               data-open-dialog=(format!("dlg-revoke-invite-{id}")) {
+                               data-open-modal=(format!("/members/invitations/{id}/modal/revoke")) {
                             "Revoke invite…"
                         }
                     }
                 }
-                (reissue_invite_dialog(id, &invitation.email, csrf_token))
-                (revoke_invite_dialog(id, &invitation.email, csrf_token))
+                // Dialogs fetched on demand from the modal endpoints
+                // above — no inline markup.
             }
         }
     }
@@ -3380,7 +3588,7 @@ fn pending_invite_row(invitation: &identity::Invitation, csrf_token: &str) -> Ma
 /// so it reads as a "you're about to invalidate something" gate, not
 /// destructive. The dialog spells out the implication (old URL stops
 /// working) before chaining into the reauth modal.
-fn reissue_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
+pub(crate) fn reissue_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
     html! {
         dialog id=(format!("dlg-reissue-invite-{id}"))
                class="action-dialog action-dialog-centered" {
@@ -3477,7 +3685,7 @@ pub fn reissue_modal_content_success(
 /// terminal-but-recoverable, same palette as Deactivate. Sits as a
 /// sibling of the Reissue dialog on the same row; the operator picks
 /// which one fits their intent from the kebab.
-fn revoke_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
+pub(crate) fn revoke_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup {
     html! {
         dialog id=(format!("dlg-revoke-invite-{id}"))
                class="action-dialog action-dialog-centered" {
@@ -3518,7 +3726,7 @@ fn revoke_invite_dialog(id: uuid::Uuid, email: &str, csrf_token: &str) -> Markup
 /// the lifecycle-state gates inside each `perform_*`; the UI just hides
 /// what the API would refuse so users don't see dead-end buttons.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RowAction {
+pub(crate) enum RowAction {
     Deactivate,
     Reactivate,
     ChangeRole,
@@ -3526,7 +3734,48 @@ enum RowAction {
     Purge,
 }
 
-fn available_actions(
+/// Map a member-action modal path segment to the `RowAction` it gates
+/// against. `"role-owner-confirm"` maps to `ChangeRole` because the
+/// owner-promotion confirm step is reachable only when Change Role is
+/// permitted. Returns `None` for unrecognized segments so the modal
+/// endpoint can 404 cleanly.
+pub(crate) fn row_action_for_segment(seg: &str) -> Option<RowAction> {
+    match seg {
+        "deactivate" => Some(RowAction::Deactivate),
+        "reactivate" => Some(RowAction::Reactivate),
+        "role" | "role-owner-confirm" => Some(RowAction::ChangeRole),
+        "delete" => Some(RowAction::Delete),
+        "purge" => Some(RowAction::Purge),
+        _ => None,
+    }
+}
+
+/// Render the dialog fragment for a member-action modal segment. The
+/// fetch endpoint serves this on demand; the client injects it into
+/// `#modal-host` and removes it on close. `"role-owner-confirm"` is a
+/// distinct fragment from `"role"` (the owner-promotion intercept
+/// fetches it separately once the operator picks Owner). Returns
+/// `None` for unrecognized segments.
+pub(crate) fn member_action_modal(
+    seg: &str,
+    target: &User,
+    csrf_token: &str,
+) -> Option<Markup> {
+    let id = target.id.0;
+    match seg {
+        "deactivate" => Some(render_action_dialog(RowAction::Deactivate, target, csrf_token, id)),
+        "reactivate" => Some(render_action_dialog(RowAction::Reactivate, target, csrf_token, id)),
+        "role" => Some(render_action_dialog(RowAction::ChangeRole, target, csrf_token, id)),
+        "role-owner-confirm" => {
+            Some(role_owner_confirm_dialog(id, &target.display_name, csrf_token))
+        }
+        "delete" => Some(render_action_dialog(RowAction::Delete, target, csrf_token, id)),
+        "purge" => Some(render_action_dialog(RowAction::Purge, target, csrf_token, id)),
+        _ => None,
+    }
+}
+
+pub(crate) fn available_actions(
     viewer: InstanceRole,
     target_role: InstanceRole,
     target_lifecycle: UserLifecycle,
@@ -3602,7 +3851,12 @@ fn row_actions_kebab(
     actions: &[RowAction],
     locked: bool,
 ) -> Markup {
-    let id = target.id.0;
+    // No inline dialog markup anymore. Each kebab item opens its dialog
+    // on demand via `data-open-modal="/members/{id}/modal/{action}"`
+    // (see `render_action_item`); the client fetches the fragment,
+    // injects it into `#modal-host`, and removes it on close. This keeps
+    // the members table free of the N×actions dialog markup that used to
+    // ship with every row.
     html! {
         details class="row-actions" {
             summary class="row-actions-trigger" aria-label="Row actions" {
@@ -3614,31 +3868,7 @@ fn row_actions_kebab(
                 }
             }
         }
-        // Confirmation / role-change dialogs live as siblings of the
-        // <details> so showModal() floats them over the page regardless
-        // of whether the kebab is open. Only the dialog-opening actions
-        // (Delete / Purge / Change Role) render a dialog; Deactivate /
-        // Reactivate submit straight from the menu. Locked self-row
-        // items never open a dialog or submit anything, so we skip the
-        // dialog markup entirely in that case.
-        @if !locked {
-            @for action in actions {
-                @if action_uses_dialog(*action) {
-                    (render_action_dialog(*action, target, csrf_token, id))
-                }
-            }
-        }
     }
-}
-
-/// Every row action now opens a confirmation dialog first — there are
-/// no submit-direct items in the kebab anymore. Deactivate +
-/// Reactivate are the recently-added ones; the destructive trio
-/// (Delete / Purge / ChangeRole) already had dialogs. The dialog's
-/// Confirm/Continue button then chains into the reauth modal for
-/// actions that require it (everything but Reactivate).
-fn action_uses_dialog(_action: RowAction) -> bool {
-    true
 }
 
 fn render_action_item(
@@ -3655,19 +3885,19 @@ fn render_action_item(
     match action {
         RowAction::Deactivate => html! {
             button type="button" class="row-action-item"
-                   data-open-dialog=(format!("dlg-deactivate-{id}")) {
+                   data-open-modal=(format!("/members/{id}/modal/deactivate")) {
                 "Deactivate…"
             }
         },
         RowAction::Reactivate => html! {
             button type="button" class="row-action-item"
-                   data-open-dialog=(format!("dlg-reactivate-{id}")) {
+                   data-open-modal=(format!("/members/{id}/modal/reactivate")) {
                 "Reactivate…"
             }
         },
         RowAction::ChangeRole => html! {
             button type="button" class="row-action-item"
-                   data-open-dialog=(format!("dlg-role-{id}")) {
+                   data-open-modal=(format!("/members/{id}/modal/role")) {
                 "Change role…"
             }
         },
@@ -3678,7 +3908,7 @@ fn render_action_item(
         // names — only the visible label changed.
         RowAction::Delete => html! {
             button type="button" class="row-action-item row-action-danger"
-                   data-open-dialog=(format!("dlg-delete-{id}")) {
+                   data-open-modal=(format!("/members/{id}/modal/delete")) {
                 "Anonymize…"
             }
         },
@@ -3686,7 +3916,7 @@ fn render_action_item(
         // label calls it "Delete…" — the terminal, total action.
         RowAction::Purge => html! {
             button type="button" class="row-action-item row-action-danger"
-                   data-open-dialog=(format!("dlg-purge-{id}")) {
+                   data-open-modal=(format!("/members/{id}/modal/purge")) {
                 "Delete…"
             }
         },
@@ -3775,48 +4005,63 @@ fn role_icon_picker(id: uuid::Uuid, current: InstanceRole) -> Markup {
 /// the "I understand…" checkbox (wired by CONFIRM_CHECKBOX_JS) — a
 /// second deliberate confirmation step on top of the password
 /// re-auth that follows.
-fn role_owner_confirm_dialog(id: uuid::Uuid, name: &str) -> Markup {
+pub(crate) fn role_owner_confirm_dialog(
+    id: uuid::Uuid,
+    name: &str,
+    csrf_token: &str,
+) -> Markup {
     html! {
         dialog id=(format!("dlg-role-owner-confirm-{id}"))
                class="action-dialog action-dialog-centered" {
-            div class="dialog-header" {
-                div class="dialog-icon dialog-icon-shield" {
-                    (crown_icon())
+            // Self-contained form — carries its own role=owner + csrf
+            // rather than borrowing the role picker's `form-role-{id}`.
+            // Under the on-demand modal model the role picker dialog is
+            // removed from the DOM once this owner-confirm is fetched,
+            // so this dialog can't depend on the picker's form still
+            // existing. The reauth chain stages `role=owner` straight
+            // off this form.
+            form id=(format!("form-role-owner-{id}"))
+                 method="post" action=(format!("/members/{id}/role")) {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-shield" {
+                        (crown_icon())
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
                 }
-                button type="button" class="dialog-close" data-close-dialog
-                       aria-label="Close" {
-                    (close_icon())
+                h2 { "Make " (name) " an Owner?" }
+                p class="dialog-description" {
+                    "Owners have full control of this Hearth: they can change "
+                    "any member's role, deactivate or delete accounts, read the "
+                    "audit log, and rotate the server-level recovery code. "
+                    "Promoting someone to Owner means sharing your authority "
+                    "with them. They'll be able to deactivate or remove you."
                 }
-            }
-            h2 { "Make " (name) " an Owner?" }
-            p class="dialog-description" {
-                "Owners have full control of this Hearth: they can change "
-                "any member's role, deactivate or delete accounts, read the "
-                "audit log, and rotate the server-level recovery code. "
-                "Promoting someone to Owner means sharing your authority "
-                "with them. They'll be able to deactivate or remove you."
-            }
-            label class="confirm-checkbox-field" {
-                input type="checkbox" class="member-checkbox"
-                      data-confirm-checkbox;
-                span {
-                    "I understand the impact of making " strong { (name) }
-                    " an Owner of this Hearth instance."
+                label class="confirm-checkbox-field" {
+                    input type="checkbox" class="member-checkbox"
+                          data-confirm-checkbox;
+                    span {
+                        "I understand the impact of making " strong { (name) }
+                        " an Owner of this Hearth instance."
+                    }
                 }
-            }
-            div class="dialog-actions" {
-                button type="button" class="btn-secondary" data-close-dialog {
-                    "Cancel"
-                }
-                // Chains to the reauth modal. The original change-role
-                // form was already staged (csrf + role) when
-                // REAUTH_CHAIN_JS opened this owner-confirm intercept;
-                // clicking Make Owner here re-fires the chain without
-                // the role-aware intercept so it proceeds to reauth.
-                button type="button" class="btn"
-                       data-reauth-confirm=(format!("form-role-{id}"))
-                       disabled {
-                    "Make Owner"
+                input type="hidden" name="role" value="owner";
+                (csrf_input(csrf_token))
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog {
+                        "Cancel"
+                    }
+                    // Chains to the reauth modal off this form's own
+                    // role=owner payload. No `data-role-aware` — the
+                    // owner decision is already made, so it proceeds
+                    // straight to reauth.
+                    button type="button" class="btn"
+                           data-reauth-confirm=(format!("form-role-owner-{id}"))
+                           disabled {
+                        "Make Owner"
+                    }
                 }
             }
         }
@@ -3879,7 +4124,7 @@ fn plus_icon() -> Markup {
     }
 }
 
-fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: uuid::Uuid) -> Markup {
+pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: uuid::Uuid) -> Markup {
     let name = &target.display_name;
     match action {
         // Deactivate uses the centered-icon chrome shared with the
@@ -3997,7 +4242,10 @@ fn render_action_dialog(action: RowAction, target: &User, csrf_token: &str, id: 
                     }
                 }
             }
-            (role_owner_confirm_dialog(id, name))
+            // Owner-confirm is NOT rendered inline anymore — under the
+            // on-demand model the owner-promotion intercept fetches
+            // `/members/{id}/modal/role-owner-confirm` separately once
+            // the operator picks Owner. See REAUTH_CHAIN_JS.
         },
         // RowAction::Delete = soft delete, surfaced as "Anonymize".
         // Account row stays so any non-orphaned content (comments on
@@ -4374,12 +4622,9 @@ pub fn pending_page(
 
     let content = html! {
         (render_pending_banner(&banner))
-        // Reauth modal lives inside a `<template>` so the page boots
-        // without a hidden dialog in the live DOM. REAUTH_CHAIN_JS
-        // materializes it from `tpl-dlg-reauth` on first chain run.
-        template id="tpl-dlg-reauth" {
-            (reauth_modal(ctx))
-        }
+        // `tpl-dlg-reauth` is mounted once at the shell level (see
+        // `shell_app_inner`); REAUTH_CHAIN_JS materializes `dlg-reauth`
+        // from it on the first chain run. No per-page copy needed.
 
         @if active.is_empty() {
             (pending_empty_state())
@@ -4463,15 +4708,15 @@ fn pending_empty_state() -> Markup {
 /// row has `id="row-{transition_id}"` so the member-row badge on
 /// `/members` can deep-link straight to it via fragment.
 fn pending_active_row(
-    ctx: &ChromeContext,
+    _ctx: &ChromeContext,
     row: &pending::TransitionRow,
     by_id: &std::collections::HashMap<uuid::Uuid, &identity::User>,
 ) -> Markup {
+    // `_ctx` is unused now that the veto dialog is fetched on demand
+    // (the fragment endpoint renders its own CSRF input). Kept on the
+    // signature so the /pending page call site stays uniform.
     let target = row.target_user_id.and_then(|id| by_id.get(&id).copied());
     let initiator = row.initiator_user_id.and_then(|id| by_id.get(&id).copied());
-    let target_name = target
-        .map(|u| u.display_name.as_str())
-        .unwrap_or("(unknown member)");
     let action_label = pending_action_label(row);
 
     html! {
@@ -4496,10 +4741,10 @@ fn pending_active_row(
             }
             td class="col-pending-actions" {
                 button type="button" class="btn-secondary"
-                       data-open-dialog=(format!("dlg-veto-{}", row.id)) {
+                       data-open-modal=(format!("/pending/{}/modal/veto", row.id)) {
                     "Veto"
                 }
-                (veto_pending_dialog(row.id, target_name, &action_label, ctx.csrf_token))
+                // Veto dialog fetched on demand from the endpoint above.
             }
         }
     }
@@ -4614,7 +4859,7 @@ fn user_cell(u: &identity::User) -> Markup {
 /// Per-row Veto confirmation dialog. Centered chrome with a warning
 /// (amber) feature icon; chains into the shared reauth modal via the
 /// standard `data-reauth-confirm` attribute.
-fn veto_pending_dialog(
+pub(crate) fn veto_pending_dialog(
     transition_id: uuid::Uuid,
     target_name: &str,
     action_label: &str,
@@ -4659,7 +4904,7 @@ fn veto_pending_dialog(
 /// render as the action name; role-change kinds render as
 /// "Promote to Owner", "Demote to Member", etc., based on the
 /// payload's target role.
-fn pending_action_label(row: &pending::TransitionRow) -> String {
+pub(crate) fn pending_action_label(row: &pending::TransitionRow) -> String {
     use pending::TransitionKind;
     match row.kind {
         TransitionKind::Deactivate => "Deactivate".to_string(),

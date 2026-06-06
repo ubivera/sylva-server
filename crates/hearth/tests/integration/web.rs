@@ -908,78 +908,98 @@ async fn members_pagination_rows_per_page_respects_url_param() {
 // Account settings modal (CP2)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The settings modal is mounted at the shell level via
-/// `<template id="tpl-dlg-account-settings">` so the user-card popover
-/// can open it from any authed page. Regression guard against a future
-/// refactor that accidentally page-scopes the template.
+/// Modals are on-demand now: the page ships only an empty `#modal-host`
+/// and a trigger that fetches the modal markup from `/modals/*`. The
+/// account-settings dialog must NOT be baked into the page source. This
+/// guards against regressing back to the `<template>`-in-every-page
+/// approach (which left inert markup + a lingering materialized dialog
+/// in the DOM).
 #[tokio::test]
-async fn shell_mounts_account_settings_modal_template() {
+async fn account_settings_modal_is_on_demand_not_in_page_source() {
     let app = TestApp::new().await;
     app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
         .await;
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    // /me uses the narrow shell; /members uses the wide shell. Both
-    // share the same `shell_app_inner`, so the template should appear
-    // on either. Verify on /me since every role can hit it.
     let (status, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
+    // Empty injection host present; no modal markup baked in.
     assert!(
-        body.contains(r#"id="tpl-dlg-account-settings""#),
-        "expected `tpl-dlg-account-settings` template in /me chrome"
+        body.contains(r#"id="modal-host""#),
+        "expected the empty #modal-host injection point"
     );
     assert!(
-        body.contains(r#"id="dlg-account-settings""#),
-        "expected `dlg-account-settings` dialog inside the template"
-    );
-    // Left-rail tab nav: three tabs (Profile / Security / Data
-    // Control). All three exist server-side from CP2 onwards even
-    // though only Profile has real content — CP3/CP4 fill in the
-    // others without rewiring the layout.
-    assert!(
-        body.contains(r#"data-settings-tab="profile""#),
-        "expected Profile tab"
+        !body.contains(r#"id="tpl-dlg-account-settings""#),
+        "account-settings should NOT ship as a <template> in the page"
     );
     assert!(
-        body.contains(r#"data-settings-tab="security""#),
-        "expected Security tab"
+        !body.contains(r#"id="dlg-account-settings""#),
+        "account-settings dialog should NOT be in the page source"
     );
     assert!(
-        body.contains(r#"data-settings-tab="data""#),
-        "expected Data Control tab"
+        !body.contains(r#"id="tpl-dlg-reauth""#),
+        "reauth should NOT ship as a <template> in the page"
     );
-    // Profile panel + its two forms (display name + email).
-    assert!(body.contains(r#"data-settings-panel="profile""#));
-    assert!(body.contains(r#"id="form-settings-name""#));
-    assert!(body.contains(r#"id="form-settings-email""#));
-    // Email submit is a reauth-chain trigger now, not a native
-    // submit. Inline password input retired — password lives in the
-    // reauth modal instead.
+    // Triggers reference the fetch endpoint, not a DOM id.
     assert!(
-        body.contains(r#"data-reauth-confirm="form-settings-email""#),
-        "expected the email form to route through the reauth chain"
-    );
-    assert!(
-        !body.contains(r#"id="settings-email-password""#),
-        "inline password input should be gone now that reauth handles it"
-    );
-    // Locale field was dropped — no input should reference it.
-    assert!(
-        !body.contains(r#"id="settings-locale""#),
-        "locale input should be retired from the settings UI"
-    );
-    // /me itself carries the Manage account button that opens the
-    // modal (separate from the user-card popover trigger).
-    assert!(
-        body.contains(r#"data-open-dialog="dlg-account-settings""#),
-        "expected Manage account button on /me"
+        body.contains(r#"data-open-modal="/modals/account-settings""#),
+        "expected Manage account button to fetch the modal on demand"
     );
 }
 
-/// The user-card popover's "Account settings" row swapped from an
-/// anchor to a `<button data-open-dialog>` so it opens the modal in-
-/// page rather than navigating to /me.
+/// The on-demand `GET /modals/account-settings` fragment carries the
+/// full modal: header chrome, six-tab rail, and the Profile panel's
+/// Account Information section with its two forms.
+#[tokio::test]
+async fn account_settings_modal_fragment_renders_full_modal() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    // The fragment is the dialog itself, not a full page.
+    assert!(!body.contains("<html"), "fragment should not be a full page");
+    assert!(body.contains(r#"id="dlg-account-settings""#));
+    // Six tabs.
+    assert!(body.contains(r#"data-settings-tab="profile""#), "Profile");
+    assert!(body.contains(r#"data-settings-tab="security""#), "Security");
+    assert!(body.contains(r#"data-settings-tab="devices""#), "Devices");
+    assert!(body.contains(r#"data-settings-tab="authenticators""#), "Authenticators");
+    assert!(body.contains(r#"data-settings-tab="passkeys""#), "Passkeys");
+    assert!(body.contains(r#"data-settings-tab="data""#), "Data Control");
+    // Profile panel + Account Information section + the two forms.
+    assert!(body.contains(r#"data-settings-panel="profile""#));
+    assert!(body.contains("Account Information"));
+    assert!(body.contains(r#"id="form-settings-name""#));
+    assert!(body.contains(r#"id="form-settings-email""#));
+    // Header chrome: gear-icon + tagline + Sign-out form.
+    assert!(body.contains(r#"class="settings-header-icon""#));
+    assert!(body.contains("Manage your preferences"));
+    assert!(body.contains(r#"class="settings-header-signout-form""#));
+    // Email submit is a reauth-chain trigger; inline password + locale
+    // are both retired.
+    assert!(body.contains(r#"data-reauth-confirm="form-settings-email""#));
+    assert!(!body.contains(r#"id="settings-email-password""#));
+    assert!(!body.contains(r#"id="settings-locale""#));
+}
+
+/// `GET /modals/account-settings` requires authentication — an
+/// unauthenticated fetch bounces to /login like any other browser
+/// route.
+#[tokio::test]
+async fn account_settings_modal_fragment_requires_auth() {
+    let app = TestApp::new().await;
+    let (status, _) = get_with_cookie(&app, "/modals/account-settings", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+/// The user-card popover's "Account settings" row fetches the modal on
+/// demand (`data-open-modal`), not via a DOM-id opener or an anchor to
+/// /me.
 #[tokio::test]
 async fn user_card_popover_account_settings_opens_modal() {
     let app = TestApp::new().await;
@@ -990,20 +1010,19 @@ async fn user_card_popover_account_settings_opens_modal() {
 
     let (status, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
-    // The trigger is a button now — assert the button + data-open-dialog
-    // pair appears in the user-card-menu region. Scoping by class so a
-    // stray match somewhere else doesn't satisfy the assertion.
     assert!(
-        body.contains(r#"<button type="button" class="user-card-action"
-                       data-open-dialog="dlg-account-settings""#)
-            || body.contains(r#"class="user-card-action""#)
-                && body.contains(r#"data-open-dialog="dlg-account-settings""#),
-        "expected user-card-action button with data-open-dialog"
+        body.contains(r#"class="user-card-action""#)
+            && body.contains(r#"data-open-modal="/modals/account-settings""#),
+        "expected user-card-action button that fetches the modal on demand"
     );
-    // And it must NOT still be an anchor pointing at /me.
+    // Must not be the old anchor or the old data-open-dialog opener.
     assert!(
         !body.contains(r#"<a class="user-card-action" href="/me""#),
         "user-card-action anchor should be retired"
+    );
+    assert!(
+        !body.contains(r#"data-open-dialog="dlg-account-settings""#),
+        "old DOM-id opener should be gone"
     );
 }
 
