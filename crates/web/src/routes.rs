@@ -97,8 +97,6 @@ pub async fn login_submit(
     State(state): State<AppState>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    // Verify credentials via the existing auth helper — same code path
-    // the JSON API uses, so behaviour stays consistent.
     let outcome = match auth::verify_credentials(&state.db, &form.email, &form.password).await {
         Ok(o) => o,
         Err(err) => {
@@ -122,8 +120,6 @@ pub async fn login_submit(
         }
     };
 
-    // Issue a session — same SessionRepository::create + audit shape as
-    // the JSON login handler.
     let actor = audit::Actor {
         user_id: user.id,
         display_name: user.display_name.clone(),
@@ -226,7 +222,15 @@ pub async fn accept_invite_submit(
 
     match perform_accept_invite(&state, &token, &form.display_name, &form.password).await {
         Ok(outcome) => {
-            let mut response = Redirect::to("/me").into_response();
+            // Render the recovery-code interstitial as the POST
+            // response body — no redirect. Lets the code ride one HTTP
+            // exchange and never appear in a URL, history entry, or
+            // referer. Session cookie is set on the same response so
+            // the user is signed in when they click "Continue" (which
+            // is a plain GET to /me).
+            let body = views::accept_invite_recovery_code_page(&outcome.recovery_code)
+                .into_string();
+            let mut response = Html(body).into_response();
             set_cookie_header(
                 &mut response,
                 &cookie_value(
@@ -298,6 +302,373 @@ pub async fn me_page(
         pending_count,
     };
     Html(views::me_page(&ctx).into_string()).into_response()
+}
+
+/// `GET /modals/account-settings` — render the account-settings
+/// dialog as a standalone fragment. Modals are no longer baked into
+/// every page as `<template>` blocks; instead the shell ships an empty
+/// `#modal-host` and the client fetches a modal's markup on demand
+/// (then removes it from the DOM on close). See `MODAL_HOST_JS`.
+pub async fn account_settings_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::account_settings_modal(&ctx).into_string()).into_response()
+}
+
+/// `GET /modals/reauth` — render the reauth dialog as a standalone
+/// fragment. Fetched on demand by `REAUTH_CHAIN_JS` whenever an action
+/// chains through the password gate (account-settings email change,
+/// the /members destructive actions, /pending veto, invite). The
+/// chain repoints the form's action + stages the originating payload
+/// after the fragment lands.
+pub async fn reauth_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::reauth_modal(&ctx).into_string()).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct MeProfileForm {
+    pub csrf_token: String,
+    pub display_name: String,
+}
+
+#[derive(Deserialize)]
+pub struct MeEmailForm {
+    pub csrf_token: String,
+    pub email: String,
+    pub password: String,
+}
+
+/// `POST /me/profile` — update the operator's `display_name` and
+/// `locale`. No re-auth required (low-risk, low-friction). Returns the
+/// profile-section partial with a success/error feedback tile so HTMX
+/// swaps it in place inside the account-settings modal.
+pub async fn me_profile_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<MeProfileForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+
+    let display_name = form.display_name.trim().to_string();
+    if display_name.is_empty() {
+        return render_name_partial(
+            &state,
+            auth.session_id,
+            &auth.user,
+            Some(views::SettingsFeedback::Error(
+                "Display name can't be blank.".to_string(),
+            )),
+        );
+    }
+
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let old_display_name = auth.user.display_name.clone();
+    let result: anyhow::Result<identity::User> = async {
+        let mut tx = state.db.begin().await?;
+        // `update_profile` takes an optional `locale` slot. We pass
+        // `None` here because the settings UI doesn't surface locale as
+        // an editable field — operators don't typically think about
+        // BCP-47 tags. Leaving the column intact keeps future
+        // server-side locale-aware rendering paths open.
+        let user = identity::UserRepository::update_profile(
+            &mut tx,
+            auth.user.id,
+            Some(&display_name),
+            None,
+        )
+        .await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "profile_updated",
+            serde_json::json!({
+                "old_display_name": old_display_name,
+                "new_display_name": user.display_name,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(user)
+    }
+    .await;
+
+    match result {
+        Ok(updated) => render_name_partial(
+            &state,
+            auth.session_id,
+            &updated,
+            Some(views::SettingsFeedback::Success(
+                "Profile updated.".to_string(),
+            )),
+        ),
+        Err(err) => {
+            tracing::error!(?err, "me_profile_submit");
+            render_name_partial(
+                &state,
+                auth.session_id,
+                &auth.user,
+                Some(views::SettingsFeedback::Error(
+                    "Something went wrong. Try again.".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+/// `POST /me/email` — update the operator's login email. Driven from
+/// the account-settings modal's email form via the reauth chain:
+/// the settings form stages the new email value into a hidden input
+/// on `dlg-reauth`, the operator enters their current password
+/// there, and HTMX submits the combined payload here.
+///
+/// Outcomes:
+///
+/// - **Wrong password** (HTMX) → return the reauth modal content
+///   (inner partial) with the `invalid_password` banner so the modal
+///   stays open and the operator can retry. Same shape as the admin
+///   destructive actions.
+/// - **Invalid email shape / email in use / success / no-op** → HX-
+///   Redirect to `/me` with a hearth-toast describing the outcome.
+///   Closes both modals (reauth + settings) on the way out.
+pub async fn me_email_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<MeEmailForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let htmx = headers.contains_key("hx-request");
+
+    let new_email = form.email.trim().to_string();
+
+    // Verify the current password before touching the row. A stolen
+    // session cookie would let an attacker pivot the login email and
+    // lock the operator out; the password check makes that an
+    // additional credential-theft step. Wrong password keeps the
+    // reauth modal open with a banner (HTMX) or bounces with an
+    // error toast (non-HTMX edge case).
+    let password_ok = match auth::verify_user_password(
+        &state.db,
+        auth.user.id,
+        &form.password,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::error!(?err, "verify_user_password for email change");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+    if !password_ok {
+        return reauth_invalid_password_response(
+            &state,
+            auth.session_id,
+            &auth.user,
+            "/me/email",
+            &[("email", &new_email)],
+            htmx,
+        );
+    }
+
+    // Cheap "looks like an email" check. Browser-side validation in
+    // the settings form (type=email + required, with REAUTH_CHAIN_JS
+    // calling reportValidity before staging) makes a malformed value
+    // an attacker / scripted-client scenario, not a normal one.
+    let valid_shape = new_email
+        .split_once('@')
+        .map(|(l, r)| !l.is_empty() && !r.is_empty() && r.contains('.'))
+        .unwrap_or(false);
+    if !valid_shape {
+        return redirect_to_me_with_error(htmx, "email_required");
+    }
+
+    // No-op short-circuit when the email isn't actually changing.
+    if new_email == auth.user.email {
+        return redirect_to_me_with_action(htmx, "email_unchanged");
+    }
+
+    // Pre-check uniqueness for the friendly toast. The DB's
+    // `email_lower` unique index is the source of truth — a race
+    // between this check and the UPDATE would surface as an Internal
+    // error (vanishingly rare on a single-operator instance).
+    let users = identity::UserRepository::new(state.db.clone());
+    match users.email_in_use(&new_email).await {
+        Ok(true) => return redirect_to_me_with_error(htmx, "email_already_in_use"),
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!(?err, "email_in_use pre-check");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    }
+
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let old_email = auth.user.email.clone();
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        let updated = identity::UserRepository::update_email(
+            &mut tx,
+            auth.user.id,
+            &new_email,
+        )
+        .await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "email_changed",
+            serde_json::json!({
+                "old_email": old_email,
+                "new_email": updated.email,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => redirect_to_me_with_action(htmx, "email_updated"),
+        Err(err) => {
+            tracing::error!(?err, "me_email_submit");
+            error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            )
+        }
+    }
+}
+
+/// Build the "wrong password" response for an account-settings reauth
+/// flow. Mirrors the admin pattern: HTMX → reauth modal partial with
+/// `invalid_password` banner; non-HTMX → redirect to /me with a
+/// generic error toast (rare path; the modal flow requires JS).
+fn reauth_invalid_password_response(
+    state: &AppState,
+    session_id: uuid::Uuid,
+    user: &identity::User,
+    action_url: &str,
+    staged_params: &[(&str, &str)],
+    htmx: bool,
+) -> Response {
+    if !htmx {
+        return redirect_to_me_with_error(htmx, "invalid_password");
+    }
+    let csrf_token = csrf::compute_token(&state.csrf_secret, session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(
+        views::reauth_modal_content(
+            &ctx,
+            action_url,
+            staged_params,
+            Some("invalid_password"),
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+/// HX-Redirect (when HTMX) or 303 (non-HTMX) to `/me` with a positive
+/// toast for `action`. Mirrors `admin_routes::redirect_with_action_toast`
+/// but scoped to this crate so we don't reach across to `admin_routes`
+/// from `routes`.
+fn redirect_to_me_with_action(htmx: bool, action: &str) -> Response {
+    let toast = views::toast_for_action(action, None);
+    attach_toast(redirect_to_me(htmx), toast)
+}
+
+/// HX-Redirect (when HTMX) or 303 (non-HTMX) to `/me` with a red
+/// error toast looked up against the shared `error_banner_message`
+/// catalog.
+fn redirect_to_me_with_error(htmx: bool, error_code: &str) -> Response {
+    let toast = Some(views::toast_for_error(error_code));
+    attach_toast(redirect_to_me(htmx), toast)
+}
+
+fn redirect_to_me(htmx: bool) -> Response {
+    if htmx {
+        let mut resp = (axum::http::StatusCode::OK, "").into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str("/me") {
+            resp.headers_mut().insert("HX-Redirect", v);
+        }
+        resp
+    } else {
+        Redirect::to("/me").into_response()
+    }
+}
+
+fn attach_toast(mut response: Response, toast: Option<views::Toast>) -> Response {
+    let Some(t) = toast else {
+        return response;
+    };
+    let payload = serde_json::json!({ "hearth-toast": t });
+    if let Ok(json) = serde_json::to_string(&payload)
+        && let Ok(v) = axum::http::HeaderValue::from_str(&json)
+    {
+        response.headers_mut().insert("HX-Trigger", v);
+    }
+    response
+}
+
+/// Render the display-name form partial for an HTMX response. Pulled
+/// out so the success and error paths share one rendering site —
+/// fewer divergent call shapes to keep in sync.
+fn render_name_partial(
+    state: &AppState,
+    session_id: uuid::Uuid,
+    user: &identity::User,
+    feedback: Option<views::SettingsFeedback>,
+) -> Response {
+    let csrf_token = csrf::compute_token(&state.csrf_secret, session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::settings_name_form(&ctx, feedback.as_ref()).into_string())
+        .into_response()
 }
 
 /// Fetches the active pending-transition count, but only for Owner
@@ -734,10 +1105,9 @@ fn set_cookie_header(response: &mut Response, value: &str) {
 ///   defense-in-depth posture we want for session credentials).
 /// - `SameSite=Lax` — sent on top-level navigations + GET cross-site;
 ///   blocked on cross-site POST. Good default for an admin UI.
-/// - **`Secure` is intentionally omitted** for this checkpoint because
-///   we ship plain HTTP in dev. TLS lands near-MVP; that checkpoint
-///   should flip `Secure` on conditionally based on the public base URL
-///   scheme.
+/// - **`Secure` is intentionally omitted** because dev ships plain
+///   HTTP. Once TLS lands, `Secure` should be flipped on conditionally
+///   based on the public base URL scheme.
 fn cookie_value(name: &str, value: &str, clearing: bool) -> String {
     if clearing {
         format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")

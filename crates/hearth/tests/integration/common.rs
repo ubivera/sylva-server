@@ -555,3 +555,17 @@ pub struct LoginBody {
     pub expires_at: DateTime<Utc>,
     pub user_id: Uuid,
 }
+
+/// Response body for `POST /api/auth/accept-invite`. Mirrors
+/// `LoginBody` plus the one-time `recovery_code` plaintext stamped
+/// into `auth.user_recovery_codes` inside the same transaction. Used
+/// by tests that need to assert the code's existence + verify it
+/// round-trips through `auth::recovery_code::hash_code`.
+#[derive(serde::Deserialize)]
+pub struct AcceptInviteBody {
+    pub token: String,
+    #[allow(dead_code)]
+    pub expires_at: DateTime<Utc>,
+    pub user_id: Uuid,
+    pub recovery_code: String,
+}

@@ -160,10 +160,10 @@ pub struct RoleChangeForm {
     pub password: String,
 }
 
-/// Reactivate now requires re-auth too (folded into the same gate as
-/// the destructive actions). Kept as its own struct so the handler
-/// can use a different success banner verb without sharing the
-/// `LifecycleActionForm`'s richer Pending-handling.
+/// Reactivate requires re-auth (the same gate as the destructive
+/// actions). Kept as its own struct so the handler can use a different
+/// success banner verb without sharing the `LifecycleActionForm`'s
+/// richer Pending-handling.
 #[derive(Deserialize)]
 pub struct ReactivateForm {
     pub csrf_token: String,
@@ -280,9 +280,9 @@ pub async fn delete_member(
     {
         return resp;
     }
-    // The route + the admin_logic function keep the historical
-    // "delete" / "soft_delete" naming; the toast token is renamed
-    // because the UI surfaces this action as "Anonymize".
+    // The route + the admin_logic function use "delete" / "soft_delete"
+    // naming; the toast token differs because the UI surfaces this
+    // action as "Anonymize".
     match admin_logic::perform_soft_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
@@ -319,9 +319,8 @@ pub async fn purge_member(
     {
         return resp;
     }
-    // Historical "purge" / "hard_delete" naming stays on the backend;
-    // the toast token is renamed because the UI surfaces this action
-    // as "Delete".
+    // The backend uses "purge" / "hard_delete" naming; the toast token
+    // differs because the UI surfaces this action as "Delete".
     match admin_logic::perform_hard_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
@@ -802,4 +801,169 @@ pub async fn reissue_invitation(
             )
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// On-demand modal fragments
+//
+// Every modal on the admin surface is fetched when opened and removed
+// on close (see `DIALOG_JS` / `hearthOpenModal`); none ship in the page
+// source. These GET endpoints return the bare `<dialog>` markup. They
+// reuse the same authz the kebab uses to decide what to render, so a
+// direct GET for a forbidden action 403s rather than handing back a
+// dialog the POST would reject anyway.
+// ────────────────────────────────────────────────────────────────────────
+
+/// `GET /members/{id}/modal/{action}` — per-row member action dialog
+/// (deactivate / reactivate / role / role-owner-confirm / delete /
+/// purge). Gated by `available_actions`.
+pub async fn member_action_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Path((target_id, action)): Path<(Uuid, String)>,
+) -> Response {
+    let admin = match require_admin(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(req_action) = views::row_action_for_segment(&action) else {
+        return error_response(axum::http::StatusCode::NOT_FOUND, "Unknown action.");
+    };
+    let users = identity::UserRepository::new(state.db.clone());
+    let target = match users.find_any(identity::UserId::new(target_id)).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return error_response(axum::http::StatusCode::NOT_FOUND, "Member not found.");
+        }
+        Err(err) => {
+            tracing::error!(?err, "loading target for action modal");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+    let viewer = admin.0.user.instance_role;
+    let is_self = admin.0.user.id.0 == target_id;
+    // Self-row actions render locked (never executable); a modal GET
+    // for one is a forbidden direct hit.
+    if is_self {
+        return error_response(
+            axum::http::StatusCode::FORBIDDEN,
+            "You can't target yourself.",
+        );
+    }
+    let allowed =
+        views::available_actions(viewer, target.instance_role, target.lifecycle, is_self);
+    if !allowed.contains(&req_action) {
+        return error_response(
+            axum::http::StatusCode::FORBIDDEN,
+            "You can't perform that action on this member.",
+        );
+    }
+    let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
+    match views::member_action_modal(&action, &target, &csrf_token) {
+        Some(markup) => Html(markup.into_string()).into_response(),
+        None => error_response(axum::http::StatusCode::NOT_FOUND, "Unknown action."),
+    }
+}
+
+/// `GET /members/invitations/{id}/modal/{action}` — pending-invitation
+/// reissue / revoke dialog.
+pub async fn invitation_action_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Path((invitation_id, action)): Path<(Uuid, String)>,
+) -> Response {
+    let admin = match require_admin(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let id = InvitationId::new(invitation_id);
+    let invitation = match state.invitations.find_by_id(id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return error_response(
+                axum::http::StatusCode::NOT_FOUND,
+                "That invitation no longer exists.",
+            );
+        }
+        Err(err) => {
+            tracing::error!(?err, "loading invitation for action modal");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+    let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
+    let markup = match action.as_str() {
+        "reissue" => views::reissue_invite_dialog(invitation_id, &invitation.email, &csrf_token),
+        "revoke" => views::revoke_invite_dialog(invitation_id, &invitation.email, &csrf_token),
+        _ => return error_response(axum::http::StatusCode::NOT_FOUND, "Unknown action."),
+    };
+    Html(markup.into_string()).into_response()
+}
+
+/// `GET /modals/invite` — the invite-member modal. Admin-gated.
+pub async fn invite_modal_fragment(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    let admin = match require_admin(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &admin.0.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::invite_modal(&ctx).into_string()).into_response()
+}
+
+/// `GET /pending/{id}/modal/veto` — the veto confirmation dialog for a
+/// pending Owner-on-Owner transition. Owners only (mirrors the
+/// `/pending` page + the veto POST handler).
+pub async fn veto_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Path(transition_id): Path<Uuid>,
+) -> Response {
+    if auth.user.instance_role != InstanceRole::Owner {
+        return error_response(axum::http::StatusCode::FORBIDDEN, "Owners only.");
+    }
+    let row = match pending::find_by_id(&state.db, transition_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error_response(
+                axum::http::StatusCode::NOT_FOUND,
+                "That pending action no longer exists.",
+            );
+        }
+        Err(err) => {
+            tracing::error!(?err, "loading transition for veto modal");
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+            );
+        }
+    };
+    let users = identity::UserRepository::new(state.db.clone());
+    let target_name = match row.target_user_id {
+        Some(tid) => match users.find_any(identity::UserId::new(tid)).await {
+            Ok(Some(u)) => u.display_name,
+            _ => "(unknown member)".to_string(),
+        },
+        None => "(unknown member)".to_string(),
+    };
+    let action_label = views::pending_action_label(&row);
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    Html(
+        views::veto_pending_dialog(transition_id, &target_name, &action_label, &csrf_token)
+            .into_string(),
+    )
+    .into_response()
 }

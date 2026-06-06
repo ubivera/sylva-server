@@ -180,10 +180,9 @@ async fn create_invite_emits_token_and_audit() {
     resp.assert_status(StatusCode::CREATED);
     let body: CreateInviteResp = resp.json();
     assert_eq!(body.email, "alice@test.local");
-    assert_eq!(body.instance_role, InstanceRole::Member); // default
+    assert_eq!(body.instance_role, InstanceRole::Member);
     assert_eq!(body.token.len(), 64);
 
-    // Audit event landed.
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
         "SELECT event_data FROM audit.events
          WHERE event_type = 'invite_created' AND actor_user_id = $1
@@ -401,7 +400,6 @@ async fn revoke_accepted_invite_returns_409() {
         .await
         .json();
 
-    // Accept the invite.
     app.post(
         "/api/auth/accept-invite",
         None,
@@ -459,7 +457,6 @@ async fn audit_pagination_cursor_walks_the_chain() {
     let first_page2 = page2.items[0].seqno;
     assert!(first_page2 < page1.items.last().unwrap().seqno);
 
-    // Eventually we reach the end.
     let mut next = page2.next_cursor;
     let mut total = page1.items.len() + page2.items.len();
     while let Some(c) = next {
@@ -477,7 +474,6 @@ async fn audit_pagination_cursor_walks_the_chain() {
 #[tokio::test]
 async fn audit_filter_actor_scopes_correctly() {
     let (app, owner, owner_tok, admin, _admin_tok) = app_with_owner_and_admin().await;
-    // owner creates an invite (actor = owner)
     app.post(
         "/api/admin/invites",
         Some(&owner_tok),
@@ -522,7 +518,6 @@ async fn admin_sessions_lists_all_active_users() {
 async fn admin_revoke_session_kills_target_token() {
     let (app, owner, owner_tok, _admin, admin_tok) = app_with_owner_and_admin().await;
 
-    // Find owner's session id via admin's session list.
     let sessions: Vec<SessionView> = app
         .get("/api/admin/sessions", Some(&admin_tok))
         .await
@@ -611,7 +606,6 @@ async fn deactivate_then_reactivate_cycle() {
     let (user_id, user_tok) =
         seed_user_token(&app, "u@test.local", "U", "upw", InstanceRole::Member).await;
 
-    // Deactivate.
     let resp = app
         .post(
             &format!("/api/admin/members/{user_id}/deactivate"),
@@ -623,7 +617,6 @@ async fn deactivate_then_reactivate_cycle() {
     let body: LifecycleBody = resp.json();
     assert_eq!(body.lifecycle, "deactivated");
 
-    // User's session is dead.
     app.get("/api/me", Some(&user_tok))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
@@ -638,7 +631,6 @@ async fn deactivate_then_reactivate_cycle() {
     .assert_status(StatusCode::UNAUTHORIZED)
     .assert_error("invalid_credentials");
 
-    // Reactivate.
     let resp = app
         .post(
             &format!("/api/admin/members/{user_id}/reactivate"),
@@ -811,7 +803,6 @@ async fn delete_redacts_pii_and_frees_email() {
         .await;
     resp.assert_status(StatusCode::NO_CONTENT);
 
-    // Session is dead.
     app.get("/api/me", Some(&user_tok))
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
@@ -850,7 +841,6 @@ async fn delete_redacts_pii_and_frees_email() {
         .await;
     invite_resp.assert_status(StatusCode::CREATED);
 
-    // Audit event recorded the original email.
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
         "SELECT event_data FROM audit.events
          WHERE event_type = 'user_deleted'
@@ -871,7 +861,6 @@ async fn purge_can_target_already_soft_deleted_user() {
     let (user_id, _tok) =
         seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::Member).await;
 
-    // Soft-delete first.
     app.post(
         &format!("/api/admin/members/{user_id}/delete"),
         Some(&owner_tok),
@@ -880,7 +869,6 @@ async fn purge_can_target_already_soft_deleted_user() {
     .await
     .assert_status(StatusCode::NO_CONTENT);
 
-    // Purge a soft-deleted user.
     let resp = app
         .post(
             &format!("/api/admin/members/{user_id}/purge"),
@@ -898,7 +886,6 @@ async fn purge_can_target_already_soft_deleted_user() {
             .unwrap();
     assert_eq!(lifecycle, "hard_deleted");
 
-    // Audit recorded the prior lifecycle.
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
         "SELECT event_data FROM audit.events
          WHERE event_type = 'user_purged'
@@ -1041,7 +1028,6 @@ async fn owner_promotes_user_to_admin() {
     let body: LifecycleBody = resp.json();
     assert_eq!(body.instance_role, InstanceRole::Admin);
 
-    // /me as that user now reflects the new role.
     let user_tok = app.login(&target.email, "pw").await;
     let me: serde_json::Value = app.get("/api/me", Some(&user_tok)).await.json();
     assert_eq!(me["instance_role"].as_str(), Some("admin"));
@@ -1062,7 +1048,6 @@ async fn owner_demotes_admin_to_user() {
     let body: LifecycleBody = resp.json();
     assert_eq!(body.instance_role, InstanceRole::Member);
 
-    // Audit recorded both ends.
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
         "SELECT event_data FROM audit.events
          WHERE event_type = 'user_role_changed'
@@ -1208,7 +1193,6 @@ async fn change_role_on_deleted_user_returns_404() {
         .seed_user("ghost@test.local", "Ghost", "pw", InstanceRole::Member)
         .await;
 
-    // Soft-delete first.
     app.post(
         &format!("/api/admin/members/{}/delete", target.id.0),
         Some(&owner_tok),

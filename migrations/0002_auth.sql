@@ -22,8 +22,6 @@ CREATE INDEX sessions_expires_at_idx         ON auth.sessions (expires_at);
 
 CREATE TABLE auth.recovery_codes (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- sha256 output is always 32 bytes; the CHECK catches any accidental
-    -- regression that writes a wrong-shaped value at the application layer.
     code_hash          BYTEA NOT NULL CHECK (octet_length(code_hash) = 32),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by_user_id UUID NULL REFERENCES identity.users(id) ON DELETE SET NULL,
@@ -34,3 +32,10 @@ CREATE TABLE auth.recovery_codes (
 CREATE UNIQUE INDEX recovery_codes_one_active
     ON auth.recovery_codes ((TRUE))
     WHERE rotated_at IS NULL;
+
+CREATE TABLE auth.user_recovery_codes (
+    user_id      UUID PRIMARY KEY REFERENCES identity.users(id) ON DELETE CASCADE,
+    code_hash    BYTEA NOT NULL CHECK (octet_length(code_hash) = 32),
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ NULL
+);

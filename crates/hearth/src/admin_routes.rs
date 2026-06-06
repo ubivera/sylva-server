@@ -93,8 +93,8 @@ pub struct CreateInviteResponse {
 /// `POST /admin/invites` - create a new invitation. Admin or Owner only.
 ///
 /// Returns the one-time acceptance token + URL. The token is shown ONCE in
-/// this response; the client (eventually email + web wizard) is responsible
-/// for delivering it to the invitee. The DB only stores `sha256(token)`.
+/// this response; the client is responsible for delivering it to the
+/// invitee. The DB only stores `sha256(token)`.
 ///
 /// Role-escalation guard: the inviter's role must satisfy the target role
 /// - an Admin cannot invite an Owner.

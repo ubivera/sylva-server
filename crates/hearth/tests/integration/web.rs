@@ -158,25 +158,16 @@ async fn app_shell_includes_instance_name_and_user_card() {
         .unwrap();
     let body = String::from_utf8_lossy(&body_bytes);
 
-    // Instance name appears in title + brand line.
     assert!(
         body.contains("test-instance"),
         "instance name should be visible in chrome: {body}"
     );
-    // Brand line uses the "Sylva · {name}" format.
     assert!(body.contains("Sylva"));
-    // Sidebar nav present.
     assert!(body.contains(r#"class="sidebar""#));
     assert!(body.contains(r#"href="/me""#));
-    // User card present with avatar + email.
     assert!(body.contains(r#"class="user-card""#));
     assert!(body.contains("Big Boss"));
     assert!(body.contains("o@test.local"));
-    // Role pill in the sidebar user-card was retired with the
-    // popover redesign; the role still surfaces inside /me's page
-    // content as a plain label (see
-    // `role_label_renders_on_me_page` below).
-    // Search trigger placeholder.
     assert!(body.contains(r#"class="search-trigger""#));
 }
 
@@ -190,21 +181,15 @@ async fn login_page_uses_public_shell_not_app_shell() {
     assert!(!body.contains(r#"class="sidebar""#));
     assert!(!body.contains(r#"class="user-card""#));
     assert!(!body.contains(r#"class="search-trigger""#));
-    // But should be styled (CSS link present).
     assert!(body.contains("/assets/css/app.css"));
-    // And the public wordmark should be there.
     assert!(body.contains("Sylva Hearth"));
 }
 
 #[tokio::test]
 async fn role_label_renders_on_me_page() {
-    // /me used to surface the viewer's role via the sidebar
-    // user-card role pill (`role-member`, etc.); that pill was
-    // retired when the user-card became a popover. Today the role
-    // is still shown inside /me's content card as a plain label —
-    // this test asserts the label is present in the rendered page
-    // for the Member viewer and that the Owner / Admin labels
-    // don't accidentally leak in.
+    // The viewer's role is shown inside /me's content card as a plain
+    // label. Asserts the label is present for the Member viewer and that
+    // the Owner / Admin labels don't accidentally leak in.
     let app = TestApp::new().await;
     app.seed_user("u@test.local", "Reg User", "userpw", InstanceRole::Member)
         .await;
@@ -262,7 +247,6 @@ async fn logout_clears_cookie_and_revokes_session() {
     let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
     let cookie = cookie_name_value(&set_cookie);
 
-    // Logout (with CSRF token)
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
     let body = format!("csrf_token={}", urlencoding(&csrf));
@@ -595,9 +579,7 @@ async fn users_page_lists_all_users_for_admin() {
     ] {
         assert!(body.contains(needle), "expected {needle:?} in: {body}");
     }
-    // Role badges rendered. Lifecycle is no longer communicated via
-    // a Status column or avatar-corner dot — just the row's presence
-    // (active accounts) and a lock overlay (deactivated accounts).
+    // Role badges rendered.
     assert!(body.contains("role-admin"));
     assert!(body.contains("role-member"));
     // The viewing admin is tagged as "you".
@@ -662,13 +644,11 @@ async fn users_page_renders_search_input_and_data_search_attributes() {
 
     let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
-    // The search input is present.
     assert!(body.contains(r#"id="users-search""#));
     assert!(body.contains("Search by name or email"));
     // Each row carries a lowercased data-search haystack of name + email.
     assert!(body.contains(r#"data-search="alice alice@test.local""#));
     assert!(body.contains(r#"data-search="adm in admin@test.local""#));
-    // The inline filter script is on the page.
     assert!(body.contains("users-search"));
 }
 
@@ -696,9 +676,8 @@ async fn users_page_sort_default_is_joined_ascending() {
     assert!(admin_pos < alice_pos, "admin should appear before alice");
     assert!(alice_pos < bob_pos, "alice should appear before bob");
 
-    // Joined column was removed from the UI but `created_at` still
-    // drives the default sort, so row order verifies the ordering
-    // logic without needing an `aria-sort` chevron to test against.
+    // `created_at` drives the default sort, so row order verifies the
+    // ordering logic without needing an `aria-sort` chevron to test against.
 }
 
 #[tokio::test]
@@ -735,13 +714,12 @@ async fn users_page_sort_header_link_flips_direction_on_active_column() {
     // Visit with sort=name&dir=asc — the "User" column should be active
     // (asc) and its link should flip to desc on the next click. Maud
     // HTML-escapes `&` in attribute values, so we match `&amp;`. The
-    // href now also carries `&filter=all` so flipping sort doesn't drop
+    // href also carries `&filter=all` so flipping sort doesn't drop
     // any active filter.
     let (_, body) = get_with_cookie(&app, "/members?sort=name&dir=asc", Some(&cookie)).await;
     assert!(body.contains(r#"href="/members?sort=name&amp;dir=desc&amp;filter=all""#));
     // Other visible sortable column (Type) resets to asc when clicked
-    // from a different sort. The Joined column was removed from the
-    // UI; only Member + Type remain user-facing.
+    // from a different sort.
     assert!(body.contains(r#"href="/members?sort=role&amp;dir=asc&amp;filter=all""#));
 }
 
@@ -761,10 +739,9 @@ async fn users_page_invalid_sort_param_falls_back_to_default() {
     .await;
     assert_eq!(status, StatusCode::OK);
     // Garbage params shouldn't crash; we fall back to joined asc.
-    // The Joined column header is gone from the UI but the sort still
-    // runs server-side — Member column's link should be the asc form
-    // even after the garbage `dir=sideways` is rejected (the unsorted
-    // default puts Member into the asc-clickable state).
+    // The sort runs server-side — Member column's link should be the
+    // asc form even after the garbage `dir=sideways` is rejected (the
+    // unsorted default puts Member into the asc-clickable state).
     assert!(body.contains(r#"sort=name&amp;dir=asc"#));
 }
 
@@ -791,9 +768,7 @@ async fn users_page_renders_deactivated_avatar_lock_overlay() {
     let (status, body) = get_with_cookie(&app, "/members", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     // Deactivated members render with `avatar-deactivated` (greys the
-    // initial) plus an `avatar-lock` overlay containing the lock icon —
-    // the dual signal that replaced the retired status-dot in the
-    // bottom-right corner of the avatar.
+    // initial) plus an `avatar-lock` overlay containing the lock icon.
     assert!(
         body.contains("avatar-deactivated"),
         "expected deactivated avatar class in: {body}"
@@ -902,4 +877,501 @@ async fn members_pagination_rows_per_page_respects_url_param() {
         body.contains(r#"max="4""#),
         "expected max=4 on page-jump input when rows clamps to 10"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Account settings modal
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Modals are on-demand now: the page ships only an empty `#modal-host`
+/// and a trigger that fetches the modal markup from `/modals/*`. The
+/// account-settings dialog must NOT be baked into the page source. This
+/// guards against regressing back to the `<template>`-in-every-page
+/// approach (which left inert markup + a lingering materialized dialog
+/// in the DOM).
+#[tokio::test]
+async fn account_settings_modal_is_on_demand_not_in_page_source() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    // Empty injection host present; no modal markup baked in.
+    assert!(
+        body.contains(r#"id="modal-host""#),
+        "expected the empty #modal-host injection point"
+    );
+    assert!(
+        !body.contains(r#"id="tpl-dlg-account-settings""#),
+        "account-settings should NOT ship as a <template> in the page"
+    );
+    assert!(
+        !body.contains(r#"id="dlg-account-settings""#),
+        "account-settings dialog should NOT be in the page source"
+    );
+    assert!(
+        !body.contains(r#"id="tpl-dlg-reauth""#),
+        "reauth should NOT ship as a <template> in the page"
+    );
+    // Triggers reference the fetch endpoint, not a DOM id.
+    assert!(
+        body.contains(r#"data-open-modal="/modals/account-settings""#),
+        "expected Manage account button to fetch the modal on demand"
+    );
+}
+
+/// The on-demand `GET /modals/account-settings` fragment carries the
+/// full modal: header chrome, six-tab rail, and the Profile panel's
+/// Account Information section with its two forms.
+#[tokio::test]
+async fn account_settings_modal_fragment_renders_full_modal() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    // The fragment is the dialog itself, not a full page.
+    assert!(!body.contains("<html"), "fragment should not be a full page");
+    assert!(body.contains(r#"id="dlg-account-settings""#));
+    // Six tabs.
+    assert!(body.contains(r#"data-settings-tab="profile""#), "Profile");
+    assert!(body.contains(r#"data-settings-tab="security""#), "Security");
+    assert!(body.contains(r#"data-settings-tab="devices""#), "Devices");
+    assert!(body.contains(r#"data-settings-tab="authenticators""#), "Authenticators");
+    assert!(body.contains(r#"data-settings-tab="passkeys""#), "Passkeys");
+    assert!(body.contains(r#"data-settings-tab="data""#), "Data Control");
+    // Profile panel + Account Information section + the two forms.
+    assert!(body.contains(r#"data-settings-panel="profile""#));
+    assert!(body.contains("Account Information"));
+    assert!(body.contains(r#"id="form-settings-name""#));
+    assert!(body.contains(r#"id="form-settings-email""#));
+    // Header chrome: gear-icon + tagline + Sign-out form.
+    assert!(body.contains(r#"class="settings-header-icon""#));
+    assert!(body.contains("Manage your preferences"));
+    assert!(body.contains(r#"class="settings-header-signout-form""#));
+    // Email submit is a reauth-chain trigger; no inline password or locale.
+    assert!(body.contains(r#"data-reauth-confirm="form-settings-email""#));
+    assert!(!body.contains(r#"id="settings-email-password""#));
+    assert!(!body.contains(r#"id="settings-locale""#));
+}
+
+/// `GET /modals/account-settings` requires authentication — an
+/// unauthenticated fetch bounces to /login like any other browser
+/// route.
+#[tokio::test]
+async fn account_settings_modal_fragment_requires_auth() {
+    let app = TestApp::new().await;
+    let (status, _) = get_with_cookie(&app, "/modals/account-settings", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+/// The user-card popover's "Account settings" row fetches the modal on
+/// demand (`data-open-modal`), not via a DOM-id opener or an anchor to
+/// /me.
+#[tokio::test]
+async fn user_card_popover_account_settings_opens_modal() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(r#"class="user-card-action""#)
+            && body.contains(r#"data-open-modal="/modals/account-settings""#),
+        "expected user-card-action button that fetches the modal on demand"
+    );
+    // Must not be the old anchor or the old data-open-dialog opener.
+    assert!(
+        !body.contains(r#"<a class="user-card-action" href="/me""#),
+        "user-card-action anchor should be retired"
+    );
+    assert!(
+        !body.contains(r#"data-open-dialog="dlg-account-settings""#),
+        "old DOM-id opener should be gone"
+    );
+}
+
+/// POST /me/profile updates the display name and writes a
+/// `profile_updated` audit event. The HTMX response body is the
+/// re-rendered name form partial (just the form contents), not a
+/// full page.
+#[tokio::test]
+async fn me_profile_submit_updates_display_name() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&display_name={}",
+        urlencoding(&csrf),
+        urlencoding("Updated Name"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/profile")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&body_bytes);
+    // Partial response: form contents only (no <html>/<body>).
+    assert!(!body.contains("<html"));
+    // Success feedback tile + the updated value pre-filled.
+    assert!(body.contains("Profile updated."));
+    assert!(body.contains(r#"value="Updated Name""#));
+    // Assert the locale field is absent so a future regression that
+    // re-introduces a locale input fails this test immediately.
+    assert!(
+        !body.contains(r#"name="locale""#),
+        "locale field should be retired from the settings UI"
+    );
+
+    // DB row reflects the change + audit event was written.
+    let row: (String,) = sqlx::query_as(
+        "SELECT display_name FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "Updated Name");
+
+    let (audit_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'profile_updated' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1);
+}
+
+/// Empty display_name is rejected with an inline error. Display_name
+/// is required everywhere it's used (sidebar user-card, member table,
+/// audit actor) — blank values would break the visible identity story.
+#[tokio::test]
+async fn me_profile_submit_rejects_empty_display_name() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "Original", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&display_name={}&locale={}",
+        urlencoding(&csrf),
+        urlencoding("   "), // whitespace-only
+        urlencoding("en"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/profile")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains("Display name can't be blank."));
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT display_name FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "Original");
+}
+
+/// POST /me/email with the correct password updates the email and
+/// writes an `email_changed` audit event. The new address can be used
+/// to sign back in afterwards (the password hash isn't touched).
+#[tokio::test]
+async fn me_email_submit_changes_email_with_correct_password() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("old@test.local", "U", "rightpw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "old@test.local", "rightpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    // The settings email form posts through the reauth chain, so the
+    // hx-request header is set when HTMX submits. Success returns 200
+    // with an `HX-Redirect: /me` header + a hearth-toast trigger;
+    // both modals (settings + reauth) close on the client-side
+    // navigation that follows.
+    let body = format!(
+        "csrf_token={}&email={}&password={}",
+        urlencoding(&csrf),
+        urlencoding("new@test.local"),
+        urlencoding("rightpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/email")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/me"),
+        "successful email change should HX-Redirect to /me"
+    );
+    let trigger = resp
+        .headers()
+        .get("HX-Trigger")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        trigger.contains("email_updated") || trigger.contains("Email updated"),
+        "HX-Trigger should carry the email_updated toast payload: {trigger}"
+    );
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT email FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "new@test.local");
+
+    let (audit_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'email_changed' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1);
+
+    // Login with the new email works.
+    let new_set_cookie = web_login(&app, "new@test.local", "rightpw").await;
+    assert!(new_set_cookie.is_some(), "login with new email should succeed");
+}
+
+/// Wrong password rejects the email change. The response is the reauth
+/// modal content with an `invalid_password` banner so the operator can
+/// retry without losing the email value (it's staged in a hidden
+/// input). DB unchanged, no audit event written.
+#[tokio::test]
+async fn me_email_submit_rejects_wrong_password() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "rightpw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "rightpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&password={}",
+        urlencoding(&csrf),
+        urlencoding("new@test.local"),
+        urlencoding("wrongpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/email")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    // Body is the reauth modal partial — has the password input and
+    // points back at /me/email so a retry posts with a new password.
+    assert!(
+        body.contains(r#"action="/me/email""#),
+        "reauth content should point at /me/email"
+    );
+    assert!(
+        body.contains(r#"name="password""#),
+        "reauth content should expose the password input"
+    );
+    assert!(
+        body.contains("Incorrect password"),
+        "reauth content should render the invalid_password banner"
+    );
+    // The staged email value rides as a hidden input so the retry
+    // doesn't lose it.
+    assert!(
+        body.contains(r#"name="email""#),
+        "staged email input should be present in the reauth retry partial"
+    );
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT email FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "u@test.local");
+
+    let (audit_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'email_changed' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 0);
+}
+
+/// Email already in use by another (manageable) account closes the
+/// settings flow and HX-Redirects to /me with an `email_already_in_use`
+/// error toast. Surfacing the conflict in the reauth modal would imply
+/// the password was wrong; bouncing to /me with a clear red toast
+/// matches the rest of the admin-action error vocabulary.
+#[tokio::test]
+async fn me_email_submit_rejects_email_in_use() {
+    let app = TestApp::new().await;
+    let _other = app
+        .seed_user("taken@test.local", "Other", "pw", InstanceRole::Member)
+        .await;
+    let user = app
+        .seed_user("u@test.local", "U", "rightpw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "rightpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&password={}",
+        urlencoding(&csrf),
+        urlencoding("taken@test.local"),
+        urlencoding("rightpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/email")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/me"),
+        "email-in-use should HX-Redirect to /me"
+    );
+    let trigger = resp
+        .headers()
+        .get("HX-Trigger")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        trigger.contains("already exists") || trigger.contains("already in use"),
+        "HX-Trigger should carry the email_already_in_use error toast: {trigger}"
+    );
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT email FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "u@test.local");
+}
+
+/// Missing `@` (or otherwise malformed shape) is caught server-side
+/// and HX-Redirects to /me with an `email_required` toast. The native
+/// HTML5 validation in the settings form usually catches this before
+/// the reauth chain ever opens, but the server still guards against
+/// scripted clients sending raw POSTs.
+#[tokio::test]
+async fn me_email_submit_invalid_email_shape_rejected() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "rightpw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "rightpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&email={}&password={}",
+        urlencoding(&csrf),
+        urlencoding("not-an-email"),
+        urlencoding("rightpw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/email")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/me"),
+        "invalid email shape should HX-Redirect to /me"
+    );
+    let trigger = resp
+        .headers()
+        .get("HX-Trigger")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        trigger.contains("email"),
+        "HX-Trigger should carry the email_required error toast: {trigger}"
+    );
+
+    let row: (String,) = sqlx::query_as(
+        "SELECT email FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "u@test.local");
 }
