@@ -382,6 +382,15 @@ fn shell_app_inner(
                         div class="main-mark" aria-hidden="true" {}
                     }
                 }
+                // Account-settings modal template. Mounted in the shell
+                // (not per-page) because the user-card popover opens it
+                // from anywhere in the authed app. Lazy-mounted via the
+                // same `<template>` pattern as the invite + reauth
+                // dialogs — `DIALOG_JS` materializes it from the
+                // template on the first `data-open-dialog` click.
+                template id="tpl-dlg-account-settings" {
+                    (account_settings_modal(ctx))
+                }
                 // Wire up [data-open-dialog] / [data-close-dialog] without
                 // pulling in a framework. Vanilla, ~10 lines, executes on
                 // every authed page (cheap when no dialogs are present).
@@ -412,6 +421,19 @@ fn shell_app_inner(
                 // Outside-click closes the user-card popover.
                 script {
                     (maud::PreEscaped(USER_CARD_OUTSIDE_CLICK_JS))
+                }
+                // Account-settings modal: the reauth-chain is needed
+                // wherever the modal can be opened (i.e. every authed
+                // page), since email change funnels through `dlg-
+                // reauth`. The idempotency guard inside REAUTH_CHAIN_JS
+                // makes the per-page load on `/members` a no-op
+                // duplicate of this shell load. SETTINGS_TABS_JS wires
+                // the left-rail tab switcher.
+                script {
+                    (maud::PreEscaped(REAUTH_CHAIN_JS))
+                }
+                script {
+                    (maud::PreEscaped(SETTINGS_TABS_JS))
                 }
             }
         }
@@ -479,6 +501,33 @@ const THEME_SWITCH_JS: &str = r#"
     });
 
     refresh();
+})();
+"#;
+
+// Tab switcher for the account-settings modal. Click on a
+// `.settings-tab` toggles `settings-tab-active` on the tab buttons
+// and `settings-panel-active` on the matching panel, scoped to the
+// containing `.settings-dialog` so a future second settings modal
+// wouldn't interfere. No URL state — operator's choice resets on
+// every open.
+const SETTINGS_TABS_JS: &str = r#"
+(function() {
+    document.addEventListener('click', function(e) {
+        var tab = e.target.closest('[data-settings-tab]');
+        if (!tab) return;
+        var dialog = tab.closest('.settings-dialog');
+        if (!dialog) return;
+        var name = tab.getAttribute('data-settings-tab');
+        dialog.querySelectorAll('[data-settings-tab]').forEach(function(t) {
+            var on = t.getAttribute('data-settings-tab') === name;
+            t.classList.toggle('settings-tab-active', on);
+            t.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        dialog.querySelectorAll('[data-settings-panel]').forEach(function(p) {
+            var on = p.getAttribute('data-settings-panel') === name;
+            p.classList.toggle('settings-panel-active', on);
+        });
+    });
 })();
 "#;
 
@@ -764,19 +813,31 @@ const TOAST_JS: &str = r#"
 "#;
 
 const DIALOG_JS: &str = r#"
-// Some shared dialogs (dlg-invite, dlg-reauth) live inside
-// `<template>` elements so the page boots without them in the live
-// DOM. When something needs one of them, we clone the template's
-// content into <body> and then proceed as if it had always been
-// there. Idempotent — the live-dialog check at the top short-
-// circuits any subsequent calls so we never end up with duplicates.
+// Some shared dialogs (dlg-invite, dlg-reauth, dlg-account-settings)
+// live inside `<template>` elements so the page boots without them
+// in the live DOM. When something needs one of them, we clone the
+// template's content into <body>, ask HTMX to scan the new subtree
+// so its hx-* attributes start firing, then return the live dialog.
+// Idempotent — the live-dialog check at the top short-circuits any
+// subsequent calls so we never end up with duplicates.
 window.hearthMaterializeDialog = function(id) {
     var live = document.getElementById(id);
     if (live) return live;
     var tpl = document.getElementById('tpl-' + id);
     if (tpl && tpl.content) {
         document.body.appendChild(tpl.content.cloneNode(true));
-        return document.getElementById(id);
+        live = document.getElementById(id);
+        // Critical: htmx.min.js scans on DOMContentLoaded and on its
+        // own swap events, but not on raw DOM mutations. Without
+        // this call, any hx-post/hx-target inside the freshly-mounted
+        // template are dead strings — submitting one of those forms
+        // does a native POST and the server's partial fragment loads
+        // as a bare-page response. Manually processing the subtree
+        // wires the attributes into HTMX's request pipeline.
+        if (live && window.htmx && typeof window.htmx.process === 'function') {
+            window.htmx.process(live);
+        }
+        return live;
     }
     return null;
 };
@@ -1006,9 +1067,13 @@ fn user_card(ctx: &ChromeContext) -> Markup {
                         (theme_light_icon())
                     }
                 }
-                // Account settings — placeholder link until the
-                // per-user settings page lands.
-                a class="user-card-action" href="/me" {
+                // Account settings — opens the shell-mounted modal
+                // (`tpl-dlg-account-settings` → `dlg-account-settings`)
+                // via the standard `data-open-dialog` hook. Rendered
+                // as a button (not an anchor) because there's no URL
+                // to navigate to — the modal lives in-page.
+                button type="button" class="user-card-action"
+                       data-open-dialog="dlg-account-settings" {
                     span class="user-card-action-icon" { (settings_icon()) }
                     span { "Account settings" }
                 }
@@ -1190,7 +1255,10 @@ pub fn login_page(error: Option<&str>, prefill_email: Option<&str>) -> Markup {
     shell_public("Sign in", content)
 }
 
-/// `GET /me` page — the authenticated user's profile.
+/// `GET /me` page — the authenticated user's profile. Read-only
+/// summary; edits happen inside the shell-mounted account-settings
+/// modal (opened by the "Manage account" button below or the user-
+/// card popover's "Account settings" row).
 pub fn me_page(ctx: &ChromeContext) -> Markup {
     let user = ctx.user;
     let lifecycle_label = match user.lifecycle {
@@ -1201,13 +1269,16 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
         UserLifecycle::HardDeleted => "Purged",
     };
     let content = html! {
-        div class="card" {
+        div class="card me-card" {
             dl class="meta" {
                 dt { "Email" }   dd { (user.email) }
                 dt { "Role" }    dd { (role_label(user.instance_role)) }
                 dt { "Status" }  dd { (lifecycle_label) }
-                @if let Some(locale) = &user.locale {
-                    dt { "Locale" } dd { (locale) }
+            }
+            div class="me-actions" {
+                button type="button" class="btn"
+                       data-open-dialog="dlg-account-settings" {
+                    "Manage account"
                 }
             }
         }
@@ -1371,6 +1442,25 @@ pub fn reauth_modal_content(
     }
 }
 
+/// Database-cylinder icon — leading glyph on the "Data Control" tab
+/// of the account-settings modal. Three stacked ovals approximating a
+/// classic relational-database glyph; reads as "data" without forcing
+/// us to commit to a more specific metaphor. Stroke uses
+/// `currentColor`.
+fn database_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            ellipse cx="12" cy="5" rx="9" ry="3" {}
+            path d="M3 5v6c0 1.66 4.03 3 9 3s9-1.34 9-3V5" {}
+            path d="M3 11v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6" {}
+        }
+    }
+}
+
 /// 22px shield icon for the reauth modal's feature-icon slot.
 fn shield_icon() -> Markup {
     html! {
@@ -1395,6 +1485,227 @@ fn invite_modal(ctx: &ChromeContext) -> Markup {
                 (invite_modal_content_form(ctx, "", InstanceRole::Member, None))
             }
         }
+    }
+}
+
+/// `dlg-account-settings` — the global account settings modal. Opens
+/// from the user-card popover's "Account settings" row and the /me
+/// page's "Manage account" button (both via `data-open-dialog` →
+/// `DIALOG_JS`). Mounted in every authed shell via a `<template>`
+/// next to the invite + reauth ones, so it's available regardless of
+/// the page the operator is on.
+///
+/// Layout is a **left-rail tab nav + right pane**. Three tabs:
+///
+/// - **Profile** (CP2 live) — display name (HTMX inline save) + email
+///   (reauth-chained: clicking Update email hands off to `dlg-reauth`,
+///   the operator re-enters their password there, and on success the
+///   handler HX-Redirects to `/me`).
+/// - **Security** (CP3 placeholder) — change password, sessions, etc.
+/// - **Data Control** (CP4+ placeholder) — recovery code, export,
+///   account deletion.
+///
+/// Each panel's content lives in a `data-settings-panel="<tab>"`
+/// container; `SETTINGS_TABS_JS` swaps `.settings-panel-active` +
+/// `.settings-tab-active` on click. No URL state — operator's choice
+/// is per-open, not persisted.
+fn account_settings_modal(ctx: &ChromeContext) -> Markup {
+    html! {
+        dialog id="dlg-account-settings"
+               class="action-dialog action-dialog-large settings-dialog" {
+            div class="settings-header" {
+                h2 { "Account settings" }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" {
+                    (close_icon())
+                }
+            }
+            div class="settings-layout" {
+                nav class="settings-tabs" role="tablist"
+                    aria-label="Account settings sections" {
+                    button type="button"
+                           class="settings-tab settings-tab-active"
+                           role="tab" aria-selected="true"
+                           data-settings-tab="profile" {
+                        span class="settings-tab-icon" { (user_icon()) }
+                        span { "Profile" }
+                    }
+                    button type="button" class="settings-tab"
+                           role="tab" aria-selected="false"
+                           data-settings-tab="security" {
+                        span class="settings-tab-icon" { (shield_icon()) }
+                        span { "Security" }
+                    }
+                    button type="button" class="settings-tab"
+                           role="tab" aria-selected="false"
+                           data-settings-tab="data" {
+                        span class="settings-tab-icon" { (database_icon()) }
+                        span { "Data Control" }
+                    }
+                }
+                div class="settings-panes" {
+                    div class="settings-panel settings-panel-active"
+                        role="tabpanel"
+                        data-settings-panel="profile" {
+                        (settings_profile_panel(ctx))
+                    }
+                    div class="settings-panel"
+                        role="tabpanel"
+                        data-settings-panel="security" {
+                        (settings_placeholder_panel(
+                            "Security",
+                            "Password, two-factor authentication, and \
+                             active sessions land here in a coming \
+                             checkpoint.",
+                        ))
+                    }
+                    div class="settings-panel"
+                        role="tabpanel"
+                        data-settings-panel="data" {
+                        (settings_placeholder_panel(
+                            "Data control",
+                            "Account recovery code, data export, and \
+                             account deletion land here in a coming \
+                             checkpoint.",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Profile panel. Two forms split on the reauth axis:
+///   - Display name (no reauth) — HTMX inline save, swaps the form
+///     back into place with a feedback tile.
+///   - Email (reauth-chained) — the Update email button is a
+///     `data-reauth-confirm` trigger; `REAUTH_CHAIN_JS` stages the
+///     new email value into the reauth modal and the user re-enters
+///     their password there. On success the handler HX-Redirects to
+///     /me with a toast (same shape as the admin destructive actions).
+fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
+    html! {
+        div id="settings-form-name" {
+            (settings_name_form(ctx, None))
+        }
+        div class="settings-section-divider" {}
+        (settings_email_form(ctx))
+    }
+}
+
+/// Stand-in for the sections that aren't built yet. Keeps the
+/// tab-nav structure honest at CP2 without pretending we have
+/// settings to show; CP3 / CP4 replace the body with a real form.
+fn settings_placeholder_panel(title: &str, body: &str) -> Markup {
+    html! {
+        div class="settings-placeholder" {
+            h3 { (title) }
+            p { (body) }
+        }
+    }
+}
+
+/// Display-name form. No reauth — display name isn't security-
+/// relevant, and the friction of "type your password to rename
+/// yourself" would feel hostile. HTMX-targeted to its own wrapper so
+/// the email form next to it doesn't disturb. `feedback` renders an
+/// inline tile above the form after a save.
+pub fn settings_name_form(
+    ctx: &ChromeContext,
+    feedback: Option<&SettingsFeedback>,
+) -> Markup {
+    let user = ctx.user;
+    html! {
+        @if let Some(fb) = feedback {
+            (settings_feedback_tile(fb))
+        }
+        form id="form-settings-name"
+             class="settings-form"
+             method="post"
+             action="/me/profile"
+             hx-post="/me/profile"
+             hx-target="#settings-form-name"
+             hx-swap="innerHTML" {
+            (csrf_input(ctx.csrf_token))
+            div class="field" {
+                label for="settings-display-name" { "Display name" }
+                input type="text"
+                      id="settings-display-name"
+                      name="display_name"
+                      value=(user.display_name)
+                      autocomplete="name"
+                      required;
+            }
+            div class="settings-form-actions" {
+                button type="submit" class="btn" { "Save name" }
+            }
+        }
+    }
+}
+
+/// Email form. Submit is gated by the reauth chain: clicking
+/// `Update email` opens `dlg-reauth` with the staged new email in a
+/// hidden input. The operator enters their current password in the
+/// reauth modal; on success the handler HX-Redirects to /me with a
+/// "Email updated" toast. Inline password is intentionally absent —
+/// re-using the existing reauth pattern keeps "security-sensitive
+/// edits live in the reauth modal" as a one-sentence story.
+pub fn settings_email_form(ctx: &ChromeContext) -> Markup {
+    let user = ctx.user;
+    html! {
+        form id="form-settings-email"
+             class="settings-form"
+             method="post"
+             action="/me/email" {
+            (csrf_input(ctx.csrf_token))
+            div class="field" {
+                label for="settings-email" { "Email" }
+                input type="email"
+                      id="settings-email"
+                      name="email"
+                      value=(user.email)
+                      autocomplete="email"
+                      required;
+                p class="field-hint" {
+                    "This is the address you'll sign in with. You'll be "
+                    "asked to confirm your current password before the "
+                    "change applies."
+                }
+            }
+            div class="settings-form-actions" {
+                button type="button" class="btn"
+                       data-reauth-confirm="form-settings-email" {
+                    "Update email"
+                }
+            }
+        }
+    }
+}
+
+/// Post-save feedback tile rendered above a form after an HTMX swap.
+/// Two flavours: success (green tick + the change summary) and error
+/// (red banner with the inline message). Kept distinct from the
+/// generic `error_banner` so the green success state matches.
+#[derive(Debug, Clone)]
+pub enum SettingsFeedback {
+    Success(String),
+    Error(String),
+}
+
+fn settings_feedback_tile(fb: &SettingsFeedback) -> Markup {
+    match fb {
+        SettingsFeedback::Success(msg) => html! {
+            div class="settings-feedback settings-feedback-success" role="status" {
+                (check_circle_icon())
+                span { (msg) }
+            }
+        },
+        SettingsFeedback::Error(msg) => html! {
+            div class="settings-feedback settings-feedback-error" role="alert" {
+                (alert_circle_icon())
+                span { (msg) }
+            }
+        },
     }
 }
 
@@ -2692,11 +3003,34 @@ const CONFIRM_CHECKBOX_JS: &str = r#"
 //      input. HTMX takes over on submit.
 const REAUTH_CHAIN_JS: &str = r#"
 (function() {
+    // Idempotency guard. The shell wires this script for every
+    // authed page (the account-settings modal opens from anywhere
+    // and uses the chain for email/password edits), but /members
+    // also loads it in its own script block for historical reasons.
+    // Double-binding the document click listener would stage the
+    // payload twice on each click; the guard keeps the first
+    // binding and short-circuits subsequent loads.
+    if (window.__hearthReauthChainLoaded) return;
+    window.__hearthReauthChainLoaded = true;
     document.addEventListener('click', function(e) {
         var btn = e.target.closest('[data-reauth-confirm]');
         if (!btn) return;
         e.preventDefault();
         var sourceForm = document.getElementById(btn.getAttribute('data-reauth-confirm'));
+        // Run native form validation before opening the reauth modal.
+        // Without this, a malformed email + click on Update email would
+        // open the reauth flow, the operator would type their password,
+        // and only then see the rejection. Surfacing the invalidity at
+        // the source form means the password prompt only appears for
+        // requests that have a chance of succeeding.
+        if (sourceForm
+            && typeof sourceForm.checkValidity === 'function'
+            && !sourceForm.checkValidity()) {
+            if (typeof sourceForm.reportValidity === 'function') {
+                sourceForm.reportValidity();
+            }
+            return;
+        }
         // Lazy-mount dlg-reauth from its <template> if this is the
         // first chain run since page load.
         var reauthDialog = window.hearthMaterializeDialog
@@ -3905,6 +4239,26 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
             ToastKind::Error,
             "Awaiting review",
             "A 72-hour veto window has begun for the requested deletion.".to_string(),
+        ),
+
+        // /me account-settings outcomes — Profile and Email edits
+        // emit these from POST /me/profile and POST /me/email after
+        // their respective updates land. Green success palette to
+        // match other positive outcomes.
+        "profile_updated" => (
+            ToastKind::Success,
+            "Profile updated",
+            "Your display name has been saved.".to_string(),
+        ),
+        "email_updated" => (
+            ToastKind::Success,
+            "Email updated",
+            "Sign-in will use the new address from now on.".to_string(),
+        ),
+        "email_unchanged" => (
+            ToastKind::Info,
+            "Nothing to update",
+            "That's already your email.".to_string(),
         ),
 
         _ => return None,

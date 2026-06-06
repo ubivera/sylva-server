@@ -333,6 +333,35 @@ impl UserRepository {
         Ok(user)
     }
 
+    /// Update a user's email address within the caller's transaction.
+    /// Bumps `updated_at`; the generated `email_lower` column re-derives
+    /// from the new value automatically. Email uniqueness against other
+    /// manageable accounts is enforced by the existing `email_lower`
+    /// unique index — the caller surfaces a 23505 (`UniqueViolation`)
+    /// SQLSTATE as a "that address is already in use" rejection to the
+    /// operator.
+    ///
+    /// The caller is responsible for the password re-auth check and
+    /// for emitting the appropriate audit event (`email_changed`).
+    pub async fn update_email(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+        new_email: &str,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "UPDATE identity.users
+             SET email = $2, updated_at = now()
+             WHERE id = $1
+             RETURNING id, email, display_name, lifecycle, instance_role, kind,
+                       locale, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(new_email)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
+    }
+
     /// True when at least one manageable user (Active, Deactivated,
     /// PendingInvite) already has `email_lower = lower(email)`. Soft- and
     /// hard-deleted users' redacted emails are not considered "in use" —

@@ -27,6 +27,8 @@ pub fn ui_router(state: AppState) -> Router {
             get(routes::accept_invite_form).post(routes::accept_invite_submit),
         )
         .route("/me", get(routes::me_page))
+        .route("/me/profile", post(routes::me_profile_submit))
+        .route("/me/email", post(routes::me_email_submit))
         .route("/members", get(routes::members_page))
         .route(
             "/members/invite",
