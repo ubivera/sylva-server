@@ -95,8 +95,24 @@ pub struct LoginForm {
 /// browser doesn't replace the page with a custom error UI).
 pub async fn login_submit(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    let rl_key = format!("login:{}", hearth::rate_limit::client_key(&headers));
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(
+                views::login_page(
+                    Some("Too many attempts. Wait a moment and try again."),
+                    None,
+                )
+                .into_string(),
+            ),
+        )
+            .into_response();
+    }
+
     let outcome = match auth::verify_credentials(&state.db, &form.email, &form.password).await {
         Ok(o) => o,
         Err(err) => {
@@ -108,6 +124,7 @@ pub async fn login_submit(
     let user = match outcome {
         Ok(user) => user,
         Err(_) => {
+            state.rate_limiter.record_failure(&rl_key);
             // Re-render with the email pre-filled so the operator
             // doesn't have to retype it after a bad password — the
             // password field stays empty and gets focus.
@@ -1406,8 +1423,23 @@ pub async fn recover_page() -> Response {
 /// generic error. Audits `recovery_started` / `recovery_failed`.
 pub async fn recover_submit(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<RecoverForm>,
 ) -> Response {
+    let rl_key = format!("recover:{}", hearth::rate_limit::client_key(&headers));
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(
+                views::recover_page(Some(
+                    "Too many attempts. Wait a moment and try again.",
+                ))
+                .into_string(),
+            ),
+        )
+            .into_response();
+    }
+
     let email = form.email.trim();
     let code = form.recovery_code.trim();
     let users = identity::UserRepository::new(state.db.clone());
@@ -1486,6 +1518,7 @@ pub async fn recover_submit(
             resp
         }
         None => {
+            state.rate_limiter.record_failure(&rl_key);
             Html(views::recover_page(Some(RECOVER_GENERIC_ERROR)).into_string()).into_response()
         }
     }

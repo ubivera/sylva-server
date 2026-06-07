@@ -255,6 +255,7 @@ impl TestApp {
             public_base_url: "http://127.0.0.1:8443".to_string(),
             instance_name: "test-instance".to_string(),
             csrf_secret: csrf_secret.clone(),
+            rate_limiter: std::sync::Arc::new(hearth::rate_limit::RateLimiter::auth_default()),
         };
         let health = axum::Router::new()
             .route(

@@ -2029,3 +2029,102 @@ async fn recover_reset_password_mismatch_rerenders() {
     // Original password still works.
     assert!(web_login(&app, "locked@test.local", "original").await.is_some());
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auth endpoint rate limiting
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn post_form_with_ip(app: &TestApp, uri: &str, ip: &str, body: String) -> StatusCode {
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("x-forwarded-for", ip)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    tower::ServiceExt::oneshot(app.router.clone(), req)
+        .await
+        .unwrap()
+        .status()
+}
+
+/// After a burst of failed `/recover` attempts from one IP, the next is
+/// throttled with 429 — while a different IP is unaffected (independent
+/// buckets, keyed off `X-Forwarded-For`).
+#[tokio::test]
+async fn recover_is_rate_limited_per_ip() {
+    let app = TestApp::new().await;
+    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let body = || {
+        format!(
+            "email={}&recovery_code={}",
+            urlencoding("nobody@test.local"),
+            urlencoding("WRONG"),
+        )
+    };
+
+    for _ in 0..burst {
+        assert_eq!(
+            post_form_with_ip(&app, "/recover", "10.9.9.9", body()).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        post_form_with_ip(&app, "/recover", "10.9.9.9", body()).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "burst+1 from the same IP should be throttled"
+    );
+    assert_eq!(
+        post_form_with_ip(&app, "/recover", "10.9.9.10", body()).await,
+        StatusCode::OK,
+        "a different IP has its own bucket"
+    );
+}
+
+/// The login form is throttled the same way. Unknown-email attempts
+/// skip the Argon2 path, so draining the bucket stays cheap.
+#[tokio::test]
+async fn login_is_rate_limited_per_ip() {
+    let app = TestApp::new().await;
+    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let body = || {
+        format!(
+            "email={}&password={}",
+            urlencoding("nobody@test.local"),
+            urlencoding("x"),
+        )
+    };
+
+    for _ in 0..burst {
+        assert_eq!(
+            post_form_with_ip(&app, "/login", "10.8.8.8", body()).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        post_form_with_ip(&app, "/login", "10.8.8.8", body()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+/// A successful login does not consume the throttle budget — a user who
+/// signs in correctly is never throttled by their own activity.
+#[tokio::test]
+async fn successful_login_does_not_consume_rate_budget() {
+    let app = TestApp::new().await;
+    app.seed_user("good@test.local", "Good", "rightpw", InstanceRole::Member)
+        .await;
+    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    for _ in 0..(burst + 2) {
+        let ok = format!(
+            "email={}&password={}",
+            urlencoding("good@test.local"),
+            urlencoding("rightpw"),
+        );
+        // 303 redirect to /me on success.
+        assert_eq!(
+            post_form_with_ip(&app, "/login", "10.7.7.7", ok).await,
+            StatusCode::SEE_OTHER
+        );
+    }
+}

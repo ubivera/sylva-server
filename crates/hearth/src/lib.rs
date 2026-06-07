@@ -10,6 +10,7 @@ pub mod health;
 #[cfg(windows)]
 pub mod job_object;
 pub mod postgres;
+pub mod rate_limit;
 pub mod recovery_token;
 pub mod shutdown;
 pub mod telemetry;
@@ -127,6 +128,7 @@ async fn serve(
         public_base_url: config.public_base_url.clone(),
         instance_name: config.instance_name.clone(),
         csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
+        rate_limiter: std::sync::Arc::new(rate_limit::RateLimiter::auth_default()),
     };
 
     let health = axum::Router::new()
