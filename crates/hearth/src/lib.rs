@@ -10,6 +10,7 @@ pub mod health;
 #[cfg(windows)]
 pub mod job_object;
 pub mod postgres;
+pub mod recovery_token;
 pub mod shutdown;
 pub mod telemetry;
 pub mod views;

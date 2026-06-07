@@ -1324,6 +1324,281 @@ fn cookie_value(name: &str, value: &str, clearing: bool) -> String {
     }
 }
 
+/// Append a `Set-Cookie` header instead of replacing. Needed when a
+/// single response sets more than one cookie (the recovery-reset
+/// completion sets the new session cookie *and* clears the recovery
+/// cookie) — `set_cookie_header`'s `insert` would drop the first.
+fn append_cookie_header(response: &mut Response, value: &str) {
+    match value.parse::<axum::http::HeaderValue>() {
+        Ok(v) => {
+            response.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
+        Err(err) => {
+            tracing::error!(?err, raw = value, "cookie header parse failed (impossible)");
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /recover — offline forgot-password flow (recovery code → new password)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Cookie carrying the single-purpose reset token between `POST
+/// /recover` and the `/recover/reset` step. HttpOnly + SameSite=Lax
+/// (so a cross-site POST can't drive the reset), short-lived.
+const RECOVERY_COOKIE_NAME: &str = "hearth_recovery";
+
+/// How long a verified recovery grant is good for before the user must
+/// re-enter their code. 10 minutes — enough to pick a password, short
+/// enough that a leaked token has a tiny window.
+const RESET_TTL_SECS: i64 = 600;
+
+fn recovery_cookie_value(token: &str, clearing: bool) -> String {
+    if clearing {
+        format!("{RECOVERY_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+    } else {
+        format!(
+            "{RECOVERY_COOKIE_NAME}={token}; Path=/; Max-Age={RESET_TTL_SECS}; HttpOnly; SameSite=Lax"
+        )
+    }
+}
+
+/// Pull the raw recovery cookie value out of the `Cookie` header.
+fn recovery_cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(name, _)| *name == RECOVERY_COOKIE_NAME)
+        .map(|(_, value)| value.to_string())
+}
+
+/// Resolve the recovery cookie to a verified `UserId`, or `None` if it's
+/// missing / tampered / expired.
+fn recovery_user_id(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<identity::UserId> {
+    let token = recovery_cookie_token(headers)?;
+    let now = chrono::Utc::now().timestamp();
+    hearth::recovery_token::verify(&state.csrf_secret, &token, now).map(identity::UserId::new)
+}
+
+#[derive(Deserialize)]
+pub struct RecoverForm {
+    pub email: String,
+    pub recovery_code: String,
+}
+
+/// Generic "didn't match" message — never reveals whether it was the
+/// email or the code that was wrong, so the page can't be used to probe
+/// which emails have accounts.
+const RECOVER_GENERIC_ERROR: &str =
+    "That email and recovery code didn't match. Check both and try again.";
+
+/// `GET /recover` — public start of the recovery flow.
+pub async fn recover_page() -> Response {
+    Html(views::recover_page(None).into_string()).into_response()
+}
+
+/// `POST /recover` — verify email + recovery code. On success, stamp
+/// the code's `last_used_at`, mint a short-lived reset cookie, and send
+/// the user to `/recover/reset`. On any failure, re-render with a
+/// generic error. Audits `recovery_started` / `recovery_failed`.
+pub async fn recover_submit(
+    State(state): State<AppState>,
+    Form(form): Form<RecoverForm>,
+) -> Response {
+    let email = form.email.trim();
+    let code = form.recovery_code.trim();
+    let users = identity::UserRepository::new(state.db.clone());
+
+    let candidate = match users.find_by_email(email).await {
+        Ok(u) => u,
+        Err(err) => {
+            tracing::error!(?err, "recover: user lookup");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    let verified = match candidate {
+        Some(user) if user.lifecycle == identity::UserLifecycle::Active => {
+            let actor = audit::Actor {
+                user_id: user.id,
+                display_name: user.display_name.clone(),
+            };
+            let outcome: anyhow::Result<bool> = async {
+                let mut tx = state.db.begin().await?;
+                let ok = auth::user_recovery_code::verify_and_stamp(&mut tx, user.id, code).await?;
+                let event = if ok { "recovery_started" } else { "recovery_failed" };
+                audit::append(
+                    &mut tx,
+                    Some(&actor),
+                    None,
+                    event,
+                    serde_json::json!({ "via": "web" }),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(ok)
+            }
+            .await;
+            match outcome {
+                Ok(true) => Some(user.id),
+                Ok(false) => None,
+                Err(err) => {
+                    tracing::error!(?err, "recover: verify recovery code");
+                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+                }
+            }
+        }
+        _ => {
+            // Unknown email or non-active account. Record the attempt
+            // (no actor — there may be no real user) without telling the
+            // caller which half failed.
+            let logged: anyhow::Result<()> = async {
+                let mut tx = state.db.begin().await?;
+                audit::append(
+                    &mut tx,
+                    None,
+                    None,
+                    "recovery_failed",
+                    serde_json::json!({ "email": email, "reason": "unknown_or_inactive" }),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+            if let Err(err) = logged {
+                tracing::error!(?err, "recover: audit failed attempt");
+            }
+            None
+        }
+    };
+
+    match verified {
+        Some(user_id) => {
+            let expires_at = chrono::Utc::now().timestamp() + RESET_TTL_SECS;
+            let token =
+                hearth::recovery_token::sign(&state.csrf_secret, user_id.0, expires_at);
+            let mut resp = Redirect::to("/recover/reset").into_response();
+            set_cookie_header(&mut resp, &recovery_cookie_value(&token, false));
+            resp
+        }
+        None => {
+            Html(views::recover_page(Some(RECOVER_GENERIC_ERROR)).into_string()).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RecoverResetForm {
+    pub new_password: String,
+    pub confirm_password: String,
+}
+
+/// `GET /recover/reset` — the new-password form, gated by a valid reset
+/// cookie. Without one, bounce back to `/recover` to start over.
+pub async fn recover_reset_page(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    match recovery_user_id(&state, &headers) {
+        Some(_) => Html(views::recover_reset_page(None).into_string()).into_response(),
+        None => Redirect::to("/recover").into_response(),
+    }
+}
+
+/// `POST /recover/reset` — set the new password. Atomically: update the
+/// hash, **rotate the recovery code** (the presented one is burned),
+/// revoke every existing session, and issue a fresh session for this
+/// device. Shows the new recovery code once, then Continue → `/me`.
+/// Audits `recovery_succeeded`.
+pub async fn recover_reset_submit(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<RecoverResetForm>,
+) -> Response {
+    let user_id = match recovery_user_id(&state, &headers) {
+        Some(id) => id,
+        None => return Redirect::to("/recover").into_response(),
+    };
+
+    if form.new_password.is_empty() {
+        return Html(
+            views::recover_reset_page(Some("Enter a new password.")).into_string(),
+        )
+        .into_response();
+    }
+    if form.new_password != form.confirm_password {
+        return Html(
+            views::recover_reset_page(Some("Those passwords don't match.")).into_string(),
+        )
+        .into_response();
+    }
+
+    let users = identity::UserRepository::new(state.db.clone());
+    let user = match users.find_any(user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Redirect::to("/recover").into_response(),
+        Err(err) => {
+            tracing::error!(?err, "recover_reset: user lookup");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    let new_phc = match auth::hash_password(&form.new_password) {
+        Ok(h) => h,
+        Err(err) => {
+            tracing::error!(?err, "recover_reset: hash");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    let new_code = auth::recovery_code::generate_code();
+    let actor = audit::Actor {
+        user_id: user.id,
+        display_name: user.display_name.clone(),
+    };
+
+    let result: anyhow::Result<String> = async {
+        let mut tx = state.db.begin().await?;
+        auth::update_password_hash(&mut tx, user.id, &new_phc).await?;
+        auth::user_recovery_code::rotate(&mut tx, user.id, &new_code).await?;
+        let revoked = auth::SessionRepository::revoke_all_for_user(&mut tx, user.id).await?;
+        let (session, token) =
+            auth::SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "recovery_succeeded",
+            serde_json::json!({ "sessions_revoked": revoked, "session_id": session.id }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(token)
+    }
+    .await;
+
+    let token = match result {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::error!(?err, "recover_reset: apply");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    // Log this device in (new session) and clear the spent reset cookie.
+    let mut resp =
+        Html(views::accept_invite_recovery_code_page(&new_code).into_string()).into_response();
+    append_cookie_header(
+        &mut resp,
+        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+    );
+    append_cookie_header(&mut resp, &recovery_cookie_value("", /* clearing = */ true));
+    resp
+}
+
 pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     (
         status,

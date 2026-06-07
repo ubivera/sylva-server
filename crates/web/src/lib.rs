@@ -22,6 +22,11 @@ pub fn ui_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::root_redirect))
         .route("/login", get(routes::login_page).post(routes::login_submit))
+        .route("/recover", get(routes::recover_page).post(routes::recover_submit))
+        .route(
+            "/recover/reset",
+            get(routes::recover_reset_page).post(routes::recover_reset_submit),
+        )
         .route(
             "/invite/{token}",
             get(routes::accept_invite_form).post(routes::accept_invite_submit),

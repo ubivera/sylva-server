@@ -1249,9 +1249,82 @@ pub fn login_page(error: Option<&str>, prefill_email: Option<&str>) -> Markup {
                 }
                 button type="submit" class="btn" { "Sign in" }
             }
+            p class="login-recover-link" {
+                a href="/recover" { "Lost access?" }
+            }
         }
     };
     shell_public("Sign in", content)
+}
+
+/// `GET /recover` — public start of the offline account-recovery flow.
+/// The operator enters their email + the recovery code they saved at
+/// invite acceptance (or last regeneration). `error` renders a generic
+/// banner that never reveals which half was wrong.
+pub fn recover_page(error: Option<&str>) -> Markup {
+    let content = html! {
+        h1 { "Recover your account" }
+        div class="card" {
+            p class="muted recover-intro" {
+                "Enter your email and the recovery code you saved. We'll "
+                "let you set a new password. Sylva is offline-first — "
+                "there's no reset email, so the recovery code is the only "
+                "way back in."
+            }
+            form method="post" action="/recover" {
+                @if let Some(msg) = error {
+                    p class="error" { (msg) }
+                }
+                div class="field" {
+                    label for="email" { "Email" }
+                    input type="email" name="email" id="email" required
+                          autocomplete="username" autofocus;
+                }
+                div class="field" {
+                    label for="recovery_code" { "Recovery code" }
+                    input type="text" name="recovery_code" id="recovery_code"
+                          required autocomplete="off" spellcheck="false"
+                          placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX";
+                }
+                button type="submit" class="btn" { "Continue" }
+            }
+            p class="login-recover-link" {
+                a href="/login" { "Back to sign in" }
+            }
+        }
+    };
+    shell_public("Recover your account", content)
+}
+
+/// `GET /recover/reset` (and POST re-render on error) — the
+/// new-password step, reachable only with a valid reset cookie (minted
+/// by `POST /recover`). Confirm-match is validated server-side so the
+/// page works without JS.
+pub fn recover_reset_page(error: Option<&str>) -> Markup {
+    let content = html! {
+        h1 { "Set a new password" }
+        div class="card" {
+            form method="post" action="/recover/reset" {
+                @if let Some(msg) = error {
+                    p class="error" { (msg) }
+                }
+                div class="field" {
+                    label for="new_password" { "New password" }
+                    input type="password" name="new_password" id="new_password"
+                          required minlength="8" autocomplete="new-password"
+                          autofocus;
+                }
+                div class="field" {
+                    label for="confirm_password" { "Confirm new password" }
+                    input type="password" name="confirm_password"
+                          id="confirm_password" required minlength="8"
+                          autocomplete="new-password";
+                }
+                button type="submit" class="btn" { "Set password" }
+            }
+        }
+    };
+    shell_public("Set a new password", content)
 }
 
 /// `GET /me` page — the authenticated user's profile. Read-only
