@@ -420,6 +420,12 @@ fn shell_app_inner(
                 script {
                     (maud::PreEscaped(INVITE_COPY_JS))
                 }
+                // WebAuthn ceremony glue for passkey enrollment (and,
+                // in the login step, authentication). Delegated, so it's
+                // dormant until a passkey fragment appears.
+                script {
+                    (maud::PreEscaped(WEBAUTHN_JS))
+                }
             }
         }
     }
@@ -533,6 +539,83 @@ const CHANGE_PASSWORD_GATE_JS: &str = r#"
         if (!newField || !btn) return;
         var val = newField.value;
         btn.disabled = !(val.length >= 8 && val === confirmField.value);
+    });
+})();
+"#;
+
+// WebAuthn (passkey) glue. Two delegated handlers:
+//   • `[data-passkey-create]` (enrollment): read the embedded creation
+//     options, run navigator.credentials.create, encode the result into
+//     the hidden field, and submit the finish form (htmx swaps the
+//     result + OOB-refreshes the passkeys list).
+//   • `[data-passkey-auth]` (sign-in 2nd factor): wired in CP-B's login
+//     step — reads request options, runs navigator.credentials.get.
+// The base64url ↔ ArrayBuffer conversion is hand-rolled (no JS deps), as
+// the WebAuthn API speaks ArrayBuffers but the wire format is base64url.
+const WEBAUTHN_JS: &str = r#"
+(function() {
+    if (window.__hearthWebauthnLoaded) return;
+    window.__hearthWebauthnLoaded = true;
+
+    function b64urlToBuf(s) {
+        s = s.replace(/-/g, '+').replace(/_/g, '/');
+        var pad = s.length % 4; if (pad) s += '='.repeat(4 - pad);
+        var bin = atob(s); var buf = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        return buf.buffer;
+    }
+    function bufToB64url(buf) {
+        var bytes = new Uint8Array(buf); var bin = '';
+        for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    function showError(scope, msg) {
+        var el = scope.querySelector('#passkey-error');
+        if (el) { el.textContent = msg; el.hidden = false; }
+    }
+    function supported() {
+        return !!(window.PublicKeyCredential && navigator.credentials);
+    }
+
+    // Enrollment: navigator.credentials.create
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-passkey-create]');
+        if (!btn) return;
+        e.preventDefault();
+        var form = btn.closest('form');
+        var optsEl = document.getElementById('passkey-options');
+        if (!form || !optsEl) return;
+        if (!supported()) { showError(form, 'This browser does not support passkeys.'); return; }
+
+        var opts;
+        try { opts = JSON.parse(optsEl.textContent).publicKey; }
+        catch (_) { showError(form, 'Could not start passkey setup.'); return; }
+        opts.challenge = b64urlToBuf(opts.challenge);
+        if (opts.user && opts.user.id) opts.user.id = b64urlToBuf(opts.user.id);
+        if (Array.isArray(opts.excludeCredentials)) {
+            opts.excludeCredentials.forEach(function(c) { c.id = b64urlToBuf(c.id); });
+        }
+
+        btn.disabled = true;
+        navigator.credentials.create({ publicKey: opts }).then(function(cred) {
+            var out = {
+                id: cred.id,
+                rawId: bufToB64url(cred.rawId),
+                type: cred.type,
+                response: {
+                    clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+                    attestationObject: bufToB64url(cred.response.attestationObject),
+                },
+                extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+            };
+            var hidden = form.querySelector('#passkey-credential');
+            if (hidden) hidden.value = JSON.stringify(out);
+            if (typeof form.requestSubmit === 'function') form.requestSubmit();
+            else form.submit();
+        }).catch(function() {
+            btn.disabled = false;
+            showError(form, 'Passkey setup was cancelled or did not complete.');
+        });
     });
 })();
 "#;
@@ -1597,6 +1680,50 @@ fn key_icon() -> Markup {
     }
 }
 
+/// Mobile-device glyph — leads the authenticators section + each row,
+/// since TOTP codes come from a phone app (or password manager).
+fn device_mobile_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            rect x="6" y="2" width="12" height="20" rx="2.5" {}
+            path d="M11 18h2" {}
+        }
+    }
+}
+
+/// Circled-i info glyph for explanatory cards.
+fn info_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            circle cx="12" cy="12" r="10" {}
+            path d="M12 16v-4" {}
+            path d="M12 8h.01" {}
+        }
+    }
+}
+
+/// Pencil glyph for the per-authenticator rename affordance.
+fn pencil_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M12 20h9" {}
+            path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" {}
+        }
+    }
+}
+
 
 /// Database-cylinder icon — leading glyph on the "Data Control" tab
 /// of the account-settings modal. Three stacked ovals approximating a
@@ -1668,7 +1795,9 @@ pub(crate) fn invite_modal(ctx: &ChromeContext) -> Markup {
 pub fn account_settings_modal(
     ctx: &ChromeContext,
     recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
-    totp_meta: Option<&auth::user_totp::TotpRow>,
+    totp_creds: &[auth::user_totp::TotpCredential],
+    passkey_creds: &[hearth::webauthn::WebauthnCredentialRow],
+    passkey_available: bool,
 ) -> Markup {
     html! {
         dialog id="dlg-account-settings"
@@ -1744,7 +1873,7 @@ pub fn account_settings_modal(
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="security" {
-                        (settings_security_panel(ctx, totp_meta))
+                        (settings_security_panel(ctx, totp_creds, passkey_creds, passkey_available))
                     }
                     div class="settings-panel"
                         role="tabpanel"
@@ -1808,7 +1937,9 @@ fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
 /// reauth step.
 fn settings_security_panel(
     ctx: &ChromeContext,
-    totp_meta: Option<&auth::user_totp::TotpRow>,
+    totp_creds: &[auth::user_totp::TotpCredential],
+    passkey_creds: &[hearth::webauthn::WebauthnCredentialRow],
+    passkey_available: bool,
 ) -> Markup {
     html! {
         section class="settings-section" {
@@ -1864,81 +1995,528 @@ fn settings_security_panel(
             }
         }
 
-        section class="settings-section" {
-            div class="settings-section-header" {
-                span class="settings-section-icon" aria-hidden="true" {
-                    (key_icon())
+        hr class="settings-divider";
+
+        (totp_authenticators_section(ctx, totp_creds, SectionMode::Normal, false))
+
+        hr class="settings-divider";
+
+        (passkey_credentials_section(ctx, passkey_creds, SectionMode::Normal, passkey_available, false))
+    }
+}
+
+/// Which row of the authenticators island is in a special inline state.
+/// Drives the HTMX-swap re-renders for rename / delete-confirm.
+#[derive(Clone, Copy)]
+pub enum SectionMode {
+    Normal,
+    Renaming(uuid::Uuid),
+    ConfirmDelete(uuid::Uuid),
+}
+
+/// The "Registered Authenticators" island — an HTMX-swappable
+/// `#totp-section` holding the list of enrolled authenticators, the
+/// reauth-chained "Add Authenticator" button, and the explainer card.
+/// Rename / delete re-render this whole section into itself.
+pub fn totp_authenticators_section(
+    ctx: &ChromeContext,
+    creds: &[auth::user_totp::TotpCredential],
+    mode: SectionMode,
+    oob: bool,
+) -> Markup {
+    let at_max = creds.len() as i64 >= auth::user_totp::MAX_AUTHENTICATORS;
+    // When delivered as a secondary (out-of-band) part of another
+    // response — e.g. refreshing the list inside the still-open settings
+    // modal after an enrollment that happened in the reauth modal.
+    let oob_attr = oob.then_some("true");
+    html! {
+        section id="totp-section" class="settings-section" hx-swap-oob=[oob_attr] {
+            div class="settings-section-header settings-section-header-actions" {
+                div class="settings-section-heading" {
+                    span class="settings-section-icon" aria-hidden="true" {
+                        (device_mobile_icon())
+                    }
+                    div {
+                        h3 { "Registered Authenticators" }
+                        p class="settings-section-tagline" {
+                            "Verification codes using apps or password managers."
+                        }
+                    }
                 }
-                div {
-                    h3 { "Authenticator app" }
-                    p class="settings-section-tagline" {
-                        "Require a 6-digit code from an authenticator app "
-                        "each time you sign in."
+                // Reauth-chained add. The hidden form is the reauth source;
+                // `display:contents` keeps it from disturbing the header flex.
+                form id="form-totp-start" method="post" action="/me/totp/start"
+                     style="display:contents" {
+                    (csrf_input(ctx.csrf_token))
+                    // keep-source-open: the settings modal stays open
+                    // behind the reauth/QR modal; the enrollment response
+                    // refreshes this list in place via hx-swap-oob.
+                    button type="button" class="btn-secondary"
+                           data-reauth-confirm="form-totp-start"
+                           data-keep-source-open
+                           disabled[at_max] {
+                        (key_icon())
+                        span { "Add Authenticator" }
                     }
                 }
             }
             div class="settings-section-body" {
-                @match totp_meta {
-                    Some(meta) => {
-                        form id="form-totp-disable"
-                             class="settings-row"
-                             method="post"
-                             action="/me/totp/disable" {
-                            (csrf_input(ctx.csrf_token))
-                            div class="settings-row-label" {
-                                label { "Status" }
-                                p class="settings-row-hint" {
-                                    "Two-factor is on"
-                                    @if let Some(v) = meta.verified_at {
-                                        " (since "
-                                        (v.format("%b %-d, %Y").to_string())
-                                        ")"
-                                    }
-                                    "."
-                                }
-                            }
-                            div class="settings-row-control" {
-                                p class="settings-row-hint" {
-                                    "Turning it off asks for your password. "
-                                    "Your recovery code stays as your backup "
-                                    "way in."
-                                }
-                                div class="settings-row-actions" {
-                                    button type="button" class="btn-secondary"
-                                           data-reauth-confirm="form-totp-disable" {
-                                        "Turn off"
-                                    }
-                                }
-                            }
+                @if creds.is_empty() {
+                    p class="settings-row-hint totp-empty" {
+                        "No authenticators yet. Add one to require a 6-digit "
+                        "code at sign-in."
+                    }
+                } @else {
+                    ul class="totp-list" {
+                        @for cred in creds {
+                            (totp_row(ctx, cred, mode, creds.len() == 1))
                         }
                     }
-                    None => {
-                        form id="form-totp-start"
-                             class="settings-row"
-                             method="post"
-                             action="/me/totp/start" {
-                            (csrf_input(ctx.csrf_token))
-                            div class="settings-row-label" {
-                                label { "Not set up" }
-                                p class="settings-row-hint" {
-                                    "Use Google Authenticator, 1Password, "
-                                    "Aegis, or similar. You'll scan a QR code "
-                                    "and confirm one code to turn it on. "
-                                    "We'll ask for your password first."
-                                }
-                            }
-                            div class="settings-row-control" {
-                                div class="settings-row-actions" {
-                                    button type="button" class="btn-secondary"
-                                           data-reauth-confirm="form-totp-start" {
-                                        "Set up"
-                                    }
-                                }
-                            }
+                }
+                @if at_max {
+                    p class="settings-row-hint" {
+                        "You've reached the maximum of "
+                        (auth::user_totp::MAX_AUTHENTICATORS)
+                        " authenticators."
+                    }
+                }
+                div class="settings-info" {
+                    span class="settings-info-icon" aria-hidden="true" {
+                        (info_icon())
+                    }
+                    div {
+                        h4 { "What are authenticators?" }
+                        p {
+                            "Authenticators provide a second factor of "
+                            "authentication (2FA) using temporary verification "
+                            "codes (TOTP). These codes are 6 digits and refresh "
+                            "every 30 seconds."
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// A single authenticator row, rendered per the active section `mode`.
+fn totp_row(
+    ctx: &ChromeContext,
+    cred: &auth::user_totp::TotpCredential,
+    mode: SectionMode,
+    is_last: bool,
+) -> Markup {
+    let id = cred.id;
+    match mode {
+        SectionMode::Renaming(target) if target == id => html! {
+            li class="totp-row totp-row-editing" {
+                form class="totp-rename-form"
+                     hx-post=(format!("/me/totp/{id}/rename"))
+                     hx-target="#totp-section"
+                     hx-swap="outerHTML" {
+                    (csrf_input(ctx.csrf_token))
+                    input type="text" name="label" value=(cred.label)
+                          maxlength="60" required autofocus
+                          class="totp-rename-input"
+                          aria-label="Authenticator name";
+                    div class="totp-row-actions" {
+                        button type="submit" class="btn-secondary" { "Save" }
+                        button type="button" class="btn-secondary"
+                               hx-get="/me/totp/section"
+                               hx-target="#totp-section" hx-swap="outerHTML" {
+                            "Cancel"
+                        }
+                    }
+                }
+            }
+        },
+        SectionMode::ConfirmDelete(target) if target == id => html! {
+            li class="totp-row totp-row-confirm" {
+                div class="totp-row-main" {
+                    span class="totp-row-name" { "Remove “" (cred.label) "”?" }
+                    span class="totp-row-meta" {
+                        @if is_last {
+                            "This is your last authenticator — removing it "
+                            "turns off two-factor sign-in."
+                        } @else {
+                            "You'll need to re-add it to use it again."
+                        }
+                    }
+                }
+                div class="totp-row-actions" {
+                    form hx-post=(format!("/me/totp/{id}/delete"))
+                         hx-target="#totp-section" hx-swap="outerHTML"
+                         style="display:contents" {
+                        (csrf_input(ctx.csrf_token))
+                        button type="submit" class="btn-danger" { "Remove" }
+                    }
+                    button type="button" class="btn-secondary"
+                           hx-get="/me/totp/section"
+                           hx-target="#totp-section" hx-swap="outerHTML" {
+                        "Cancel"
+                    }
+                }
+            }
+        },
+        _ => html! {
+            li class="totp-row" {
+                span class="totp-row-icon" aria-hidden="true" {
+                    (device_mobile_icon())
+                }
+                div class="totp-row-main" {
+                    span class="totp-row-name" { (cred.label) }
+                    span class="totp-row-meta" {
+                        "Added " (cred.created_at.format("%b %-d, %Y").to_string())
+                        @match cred.last_used_at {
+                            Some(used) => {
+                                " • Last used "
+                                (used.format("%b %-d, %Y").to_string())
+                            }
+                            None => { " • Never used" }
+                        }
+                    }
+                }
+                div class="totp-row-actions" {
+                    button type="button" class="icon-btn"
+                           aria-label="Rename authenticator"
+                           hx-get=(format!("/me/totp/{id}/edit"))
+                           hx-target="#totp-section" hx-swap="outerHTML" {
+                        (pencil_icon())
+                    }
+                    button type="button" class="icon-btn icon-btn-danger"
+                           aria-label="Remove authenticator"
+                           hx-get=(format!("/me/totp/{id}/confirm-delete"))
+                           hx-target="#totp-section" hx-swap="outerHTML" {
+                        (trash_icon())
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Fingerprint glyph — leads the Passkeys section + each passkey row.
+/// Proper concentric-ridge fingerprint (Lucide-style), matching the
+/// other icons' stroke conventions.
+fn fingerprint_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4" {}
+            path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2" {}
+            path d="M17.29 21.02c.12-.6.43-2.3.5-3.02" {}
+            path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4" {}
+            path d="M8.65 22c.21-.66.45-1.32.57-2" {}
+            path d="M14 13.12c0 2.38 0 6.38-1 8.88" {}
+            path d="M2 16h.01" {}
+            path d="M21.8 16c.2-2 .131-5.354 0-6" {}
+            path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2" {}
+        }
+    }
+}
+
+/// The "Passkeys" island — HTMX-swappable `#passkey-section` mirroring the
+/// authenticators section. Lists enrolled passkeys with rename/remove, a
+/// reauth-chained "Add passkey" button (when WebAuthn is configurable),
+/// and an explainer card. `available` is false when the RP can't be built
+/// (e.g. a bare-IP base URL) — then we explain instead of offering enroll.
+pub fn passkey_credentials_section(
+    ctx: &ChromeContext,
+    creds: &[hearth::webauthn::WebauthnCredentialRow],
+    mode: SectionMode,
+    available: bool,
+    oob: bool,
+) -> Markup {
+    let at_max = creds.len() as i64 >= hearth::webauthn::MAX_PASSKEYS;
+    let oob_attr = oob.then_some("true");
+    html! {
+        section id="passkey-section" class="settings-section" hx-swap-oob=[oob_attr] {
+            div class="settings-section-header settings-section-header-actions" {
+                div class="settings-section-heading" {
+                    span class="settings-section-icon" aria-hidden="true" {
+                        (fingerprint_icon())
+                    }
+                    div {
+                        h3 { "Registered Passkeys" }
+                        p class="settings-section-tagline" {
+                            "Passwordless authentication using biometrics "
+                            "or security keys."
+                        }
+                    }
+                }
+                @if available {
+                    form id="form-passkey-start" method="post" action="/me/passkey/start"
+                         style="display:contents" {
+                        (csrf_input(ctx.csrf_token))
+                        button type="button" class="btn-secondary"
+                               data-reauth-confirm="form-passkey-start"
+                               data-keep-source-open
+                               disabled[at_max] {
+                            (fingerprint_icon())
+                            span { "Add passkey" }
+                        }
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                @if !available {
+                    p class="settings-row-hint" {
+                        "Passkeys need this site to be reached over https or "
+                        "at a hostname like localhost (not a bare IP "
+                        "address). Set HEARTH_PUBLIC_BASE_URL accordingly to "
+                        "enable them."
+                    }
+                } @else {
+                    @if creds.is_empty() {
+                        p class="settings-row-hint totp-empty" {
+                            "No passkeys yet. Add one for passwordless, "
+                            "phishing-resistant sign-in."
+                        }
+                    } @else {
+                        ul class="totp-list" {
+                            @for cred in creds {
+                                (passkey_row(ctx, cred, mode, creds.len() == 1))
+                            }
+                        }
+                    }
+                    @if at_max {
+                        p class="settings-row-hint" {
+                            "You've reached the maximum of "
+                            (hearth::webauthn::MAX_PASSKEYS)
+                            " passkeys."
+                        }
+                    }
+                }
+                div class="settings-info" {
+                    span class="settings-info-icon" aria-hidden="true" {
+                        (info_icon())
+                    }
+                    div {
+                        h4 { "What are passkeys?" }
+                        p {
+                            "Passkeys let you sign in with your device's "
+                            "fingerprint, face, screen lock, or a security "
+                            "key instead of (or on top of) a password. "
+                            "They can't be phished or reused across sites."
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn passkey_row(
+    ctx: &ChromeContext,
+    cred: &hearth::webauthn::WebauthnCredentialRow,
+    mode: SectionMode,
+    is_last: bool,
+) -> Markup {
+    let id = cred.id;
+    match mode {
+        SectionMode::Renaming(target) if target == id => html! {
+            li class="totp-row totp-row-editing" {
+                form class="totp-rename-form"
+                     hx-post=(format!("/me/passkey/{id}/rename"))
+                     hx-target="#passkey-section"
+                     hx-swap="outerHTML" {
+                    (csrf_input(ctx.csrf_token))
+                    input type="text" name="label" value=(cred.label)
+                          maxlength="60" required autofocus
+                          class="totp-rename-input"
+                          aria-label="Passkey name";
+                    div class="totp-row-actions" {
+                        button type="submit" class="btn-secondary" { "Save" }
+                        button type="button" class="btn-secondary"
+                               hx-get="/me/passkey/section"
+                               hx-target="#passkey-section" hx-swap="outerHTML" {
+                            "Cancel"
+                        }
+                    }
+                }
+            }
+        },
+        SectionMode::ConfirmDelete(target) if target == id => html! {
+            li class="totp-row totp-row-confirm" {
+                div class="totp-row-main" {
+                    span class="totp-row-name" { "Remove “" (cred.label) "”?" }
+                    span class="totp-row-meta" {
+                        @if is_last {
+                            "This is your last passkey."
+                        } @else {
+                            "You'll need to re-add it to use it again."
+                        }
+                    }
+                }
+                div class="totp-row-actions" {
+                    form hx-post=(format!("/me/passkey/{id}/delete"))
+                         hx-target="#passkey-section" hx-swap="outerHTML"
+                         style="display:contents" {
+                        (csrf_input(ctx.csrf_token))
+                        button type="submit" class="btn-danger" { "Remove" }
+                    }
+                    button type="button" class="btn-secondary"
+                           hx-get="/me/passkey/section"
+                           hx-target="#passkey-section" hx-swap="outerHTML" {
+                        "Cancel"
+                    }
+                }
+            }
+        },
+        _ => html! {
+            li class="totp-row" {
+                span class="totp-row-icon" aria-hidden="true" {
+                    (fingerprint_icon())
+                }
+                div class="totp-row-main" {
+                    span class="totp-row-name" { (cred.label) }
+                    span class="totp-row-meta" {
+                        "Added " (cred.created_at.format("%b %-d, %Y").to_string())
+                        @match cred.last_used_at {
+                            Some(used) => {
+                                " • Last used "
+                                (used.format("%b %-d, %Y").to_string())
+                            }
+                            None => { " • Never used" }
+                        }
+                    }
+                }
+                div class="totp-row-actions" {
+                    button type="button" class="icon-btn"
+                           aria-label="Rename passkey"
+                           hx-get=(format!("/me/passkey/{id}/edit"))
+                           hx-target="#passkey-section" hx-swap="outerHTML" {
+                        (pencil_icon())
+                    }
+                    button type="button" class="icon-btn icon-btn-danger"
+                           aria-label="Remove passkey"
+                           hx-get=(format!("/me/passkey/{id}/confirm-delete"))
+                           hx-target="#passkey-section" hx-swap="outerHTML" {
+                        (trash_icon())
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Passkey enrollment fragment, swapped into the reauth modal after a
+/// reauthenticated `POST /me/passkey/start`. Embeds the WebAuthn creation
+/// options (JSON) + the challenge id; `WEBAUTHN_JS` runs the
+/// `navigator.credentials.create` ceremony on "Create passkey", fills the
+/// hidden credential field, and submits to finish.
+pub fn passkey_enroll_modal_content(
+    options_json: &str,
+    challenge_id: uuid::Uuid,
+    csrf_token: &str,
+) -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon" { (fingerprint_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Add a passkey" }
+        p class="dialog-description dialog-center-text" {
+            "Name it, then follow your browser's prompt to create the "
+            "passkey with your fingerprint, face, screen lock, or security "
+            "key."
+        }
+        script type="application/json" id="passkey-options" {
+            (maud::PreEscaped(options_json.to_string()))
+        }
+        form id="form-passkey-finish"
+             hx-post="/me/passkey/finish"
+             hx-target="#reauth-modal-content"
+             hx-swap="innerHTML" {
+            (csrf_input(csrf_token))
+            input type="hidden" name="challenge_id" value=(challenge_id.to_string());
+            input type="hidden" name="credential" id="passkey-credential";
+            div class="field" {
+                label for="passkey-label" { "Name" }
+                input type="text" name="label" id="passkey-label"
+                      value="Passkey" maxlength="60" required
+                      autocomplete="off"
+                      placeholder="e.g. MacBook Touch ID, YubiKey";
+            }
+            p class="error" id="passkey-error" hidden {}
+            div class="dialog-actions" {
+                button type="button" class="btn" data-passkey-create {
+                    "Create passkey"
+                }
+            }
+        }
+    }
+}
+
+/// Shown once a passkey is registered (swapped into the reauth modal).
+pub fn passkey_enrolled_success_content() -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-icon-success" {
+                (check_circle_icon())
+            }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Passkey added" }
+        p class="dialog-description dialog-center-text" {
+            "You can use this passkey to sign in. If you ever lose access "
+            "to it, use another passkey, an authenticator code, or your "
+            "recovery code."
+        }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog {
+                "Done"
+            }
+        }
+    }
+}
+
+/// Generic error fragment for the reauth modal slot (e.g. a passkey
+/// ceremony that failed server-side). Centered, with a close button.
+pub fn passkey_error_content(message: &str) -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-alert" { (alert_circle_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Couldn't add passkey" }
+        p class="dialog-description dialog-center-text" { (message) }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog { "Close" }
+        }
+    }
+}
+
+/// Shown when a user tries to add a passkey past the cap (near-impossible
+/// — the Add button disables at the limit).
+pub fn passkey_limit_reached_content() -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon" { (fingerprint_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Passkey limit reached" }
+        p class="dialog-description dialog-center-text" {
+            "You already have the maximum number of passkeys. Remove one "
+            "before adding another."
+        }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog { "Close" }
         }
     }
 }
@@ -2064,19 +2642,25 @@ pub fn recovery_code_modal_content(recovery_code: &str) -> Markup {
 /// side as SVG) plus a copyable manual key, and a confirm-code form that
 /// HTMX-posts back into the same modal slot. `error` re-renders inline
 /// when the confirmation code didn't match.
-pub fn totp_enroll_modal_content(qr_svg: &str, secret_b32: &str, csrf_token: &str, error: Option<&str>) -> Markup {
+pub fn totp_enroll_modal_content(
+    qr_svg: &str,
+    secret_b32: &str,
+    cred_id: uuid::Uuid,
+    csrf_token: &str,
+    error: Option<&str>,
+) -> Markup {
     html! {
         div class="dialog-header" {
-            div class="dialog-icon" { (key_icon()) }
+            div class="dialog-icon" { (device_mobile_icon()) }
             button type="button" class="dialog-close" data-close-dialog
                    aria-label="Close" {
                 (close_icon())
             }
         }
-        h2 class="dialog-center-title" { "Set up your authenticator" }
+        h2 class="dialog-center-title" { "Add an authenticator" }
         p class="dialog-description dialog-center-text" {
-            "Scan this with your authenticator app, then enter the "
-            "6-digit code it shows to finish."
+            "Scan this with your authenticator app, name it, then enter "
+            "the 6-digit code it shows to finish."
         }
         div class="totp-qr" aria-hidden="true" {
             (maud::PreEscaped(qr_svg.to_string()))
@@ -2103,17 +2687,25 @@ pub fn totp_enroll_modal_content(qr_svg: &str, secret_b32: &str, csrf_token: &st
              hx-target="#reauth-modal-content"
              hx-swap="innerHTML" {
             (csrf_input(csrf_token))
+            input type="hidden" name="cred_id" value=(cred_id.to_string());
             @if let Some(msg) = error {
                 p class="error" { (msg) }
+            }
+            div class="field" {
+                label for="totp-label" { "Name" }
+                input type="text" name="label" id="totp-label"
+                      value="Authenticator" maxlength="60" required
+                      autocomplete="off"
+                      placeholder="e.g. 1Password, Ente Auth";
             }
             div class="field" {
                 label for="totp-confirm-code" { "6-digit code" }
                 input type="text" name="code" id="totp-confirm-code"
                       inputmode="numeric" autocomplete="one-time-code"
-                      pattern="[0-9]*" maxlength="6" required autofocus;
+                      pattern="[0-9]*" maxlength="6" required;
             }
             div class="dialog-actions" {
-                button type="submit" class="btn" { "Turn on two-factor" }
+                button type="submit" class="btn" { "Add authenticator" }
             }
         }
     }
@@ -2132,15 +2724,40 @@ pub fn totp_enrolled_success_content() -> Markup {
                 (close_icon())
             }
         }
-        h2 class="dialog-center-title" { "Two-factor is on" }
+        h2 class="dialog-center-title" { "Authenticator added" }
         p class="dialog-description dialog-center-text" {
-            "You'll enter a code from your authenticator app the next "
-            "time you sign in. If you ever lose the app, use your "
-            "recovery code to get back in, then re-enroll."
+            "You'll enter a code from one of your authenticators the next "
+            "time you sign in. If you ever lose access, use your recovery "
+            "code to get back in."
         }
         div class="dialog-actions" {
             button type="button" class="btn" data-close-dialog {
                 "Done"
+            }
+        }
+    }
+}
+
+/// Shown when a user tries to add an authenticator past the cap. Only
+/// reachable by a direct POST (the Add button disables itself at the
+/// limit).
+pub fn totp_limit_reached_content() -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon" { (device_mobile_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Authenticator limit reached" }
+        p class="dialog-description dialog-center-text" {
+            "You already have the maximum number of authenticators. Remove "
+            "one before adding another."
+        }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog {
+                "Close"
             }
         }
     }
@@ -3596,6 +4213,7 @@ const REAUTH_CHAIN_JS: &str = r#"
         var actionUrl = sourceForm.getAttribute('action') || '';
         var sourceDialog = btn.closest('dialog');
         var keepSource = btn.hasAttribute('data-keep-source');
+        var keepSourceOpen = btn.hasAttribute('data-keep-source-open');
         window.hearthEnsureModal('dlg-reauth', '/modals/reauth').then(function(reauthDialog) {
             var reauthContent = document.getElementById('reauth-modal-content');
             var reauthForm = reauthContent ? reauthContent.querySelector('form') : null;
@@ -3628,7 +4246,12 @@ const REAUTH_CHAIN_JS: &str = r#"
             if (pwInput) pwInput.value = '';
 
             // Dispose of the source dialog now that its payload is
-            // staged into the reauth form. Two modes:
+            // staged into the reauth form. Three modes:
+            //   • `data-keep-source-open` (authenticator add): leave the
+            //     source modal *open* behind the reauth modal. The action
+            //     response refreshes a piece of it live via hx-swap-oob
+            //     (the authenticators list), so closing reauth reveals an
+            //     already-updated settings modal — no reopen needed.
             //   • `data-keep-source` (invite): the source must survive
             //     because the success partial gets HX-Retargeted back
             //     into it. Close it (chainTransition flag stops
@@ -3637,7 +4260,9 @@ const REAUTH_CHAIN_JS: &str = r#"
             //   • default (per-row actions): remove it outright; the
             //     reauth form is now the source of truth.
             if (sourceDialog) {
-                if (keepSource) {
+                if (keepSourceOpen) {
+                    // intentionally left open
+                } else if (keepSource) {
                     sourceDialog.dataset.chainTransition = '1';
                     if (typeof sourceDialog.close === 'function') sourceDialog.close();
                 } else {
@@ -4847,11 +5472,6 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
             ToastKind::Success,
             "Password changed",
             "Your password has been updated. Other devices were signed out.".to_string(),
-        ),
-        "totp_disabled" => (
-            ToastKind::Info,
-            "Two-factor turned off",
-            "Authenticator codes are no longer required to sign in.".to_string(),
         ),
 
         _ => return None,

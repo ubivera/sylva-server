@@ -62,7 +62,10 @@ const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_FILTER: &str = "info,hearth=debug";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_POSTGRES_URL: &str = "postgresql://hearth@127.0.0.1:15432/hearth";
-const DEFAULT_PUBLIC_BASE_URL: &str = "http://127.0.0.1:8443";
+// `localhost` (not a bare `127.0.0.1`) so WebAuthn/passkeys work in dev:
+// webauthn-rs requires the RP origin to have a domain, and an IP literal
+// has none. localhost still resolves to the loopback listener.
+const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:8443";
 const DEFAULT_INSTANCE_NAME: &str = "Hearth";
 const DEFAULT_NOTIFICATIONS_MODE: &str = "disabled";
 const DEFAULT_SMTP_PORT: u16 = 587;

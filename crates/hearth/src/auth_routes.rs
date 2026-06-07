@@ -178,30 +178,33 @@ pub async fn login_verify(
         }
     };
 
-    // TOTP code (primary).
+    // TOTP code (primary). Try every enrolled authenticator.
     if let Some(code) = req.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        let secret = match auth::user_totp::load_verified_secret(
+        let secrets = match auth::user_totp::verified_secrets(
             &state.db,
             &state.secret_key,
             user_id,
         )
         .await
         {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse { error: "mfa_token_invalid" }),
-                )
-                    .into_response();
-            }
+            Ok(s) => s,
             Err(err) => {
-                tracing::error!(?err, "login_verify: load secret");
+                tracing::error!(?err, "login_verify: load secrets");
                 return internal_error().into_response();
             }
         };
-        if auth::totp::verify_code(&secret, code, now) {
-            return finish_mfa_session(&state, user, "totp").await;
+        if secrets.is_empty() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse { error: "mfa_token_invalid" }),
+            )
+                .into_response();
+        }
+        if let Some((cred_id, _)) = secrets
+            .iter()
+            .find(|(_, secret)| auth::totp::verify_code(secret, code, now))
+        {
+            return finish_mfa_session(&state, user, "totp", Some(*cred_id)).await;
         }
         state.rate_limiter.record_failure(&rl_key);
         return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid_code" }))
@@ -223,7 +226,7 @@ pub async fn login_verify(
             }
         };
         if ok {
-            return finish_mfa_session(&state, user, "recovery_code").await;
+            return finish_mfa_session(&state, user, "recovery_code", None).await;
         }
         state.rate_limiter.record_failure(&rl_key);
         return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid_code" }))
@@ -244,8 +247,13 @@ async fn verify_recovery_code(
     Ok(ok)
 }
 
-async fn finish_mfa_session(state: &AppState, user: User, factor: &str) -> Response {
-    match issue_session_with_mfa(state, user, Some(factor)).await {
+async fn finish_mfa_session(
+    state: &AppState,
+    user: User,
+    factor: &str,
+    totp_cred: Option<Uuid>,
+) -> Response {
+    match issue_session_with_mfa(state, user, Some(factor), totp_cred).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(err) => {
             tracing::error!(?err, "login_verify: issue session");
@@ -255,7 +263,7 @@ async fn finish_mfa_session(state: &AppState, user: User, factor: &str) -> Respo
 }
 
 async fn issue_session(state: &AppState, user: User) -> anyhow::Result<LoginResponse> {
-    issue_session_with_mfa(state, user, None).await
+    issue_session_with_mfa(state, user, None, None).await
 }
 
 /// Issue a session, recording in the audit event which second factor (if
@@ -265,13 +273,14 @@ async fn issue_session_with_mfa(
     state: &AppState,
     user: User,
     mfa: Option<&str>,
+    totp_cred: Option<Uuid>,
 ) -> anyhow::Result<LoginResponse> {
     let mut tx = state.db.begin().await?;
     let (session, token) =
         SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
 
-    if mfa == Some("totp") {
-        auth::user_totp::stamp_used(&mut tx, user.id).await?;
+    if let Some(cred_id) = totp_cred {
+        auth::user_totp::stamp_used(&mut tx, cred_id).await?;
     }
 
     let mut data = serde_json::json!({

@@ -258,7 +258,7 @@ async fn outbox_subject_contains_inviter_name_and_role() {
     assert!(body_text.contains("Admin"), "body was: {body_text}");
     // Accept URL embeds the base_url + token.
     assert!(
-        body_text.contains("http://127.0.0.1:8443/invite/"),
+        body_text.contains("http://localhost:8443/invite/"),
         "body should contain accept URL: {body_text}"
     );
 }

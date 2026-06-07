@@ -357,14 +357,22 @@ pub async fn account_settings_modal(
             tracing::warn!(?err, "loading recovery-code metadata for settings modal");
             None
         });
-    // TOTP enrollment metadata drives the Security tab's Two-factor
-    // section ("on since …" vs "set up"). Degrade to "not set up" on error.
-    let totp_meta = auth::user_totp::metadata(&state.db, auth.user.id)
+    // The user's authenticators drive the Security tab's "Registered
+    // Authenticators" list. Degrade to empty on error rather than failing
+    // the whole modal.
+    let totp_creds = auth::user_totp::list_verified(&state.db, auth.user.id)
         .await
         .unwrap_or_else(|err| {
-            tracing::warn!(?err, "loading TOTP metadata for settings modal");
-            None
+            tracing::warn!(?err, "loading TOTP credentials for settings modal");
+            Vec::new()
         });
+    let passkey_creds = hearth::webauthn::list(&state.db, auth.user.id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "loading passkeys for settings modal");
+            Vec::new()
+        });
+    let passkey_available = hearth::webauthn::available(&state);
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -372,8 +380,14 @@ pub async fn account_settings_modal(
         pending_count: None,
     };
     Html(
-        views::account_settings_modal(&ctx, recovery_meta.as_ref(), totp_meta.as_ref())
-            .into_string(),
+        views::account_settings_modal(
+            &ctx,
+            recovery_meta.as_ref(),
+            &totp_creds,
+            &passkey_creds,
+            passkey_available,
+        )
+        .into_string(),
     )
     .into_response()
 }
@@ -860,10 +874,63 @@ fn render_qr_svg(data: &str) -> String {
     }
 }
 
-/// `POST /me/totp/start` — begin authenticator enrollment. Reauth-gated:
-/// the Security-tab "Set up" button chains through `dlg-reauth` for the
-/// password. Generates a secret, stores it encrypted + unverified, and
-/// swaps the QR + confirm-code fragment into the reauth modal.
+/// Build the enrollment QR fragment for a freshly-generated (or being-
+/// retried) secret + its pending credential id.
+fn totp_enroll_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    secret: &[u8],
+    cred_id: uuid::Uuid,
+    error: Option<&str>,
+) -> Response {
+    let secret_b32 = auth::totp::base32_encode(secret);
+    let uri = auth::totp::otpauth_uri(&state.instance_name, &auth.user.email, &secret_b32);
+    let qr = render_qr_svg(&uri);
+    let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    Html(views::totp_enroll_modal_content(&qr, &secret_b32, cred_id, &csrf, error).into_string())
+        .into_response()
+}
+
+/// Render the authenticators island (`#totp-section`) in a given mode —
+/// the response for refresh / edit / rename / delete HTMX swaps.
+async fn totp_section_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    mode: views::SectionMode,
+) -> Response {
+    let creds = match auth::user_totp::list_verified(&state.db, auth.user.id).await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(?err, "totp section: list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::totp_authenticators_section(&ctx, &creds, mode, false).into_string())
+        .into_response()
+}
+
+/// Trim + clamp a user-supplied authenticator label, defaulting to
+/// "Authenticator" when blank.
+fn clean_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "Authenticator".to_string()
+    } else {
+        trimmed.chars().take(60).collect()
+    }
+}
+
+/// `POST /me/totp/start` — begin enrollment of a new authenticator.
+/// Reauth-gated (the "Add Authenticator" button chains through
+/// `dlg-reauth`). Generates a secret, stores it encrypted + unverified,
+/// and swaps the QR + name + confirm-code fragment into the reauth modal.
 pub async fn me_totp_start(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
@@ -894,37 +961,48 @@ pub async fn me_totp_start(
         );
     }
 
-    let secret = auth::totp::generate_secret();
-    let stored: anyhow::Result<()> = async {
-        let mut tx = state.db.begin().await?;
-        auth::user_totp::start_enrollment(&mut tx, &state.secret_key, auth.user.id, &secret).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-    .await;
-    if let Err(err) = stored {
-        tracing::error!(?err, "totp_start: store secret");
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    match auth::user_totp::count_verified(&state.db, auth.user.id).await {
+        Ok(n) if n >= auth::user_totp::MAX_AUTHENTICATORS => {
+            return Html(views::totp_limit_reached_content().into_string()).into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(?err, "totp_start: count");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
     }
 
-    let secret_b32 = auth::totp::base32_encode(&secret);
-    let uri = auth::totp::otpauth_uri(&state.instance_name, &auth.user.email, &secret_b32);
-    let qr = render_qr_svg(&uri);
-    let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
-    Html(views::totp_enroll_modal_content(&qr, &secret_b32, &csrf, None).into_string())
-        .into_response()
+    let secret = auth::totp::generate_secret();
+    let stored: anyhow::Result<uuid::Uuid> = async {
+        let mut tx = state.db.begin().await?;
+        let id =
+            auth::user_totp::start_enrollment(&mut tx, &state.secret_key, auth.user.id, &secret)
+                .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+    .await;
+    match stored {
+        Ok(cred_id) => totp_enroll_response(&state, &auth, &secret, cred_id, None),
+        Err(err) => {
+            tracing::error!(?err, "totp_start: store secret");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
 }
 
 #[derive(Deserialize)]
 pub struct MeTotpConfirmForm {
     pub csrf_token: String,
+    pub cred_id: uuid::Uuid,
+    pub label: String,
     pub code: String,
 }
 
-/// `POST /me/totp/confirm` — finish enrollment by proving a code from the
-/// app. Already reauthenticated at `/me/totp/start`, so no password here.
-/// Marks the secret verified; on a wrong code, re-renders the QR
-/// fragment with an inline error.
+/// `POST /me/totp/confirm` — finish enrollment of the in-progress
+/// credential by proving a code. Already reauthenticated at `start`, so
+/// no password here. Sets the label + marks verified; on a wrong code,
+/// re-renders the QR fragment with an inline error.
 pub async fn me_totp_confirm(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
@@ -934,11 +1012,16 @@ pub async fn me_totp_confirm(
         return resp;
     }
 
-    let secret = match auth::user_totp::load_secret(&state.db, &state.secret_key, auth.user.id).await
+    let secret = match auth::user_totp::load_pending_secret(
+        &state.db,
+        &state.secret_key,
+        auth.user.id,
+        form.cred_id,
+    )
+    .await
     {
         Ok(Some(s)) => s,
-        // No enrollment in progress (e.g. it was confirmed/cleared in
-        // another tab). Bounce out and let them start over.
+        // No matching in-progress enrollment — restart.
         Ok(None) => return redirect_to_me_with_error(true, "totp_setup_expired"),
         Err(err) => {
             tracing::error!(?err, "totp_confirm: load secret");
@@ -948,35 +1031,29 @@ pub async fn me_totp_confirm(
 
     let now = chrono::Utc::now().timestamp();
     if !auth::totp::verify_code(&secret, form.code.trim(), now) {
-        let secret_b32 = auth::totp::base32_encode(&secret);
-        let uri = auth::totp::otpauth_uri(&state.instance_name, &auth.user.email, &secret_b32);
-        let qr = render_qr_svg(&uri);
-        let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
-        return Html(
-            views::totp_enroll_modal_content(
-                &qr,
-                &secret_b32,
-                &csrf,
-                Some("That code didn't match. Try again."),
-            )
-            .into_string(),
-        )
-        .into_response();
+        return totp_enroll_response(
+            &state,
+            &auth,
+            &secret,
+            form.cred_id,
+            Some("That code didn't match. Try again."),
+        );
     }
 
+    let label = clean_label(&form.label);
     let actor = audit::Actor {
         user_id: auth.user.id,
         display_name: auth.user.display_name.clone(),
     };
     let result: anyhow::Result<()> = async {
         let mut tx = state.db.begin().await?;
-        auth::user_totp::confirm(&mut tx, auth.user.id).await?;
+        auth::user_totp::confirm(&mut tx, auth.user.id, form.cred_id, &label).await?;
         audit::append(
             &mut tx,
             Some(&actor),
             None,
             "totp_enrolled",
-            serde_json::json!({}),
+            serde_json::json!({ "credential_id": form.cred_id }),
         )
         .await?;
         tx.commit().await?;
@@ -985,7 +1062,33 @@ pub async fn me_totp_confirm(
     .await;
 
     match result {
-        Ok(()) => Html(views::totp_enrolled_success_content().into_string()).into_response(),
+        Ok(()) => {
+            // Success content for the reauth modal, plus an out-of-band
+            // refresh of the authenticators list inside the still-open
+            // settings modal (it was kept open via data-keep-source-open).
+            let creds = auth::user_totp::list_verified(&state.db, auth.user.id)
+                .await
+                .unwrap_or_default();
+            let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
+            let ctx = views::ChromeContext {
+                instance_name: &state.instance_name,
+                user: &auth.user,
+                csrf_token: &csrf,
+                pending_count: None,
+            };
+            let oob = views::totp_authenticators_section(
+                &ctx,
+                &creds,
+                views::SectionMode::Normal,
+                /* oob = */ true,
+            );
+            Html(format!(
+                "{}{}",
+                views::totp_enrolled_success_content().into_string(),
+                oob.into_string(),
+            ))
+            .into_response()
+        }
         Err(err) => {
             tracing::error!(?err, "totp_confirm: confirm");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
@@ -993,8 +1096,146 @@ pub async fn me_totp_confirm(
     }
 }
 
-/// `POST /me/totp/disable` — turn off the authenticator. Reauth-gated.
-pub async fn me_totp_disable(
+/// `GET /me/totp/section` — re-render the authenticators island (used by
+/// rename/delete "Cancel").
+pub async fn me_totp_section(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    totp_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `GET /me/totp/{id}/edit` — render the island with one row in rename mode.
+pub async fn me_totp_edit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+) -> Response {
+    totp_section_response(&state, &auth, views::SectionMode::Renaming(cred_id)).await
+}
+
+#[derive(Deserialize)]
+pub struct MeTotpRenameForm {
+    pub csrf_token: String,
+    pub label: String,
+}
+
+/// `POST /me/totp/{id}/rename` — rename an authenticator (no reauth; a
+/// label change isn't security-sensitive). Returns the refreshed island.
+pub async fn me_totp_rename(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<MeTotpRenameForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let label = clean_label(&form.label);
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        auth::user_totp::rename(&mut tx, auth.user.id, cred_id, &label).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        tracing::error!(?err, "totp_rename");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    totp_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `GET /me/totp/{id}/confirm-delete` — render the island with one row in
+/// delete-confirm mode.
+pub async fn me_totp_confirm_delete(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+) -> Response {
+    totp_section_response(&state, &auth, views::SectionMode::ConfirmDelete(cred_id)).await
+}
+
+#[derive(Deserialize)]
+pub struct MeTotpDeleteForm {
+    pub csrf_token: String,
+}
+
+/// `POST /me/totp/{id}/delete` — remove one authenticator. Returns the
+/// refreshed island.
+pub async fn me_totp_delete(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<MeTotpDeleteForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<bool> = async {
+        let mut tx = state.db.begin().await?;
+        let removed = auth::user_totp::delete(&mut tx, auth.user.id, cred_id).await?;
+        if removed {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "totp_removed",
+                serde_json::json!({ "credential_id": cred_id }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+    .await;
+    if let Err(err) = result {
+        tracing::error!(?err, "totp_delete");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    totp_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /me/passkey/* — WebAuthn passkey enrollment + management
+// ────────────────────────────────────────────────────────────────────────
+
+/// Render the passkeys island (`#passkey-section`) in a given mode.
+async fn passkey_section_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    mode: views::SectionMode,
+) -> Response {
+    let creds = match hearth::webauthn::list(&state.db, auth.user.id).await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(?err, "passkey section: list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    let available = hearth::webauthn::available(state);
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(
+        views::passkey_credentials_section(&ctx, &creds, mode, available, false).into_string(),
+    )
+    .into_response()
+}
+
+/// `POST /me/passkey/start` — begin passkey enrollment. Reauth-gated +
+/// keep-source-open (like the authenticator add). Starts the WebAuthn
+/// registration ceremony and swaps the create-credential fragment into
+/// the reauth modal.
+pub async fn me_passkey_start(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
     headers: axum::http::HeaderMap,
@@ -1009,7 +1250,7 @@ pub async fn me_totp_disable(
     {
         Ok(ok) => ok,
         Err(err) => {
-            tracing::error!(?err, "totp_disable: verify password");
+            tracing::error!(?err, "passkey_start: verify password");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
@@ -1018,39 +1259,212 @@ pub async fn me_totp_disable(
             &state,
             auth.session_id,
             &auth.user,
-            "/me/totp/disable",
+            "/me/passkey/start",
             &[],
             htmx,
         );
     }
 
+    match hearth::webauthn::count(&state.db, auth.user.id).await {
+        Ok(n) if n >= hearth::webauthn::MAX_PASSKEYS => {
+            return Html(views::passkey_limit_reached_content().into_string()).into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(?err, "passkey_start: count");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    }
+
+    match hearth::webauthn::start_registration(&state, &auth.user).await {
+        Ok((challenge_id, options)) => {
+            let options_json = serde_json::to_string(&options).unwrap_or_else(|_| "{}".to_string());
+            let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
+            Html(
+                views::passkey_enroll_modal_content(&options_json, challenge_id, &csrf)
+                    .into_string(),
+            )
+            .into_response()
+        }
+        Err(err) => {
+            tracing::error!(?err, "passkey_start: begin registration");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MePasskeyFinishForm {
+    pub csrf_token: String,
+    pub challenge_id: uuid::Uuid,
+    pub label: String,
+    pub credential: String,
+}
+
+/// `POST /me/passkey/finish` — complete enrollment with the browser's
+/// credential. Success swaps a confirmation into the reauth modal + an
+/// out-of-band refresh of the passkeys list (settings stayed open).
+pub async fn me_passkey_finish(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<MePasskeyFinishForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let label = clean_label(&form.label);
+    match hearth::webauthn::finish_registration(
+        &state,
+        &auth.user,
+        form.challenge_id,
+        &label,
+        &form.credential,
+    )
+    .await
+    {
+        Ok(()) => {
+            let actor = audit::Actor {
+                user_id: auth.user.id,
+                display_name: auth.user.display_name.clone(),
+            };
+            let logged: anyhow::Result<()> = async {
+                let mut tx = state.db.begin().await?;
+                audit::append(
+                    &mut tx,
+                    Some(&actor),
+                    None,
+                    "passkey_registered",
+                    serde_json::json!({}),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+            if let Err(err) = logged {
+                tracing::error!(?err, "passkey_finish: audit");
+            }
+
+            let creds = hearth::webauthn::list(&state.db, auth.user.id)
+                .await
+                .unwrap_or_default();
+            let available = hearth::webauthn::available(&state);
+            let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
+            let ctx = views::ChromeContext {
+                instance_name: &state.instance_name,
+                user: &auth.user,
+                csrf_token: &csrf,
+                pending_count: None,
+            };
+            let oob = views::passkey_credentials_section(
+                &ctx,
+                &creds,
+                views::SectionMode::Normal,
+                available,
+                /* oob = */ true,
+            );
+            Html(format!(
+                "{}{}",
+                views::passkey_enrolled_success_content().into_string(),
+                oob.into_string(),
+            ))
+            .into_response()
+        }
+        Err(err) => {
+            tracing::warn!(?err, "passkey_finish: registration rejected");
+            // Re-render the reauth modal slot with a retryable error.
+            Html(
+                views::passkey_error_content(
+                    "We couldn't register that passkey. Please try again.",
+                )
+                .into_string(),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /me/passkey/section` — re-render the passkeys island.
+pub async fn me_passkey_section(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    passkey_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `GET /me/passkey/{id}/edit` — island with one row in rename mode.
+pub async fn me_passkey_edit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+) -> Response {
+    passkey_section_response(&state, &auth, views::SectionMode::Renaming(cred_id)).await
+}
+
+/// `POST /me/passkey/{id}/rename` — rename a passkey (no reauth).
+pub async fn me_passkey_rename(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<MeTotpRenameForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let label = clean_label(&form.label);
+    if let Err(err) = hearth::webauthn::rename(&state.db, auth.user.id, cred_id, &label).await {
+        tracing::error!(?err, "passkey_rename");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    passkey_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `GET /me/passkey/{id}/confirm-delete` — island with one row in
+/// delete-confirm mode.
+pub async fn me_passkey_confirm_delete(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+) -> Response {
+    passkey_section_response(&state, &auth, views::SectionMode::ConfirmDelete(cred_id)).await
+}
+
+/// `POST /me/passkey/{id}/delete` — remove one passkey.
+pub async fn me_passkey_delete(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<MeTotpDeleteForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
     let actor = audit::Actor {
         user_id: auth.user.id,
         display_name: auth.user.display_name.clone(),
     };
     let result: anyhow::Result<()> = async {
-        let mut tx = state.db.begin().await?;
-        auth::user_totp::disable(&mut tx, auth.user.id).await?;
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "totp_disabled",
-            serde_json::json!({}),
-        )
-        .await?;
-        tx.commit().await?;
+        let removed = hearth::webauthn::delete(&state.db, auth.user.id, cred_id).await?;
+        if removed {
+            let mut tx = state.db.begin().await?;
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "passkey_removed",
+                serde_json::json!({ "credential_id": cred_id }),
+            )
+            .await?;
+            tx.commit().await?;
+        }
         Ok(())
     }
     .await;
-
-    match result {
-        Ok(()) => redirect_to_me_with_action(htmx, "totp_disabled"),
-        Err(err) => {
-            tracing::error!(?err, "totp_disable");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-        }
+    if let Err(err) = result {
+        tracing::error!(?err, "passkey_delete");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
+    passkey_section_response(&state, &auth, views::SectionMode::Normal).await
 }
 
 /// Build the "wrong password" response for an account-settings reauth
@@ -1754,25 +2168,32 @@ pub async fn login_verify_submit(
         }
     };
 
-    // TOTP code path (primary).
+    // TOTP code path (primary). Try the code against every enrolled
+    // authenticator until one accepts it.
     if let Some(code) = form.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        let secret = match auth::user_totp::load_verified_secret(
+        let secrets = match auth::user_totp::verified_secrets(
             &state.db,
             &state.secret_key,
             user_id,
         )
         .await
         {
-            Ok(Some(s)) => s,
-            // No verified TOTP → the pending state is stale; restart.
-            Ok(None) => return Redirect::to("/login").into_response(),
+            Ok(s) => s,
             Err(err) => {
-                tracing::error!(?err, "login_verify: load secret");
+                tracing::error!(?err, "login_verify: load secrets");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
         };
-        if auth::totp::verify_code(&secret, code, chrono::Utc::now().timestamp()) {
-            return issue_session_after_mfa(&state, &user, MfaFactor::Totp).await;
+        // No verified authenticators → the pending state is stale.
+        if secrets.is_empty() {
+            return Redirect::to("/login").into_response();
+        }
+        let now = chrono::Utc::now().timestamp();
+        if let Some((cred_id, _)) = secrets
+            .iter()
+            .find(|(_, secret)| auth::totp::verify_code(secret, code, now))
+        {
+            return issue_session_after_mfa(&state, &user, MfaFactor::Totp(*cred_id)).await;
         }
         state.rate_limiter.record_failure(&rl_key);
         audit_mfa_failed(&state, &user, "totp").await;
@@ -1815,14 +2236,16 @@ pub async fn login_verify_submit(
 
 #[derive(Clone, Copy)]
 enum MfaFactor {
-    Totp,
+    /// TOTP, carrying the credential id that accepted the code (stamped
+    /// as last-used when the session is issued).
+    Totp(uuid::Uuid),
     RecoveryCode,
 }
 
 impl MfaFactor {
     fn label(self) -> &'static str {
         match self {
-            MfaFactor::Totp => "totp",
+            MfaFactor::Totp(_) => "totp",
             MfaFactor::RecoveryCode => "recovery_code",
         }
     }
@@ -1857,8 +2280,8 @@ async fn issue_session_after_mfa(
         let mut tx = state.db.begin().await?;
         let (session, token) =
             auth::SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
-        if matches!(factor, MfaFactor::Totp) {
-            auth::user_totp::stamp_used(&mut tx, user.id).await?;
+        if let MfaFactor::Totp(cred_id) = factor {
+            auth::user_totp::stamp_used(&mut tx, cred_id).await?;
         }
         audit::append(
             &mut tx,

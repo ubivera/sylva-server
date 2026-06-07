@@ -1,76 +1,116 @@
-//! Per-user TOTP enrollment storage. Mirrors [`crate::user_recovery_code`],
-//! but the secret is *encrypted* at rest (via [`crate::secretbox`]) rather
-//! than hashed, because the server must recover the plaintext to compute
-//! the expected code at sign-in.
+//! Per-user TOTP enrollment storage — **many authenticators per user**,
+//! each with a user-chosen label. Secrets are *encrypted* at rest (via
+//! [`crate::secretbox`]) rather than hashed, because the server must
+//! recover the plaintext to compute the expected code at sign-in.
 //!
 //! A row exists from the moment enrollment starts; `verified_at` stays
-//! NULL until the user confirms a code. Only a verified row counts as an
-//! active second factor.
+//! NULL until the user confirms a code. Only verified rows count as
+//! active factors, and 2FA is "on" for a user while at least one
+//! verified row exists.
 
 use chrono::{DateTime, Utc};
 use identity::UserId;
 use serde::Serialize;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::Result;
 use crate::secretbox;
 
-/// Metadata about a user's TOTP enrollment. The secret never appears
-/// here — the Security tab uses this to show "Enabled since …".
+/// Upper bound on verified authenticators per user. Generous — a real
+/// user is unlikely to approach it; it just stops unbounded growth.
+pub const MAX_AUTHENTICATORS: i64 = 50;
+
+/// A verified authenticator as shown in the Security tab. The secret
+/// never appears here.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
-pub struct TotpRow {
-    pub user_id: uuid::Uuid,
+pub struct TotpCredential {
+    pub id: Uuid,
+    pub label: String,
     pub created_at: DateTime<Utc>,
-    pub verified_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
 }
 
-/// Store (or replace) a user's TOTP secret, encrypted and **unverified**.
-/// UPSERT so restarting enrollment cleanly overwrites a half-finished
-/// attempt. The row isn't an active factor until [`confirm`] runs.
+/// Begin enrollment of a new authenticator. Clears any half-finished
+/// (unverified) rows for the user first, then inserts a fresh unverified
+/// row and returns its id. The label is a placeholder until [`confirm`].
 pub async fn start_enrollment(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key: &[u8; 32],
     user_id: UserId,
     raw_secret: &[u8],
-) -> Result<()> {
+) -> Result<Uuid> {
+    sqlx::query("DELETE FROM auth.totp_credentials WHERE user_id = $1 AND verified_at IS NULL")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+
     let enc = secretbox::seal(key, raw_secret)?;
-    sqlx::query(
-        "INSERT INTO auth.totp_secrets (user_id, secret_enc, created_at, verified_at, last_used_at)
-         VALUES ($1, $2, now(), NULL, NULL)
-         ON CONFLICT (user_id) DO UPDATE
-         SET secret_enc   = EXCLUDED.secret_enc,
-             created_at   = now(),
-             verified_at  = NULL,
-             last_used_at = NULL",
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO auth.totp_credentials (user_id, label, secret_enc)
+         VALUES ($1, 'Authenticator', $2)
+         RETURNING id",
     )
     .bind(user_id)
     .bind(&enc)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    Ok(())
+    Ok(id)
 }
 
-/// Mark the user's TOTP enrollment verified (active). Returns whether a
-/// row was present to update.
+/// Mark a specific in-progress credential verified (active) and set its
+/// label. Scoped to `user_id` + unverified so a tampered id can't touch
+/// another user's or an already-active credential. Returns whether a row
+/// matched.
 pub async fn confirm(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: UserId,
+    cred_id: Uuid,
+    label: &str,
 ) -> Result<bool> {
     let rows = sqlx::query(
-        "UPDATE auth.totp_secrets SET verified_at = now() WHERE user_id = $1",
+        "UPDATE auth.totp_credentials
+         SET verified_at = now(), label = $3
+         WHERE id = $1 AND user_id = $2 AND verified_at IS NULL",
     )
+    .bind(cred_id)
     .bind(user_id)
+    .bind(label)
     .execute(&mut **tx)
     .await?;
     Ok(rows.rows_affected() > 0)
 }
 
-/// Whether TOTP is an active second factor for this user (enrolled AND
-/// verified). Drives the login branch and the Security-tab state.
+/// Decrypt the secret of a specific in-progress credential — used by the
+/// enrollment confirm step.
+pub async fn load_pending_secret(
+    pool: &PgPool,
+    key: &[u8; 32],
+    user_id: UserId,
+    cred_id: Uuid,
+) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT secret_enc FROM auth.totp_credentials
+         WHERE id = $1 AND user_id = $2 AND verified_at IS NULL",
+    )
+    .bind(cred_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some((enc,)) => Ok(Some(secretbox::open(key, &enc)?)),
+        None => Ok(None),
+    }
+}
+
+/// Whether the user has any active (verified) authenticator. Drives the
+/// login branch and the Security-tab state.
 pub async fn is_enrolled(pool: &PgPool, user_id: UserId) -> Result<bool> {
     let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT verified_at IS NOT NULL FROM auth.totp_secrets WHERE user_id = $1",
+        "SELECT EXISTS(
+             SELECT 1 FROM auth.totp_credentials
+             WHERE user_id = $1 AND verified_at IS NOT NULL
+         )",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -78,81 +118,97 @@ pub async fn is_enrolled(pool: &PgPool, user_id: UserId) -> Result<bool> {
     Ok(matches!(row, Some((true,))))
 }
 
-/// Decrypt the stored secret regardless of verified state — used by the
-/// enrollment confirm step (the row is still unverified at that point).
-pub async fn load_secret(
+/// All verified `(id, secret)` pairs for the user. The login challenge
+/// tries each until one accepts the presented code.
+pub async fn verified_secrets(
     pool: &PgPool,
     key: &[u8; 32],
     user_id: UserId,
-) -> Result<Option<Vec<u8>>> {
-    load(pool, key, user_id, false).await
-}
-
-/// Decrypt the stored secret only if verified — used by the login
-/// challenge so a half-finished enrollment can't satisfy 2FA.
-pub async fn load_verified_secret(
-    pool: &PgPool,
-    key: &[u8; 32],
-    user_id: UserId,
-) -> Result<Option<Vec<u8>>> {
-    load(pool, key, user_id, true).await
-}
-
-async fn load(
-    pool: &PgPool,
-    key: &[u8; 32],
-    user_id: UserId,
-    require_verified: bool,
-) -> Result<Option<Vec<u8>>> {
-    let sql = if require_verified {
-        "SELECT secret_enc FROM auth.totp_secrets WHERE user_id = $1 AND verified_at IS NOT NULL"
-    } else {
-        "SELECT secret_enc FROM auth.totp_secrets WHERE user_id = $1"
-    };
-    let row: Option<(Vec<u8>,)> = sqlx::query_as(sql)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
-    match row {
-        Some((enc,)) => Ok(Some(secretbox::open(key, &enc)?)),
-        None => Ok(None),
-    }
-}
-
-/// Stamp `last_used_at` after a successful login challenge.
-pub async fn stamp_used(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user_id: UserId,
-) -> Result<()> {
-    sqlx::query("UPDATE auth.totp_secrets SET last_used_at = now() WHERE user_id = $1")
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-/// Remove a user's TOTP enrollment entirely (turn off 2FA).
-pub async fn disable(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    user_id: UserId,
-) -> Result<()> {
-    sqlx::query("DELETE FROM auth.totp_secrets WHERE user_id = $1")
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-/// Verified-enrollment metadata for the Security tab ("Enabled since …").
-/// Returns `None` when TOTP isn't active.
-pub async fn metadata(pool: &PgPool, user_id: UserId) -> Result<Option<TotpRow>> {
-    let row: Option<TotpRow> = sqlx::query_as(
-        "SELECT user_id, created_at, verified_at, last_used_at
-         FROM auth.totp_secrets
+) -> Result<Vec<(Uuid, Vec<u8>)>> {
+    let rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, secret_enc FROM auth.totp_credentials
          WHERE user_id = $1 AND verified_at IS NOT NULL",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(row)
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, enc) in rows {
+        out.push((id, secretbox::open(key, &enc)?));
+    }
+    Ok(out)
+}
+
+/// List the user's verified authenticators for the Security tab,
+/// oldest first.
+pub async fn list_verified(pool: &PgPool, user_id: UserId) -> Result<Vec<TotpCredential>> {
+    let rows: Vec<TotpCredential> = sqlx::query_as(
+        "SELECT id, label, created_at, last_used_at
+         FROM auth.totp_credentials
+         WHERE user_id = $1 AND verified_at IS NOT NULL
+         ORDER BY created_at",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Count of verified authenticators (enforces [`MAX_AUTHENTICATORS`]).
+pub async fn count_verified(pool: &PgPool, user_id: UserId) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM auth.totp_credentials
+         WHERE user_id = $1 AND verified_at IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Rename a verified authenticator. Scoped to `user_id`.
+pub async fn rename(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+    cred_id: Uuid,
+    label: &str,
+) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE auth.totp_credentials
+         SET label = $3
+         WHERE id = $1 AND user_id = $2 AND verified_at IS NOT NULL",
+    )
+    .bind(cred_id)
+    .bind(user_id)
+    .bind(label)
+    .execute(&mut **tx)
+    .await?;
+    Ok(rows.rows_affected() > 0)
+}
+
+/// Stamp `last_used_at` on the credential that satisfied a sign-in.
+pub async fn stamp_used(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cred_id: Uuid,
+) -> Result<()> {
+    sqlx::query("UPDATE auth.totp_credentials SET last_used_at = now() WHERE id = $1")
+        .bind(cred_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Remove one authenticator. Scoped to `user_id`. Returns whether a row
+/// matched.
+pub async fn delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+    cred_id: Uuid,
+) -> Result<bool> {
+    let rows = sqlx::query("DELETE FROM auth.totp_credentials WHERE id = $1 AND user_id = $2")
+        .bind(cred_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(rows.rows_affected() > 0)
 }

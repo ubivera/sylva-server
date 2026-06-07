@@ -13,6 +13,7 @@ pub mod postgres;
 pub mod rate_limit;
 pub mod shutdown;
 pub mod signed_token;
+pub mod webauthn;
 pub mod telemetry;
 pub mod views;
 

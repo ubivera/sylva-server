@@ -45,7 +45,24 @@ pub fn ui_router(state: AppState) -> Router {
         )
         .route("/me/totp/start", post(routes::me_totp_start))
         .route("/me/totp/confirm", post(routes::me_totp_confirm))
-        .route("/me/totp/disable", post(routes::me_totp_disable))
+        .route("/me/totp/section", get(routes::me_totp_section))
+        .route("/me/totp/{id}/edit", get(routes::me_totp_edit))
+        .route("/me/totp/{id}/rename", post(routes::me_totp_rename))
+        .route(
+            "/me/totp/{id}/confirm-delete",
+            get(routes::me_totp_confirm_delete),
+        )
+        .route("/me/totp/{id}/delete", post(routes::me_totp_delete))
+        .route("/me/passkey/start", post(routes::me_passkey_start))
+        .route("/me/passkey/finish", post(routes::me_passkey_finish))
+        .route("/me/passkey/section", get(routes::me_passkey_section))
+        .route("/me/passkey/{id}/edit", get(routes::me_passkey_edit))
+        .route("/me/passkey/{id}/rename", post(routes::me_passkey_rename))
+        .route(
+            "/me/passkey/{id}/confirm-delete",
+            get(routes::me_passkey_confirm_delete),
+        )
+        .route("/me/passkey/{id}/delete", post(routes::me_passkey_delete))
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in

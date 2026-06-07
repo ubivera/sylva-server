@@ -30,6 +30,8 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
+webauthn-rs = { workspace = true }
+url = { workspace = true }
 
 identity = { path = "../identity" }
 audit = { path = "../audit" }
