@@ -39,3 +39,15 @@ CREATE TABLE auth.user_recovery_codes (
     generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ NULL
 );
+
+-- TOTP (authenticator-app) second factor: one per user. The secret is
+-- AEAD-encrypted (XChaCha20-Poly1305) under the instance secret key, not
+-- hashed, because the server must recover it to verify codes. A row with
+-- verified_at IS NULL is a half-finished enrollment, not an active factor.
+CREATE TABLE auth.totp_secrets (
+    user_id      UUID PRIMARY KEY REFERENCES identity.users(id) ON DELETE CASCADE,
+    secret_enc   BYTEA NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    verified_at  TIMESTAMPTZ NULL,
+    last_used_at TIMESTAMPTZ NULL
+);

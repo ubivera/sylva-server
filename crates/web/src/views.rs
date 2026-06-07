@@ -1327,6 +1327,56 @@ pub fn recover_reset_page(error: Option<&str>) -> Markup {
     shell_public("Set a new password", content)
 }
 
+/// `GET /login/verify` — the second-factor challenge, reached after a
+/// correct password when the user has TOTP enrolled. Reachable only with
+/// a valid `hearth_mfa` cookie. Offers the authenticator code (primary)
+/// and a recovery-code break-glass (in a native `<details>`, no JS).
+pub fn login_verify_page(error: Option<&str>) -> Markup {
+    let content = html! {
+        h1 { "Two-step verification" }
+        div class="card" {
+            p class="muted recover-intro" {
+                "Enter the 6-digit code from your authenticator app to "
+                "finish signing in."
+            }
+            form method="post" action="/login/verify" {
+                @if let Some(msg) = error {
+                    p class="error" { (msg) }
+                }
+                div class="field" {
+                    label for="code" { "Authenticator code" }
+                    input type="text" name="code" id="code"
+                          inputmode="numeric" autocomplete="one-time-code"
+                          pattern="[0-9]*" maxlength="6" required autofocus;
+                }
+                button type="submit" class="btn" { "Verify" }
+            }
+            details class="login-verify-alt" {
+                summary { "Use a recovery code instead" }
+                p class="muted" {
+                    "If you've lost access to your authenticator, enter one "
+                    "of your saved recovery codes to sign in, then re-enroll "
+                    "from settings."
+                }
+                form method="post" action="/login/verify" {
+                    div class="field" {
+                        label for="recovery_code" { "Recovery code" }
+                        input type="text" name="recovery_code" id="recovery_code"
+                              autocomplete="off" spellcheck="false" required;
+                    }
+                    button type="submit" class="btn-secondary" {
+                        "Sign in with recovery code"
+                    }
+                }
+            }
+            p class="login-recover-link" {
+                a href="/login" { "Back to sign in" }
+            }
+        }
+    };
+    shell_public("Two-step verification", content)
+}
+
 /// `GET /me` page — the authenticated user's profile. Read-only
 /// summary; edits happen inside the shell-mounted account-settings
 /// modal (opened by the "Manage account" button below or the user-
@@ -1547,25 +1597,6 @@ fn key_icon() -> Markup {
     }
 }
 
-/// Fingerprint icon — leading glyph on the "Passkeys" tab. Nested
-/// arcs evoke the WebAuthn / biometric story without locking us
-/// into a specific platform's affordance (Touch ID vs Windows
-/// Hello vs Android).
-fn fingerprint_icon() -> Markup {
-    html! {
-        svg xmlns="http://www.w3.org/2000/svg"
-            width="18" height="18" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round"
-            aria-hidden="true" {
-            path d="M6.5 3.5a10 10 0 0 1 11 0" {}
-            path d="M3 8a14 14 0 0 1 18 0" {}
-            path d="M5 12a12 12 0 0 1 14 0" {}
-            path d="M8 16a4 4 0 0 1 8 0v2" {}
-            path d="M12 12v6" {}
-        }
-    }
-}
 
 /// Database-cylinder icon — leading glyph on the "Data Control" tab
 /// of the account-settings modal. Three stacked ovals approximating a
@@ -1637,6 +1668,7 @@ pub(crate) fn invite_modal(ctx: &ChromeContext) -> Markup {
 pub fn account_settings_modal(
     ctx: &ChromeContext,
     recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
+    totp_meta: Option<&auth::user_totp::TotpRow>,
 ) -> Markup {
     html! {
         dialog id="dlg-account-settings"
@@ -1698,18 +1730,6 @@ pub fn account_settings_modal(
                     }
                     button type="button" class="settings-tab"
                            role="tab" aria-selected="false"
-                           data-settings-tab="authenticators" {
-                        span class="settings-tab-icon" { (key_icon()) }
-                        span { "Authenticators" }
-                    }
-                    button type="button" class="settings-tab"
-                           role="tab" aria-selected="false"
-                           data-settings-tab="passkeys" {
-                        span class="settings-tab-icon" { (fingerprint_icon()) }
-                        span { "Passkeys" }
-                    }
-                    button type="button" class="settings-tab"
-                           role="tab" aria-selected="false"
                            data-settings-tab="data" {
                         span class="settings-tab-icon" { (database_icon()) }
                         span { "Data Control" }
@@ -1724,7 +1744,7 @@ pub fn account_settings_modal(
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="security" {
-                        (settings_security_panel(ctx))
+                        (settings_security_panel(ctx, totp_meta))
                     }
                     div class="settings-panel"
                         role="tabpanel"
@@ -1735,28 +1755,6 @@ pub fn account_settings_modal(
                              into will be listed here, with the option \
                              to sign each one out remotely. Coming in a \
                              follow-up checkpoint.",
-                        ))
-                    }
-                    div class="settings-panel"
-                        role="tabpanel"
-                        data-settings-panel="authenticators" {
-                        (settings_placeholder_panel(
-                            "Authenticators",
-                            "Time-based one-time password apps \
-                             (Google Authenticator, 1Password, Authy, etc.) \
-                             will be enrolled here. Coming in a follow-up \
-                             checkpoint.",
-                        ))
-                    }
-                    div class="settings-panel"
-                        role="tabpanel"
-                        data-settings-panel="passkeys" {
-                        (settings_placeholder_panel(
-                            "Passkeys",
-                            "Passkeys let you sign in with a face / \
-                             fingerprint / hardware key instead of a \
-                             password. Enrollment lands in a follow-up \
-                             checkpoint.",
                         ))
                     }
                     div class="settings-panel"
@@ -1808,7 +1806,10 @@ fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
 /// least 8 chars and matches the confirm field (see
 /// `CHANGE_PASSWORD_GATE_JS`), so a typo'd confirm never reaches the
 /// reauth step.
-fn settings_security_panel(ctx: &ChromeContext) -> Markup {
+fn settings_security_panel(
+    ctx: &ChromeContext,
+    totp_meta: Option<&auth::user_totp::TotpRow>,
+) -> Markup {
     html! {
         section class="settings-section" {
             div class="settings-section-header" {
@@ -1856,6 +1857,83 @@ fn settings_security_panel(ctx: &ChromeContext) -> Markup {
                                    data-reauth-confirm="form-change-password"
                                    disabled {
                                 "Change password"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" {
+                    (key_icon())
+                }
+                div {
+                    h3 { "Authenticator app" }
+                    p class="settings-section-tagline" {
+                        "Require a 6-digit code from an authenticator app "
+                        "each time you sign in."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                @match totp_meta {
+                    Some(meta) => {
+                        form id="form-totp-disable"
+                             class="settings-row"
+                             method="post"
+                             action="/me/totp/disable" {
+                            (csrf_input(ctx.csrf_token))
+                            div class="settings-row-label" {
+                                label { "Status" }
+                                p class="settings-row-hint" {
+                                    "Two-factor is on"
+                                    @if let Some(v) = meta.verified_at {
+                                        " (since "
+                                        (v.format("%b %-d, %Y").to_string())
+                                        ")"
+                                    }
+                                    "."
+                                }
+                            }
+                            div class="settings-row-control" {
+                                p class="settings-row-hint" {
+                                    "Turning it off asks for your password. "
+                                    "Your recovery code stays as your backup "
+                                    "way in."
+                                }
+                                div class="settings-row-actions" {
+                                    button type="button" class="btn-secondary"
+                                           data-reauth-confirm="form-totp-disable" {
+                                        "Turn off"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        form id="form-totp-start"
+                             class="settings-row"
+                             method="post"
+                             action="/me/totp/start" {
+                            (csrf_input(ctx.csrf_token))
+                            div class="settings-row-label" {
+                                label { "Not set up" }
+                                p class="settings-row-hint" {
+                                    "Use Google Authenticator, 1Password, "
+                                    "Aegis, or similar. You'll scan a QR code "
+                                    "and confirm one code to turn it on. "
+                                    "We'll ask for your password first."
+                                }
+                            }
+                            div class="settings-row-control" {
+                                div class="settings-row-actions" {
+                                    button type="button" class="btn-secondary"
+                                           data-reauth-confirm="form-totp-start" {
+                                        "Set up"
+                                    }
+                                }
                             }
                         }
                     }
@@ -1981,8 +2059,94 @@ pub fn recovery_code_modal_content(recovery_code: &str) -> Markup {
     }
 }
 
-/// Stand-in for the sections that aren't built yet (Devices,
-/// Authenticators, Passkeys).
+/// TOTP enrollment fragment, swapped into the reauth modal after a
+/// reauthenticated `POST /me/totp/start`. Shows the QR (rendered server-
+/// side as SVG) plus a copyable manual key, and a confirm-code form that
+/// HTMX-posts back into the same modal slot. `error` re-renders inline
+/// when the confirmation code didn't match.
+pub fn totp_enroll_modal_content(qr_svg: &str, secret_b32: &str, csrf_token: &str, error: Option<&str>) -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon" { (key_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Set up your authenticator" }
+        p class="dialog-description dialog-center-text" {
+            "Scan this with your authenticator app, then enter the "
+            "6-digit code it shows to finish."
+        }
+        div class="totp-qr" aria-hidden="true" {
+            (maud::PreEscaped(qr_svg.to_string()))
+        }
+        details class="login-verify-alt" {
+            summary { "Can't scan? Enter this key" }
+            div class="recovery-code-display" {
+                input id="totp-secret"
+                      type="text"
+                      class="recovery-code-input"
+                      value=(secret_b32)
+                      readonly
+                      aria-label="Authenticator setup key";
+                button type="button" class="btn-secondary"
+                       data-copy-target="totp-secret" {
+                    "Copy"
+                }
+            }
+        }
+        form id="form-totp-confirm"
+             method="post"
+             action="/me/totp/confirm"
+             hx-post="/me/totp/confirm"
+             hx-target="#reauth-modal-content"
+             hx-swap="innerHTML" {
+            (csrf_input(csrf_token))
+            @if let Some(msg) = error {
+                p class="error" { (msg) }
+            }
+            div class="field" {
+                label for="totp-confirm-code" { "6-digit code" }
+                input type="text" name="code" id="totp-confirm-code"
+                      inputmode="numeric" autocomplete="one-time-code"
+                      pattern="[0-9]*" maxlength="6" required autofocus;
+            }
+            div class="dialog-actions" {
+                button type="submit" class="btn" { "Turn on two-factor" }
+            }
+        }
+    }
+}
+
+/// Shown once TOTP enrollment is confirmed. Swapped into the reauth
+/// modal slot in place of the QR fragment.
+pub fn totp_enrolled_success_content() -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-icon-success" {
+                (check_circle_icon())
+            }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Two-factor is on" }
+        p class="dialog-description dialog-center-text" {
+            "You'll enter a code from your authenticator app the next "
+            "time you sign in. If you ever lose the app, use your "
+            "recovery code to get back in, then re-enroll."
+        }
+        div class="dialog-actions" {
+            button type="button" class="btn" data-close-dialog {
+                "Done"
+            }
+        }
+    }
+}
+
+/// Stand-in for the sections that aren't built yet (Devices).
 fn settings_placeholder_panel(title: &str, body: &str) -> Markup {
     html! {
         div class="settings-placeholder" {
@@ -4684,6 +4848,11 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
             "Password changed",
             "Your password has been updated. Other devices were signed out.".to_string(),
         ),
+        "totp_disabled" => (
+            ToastKind::Info,
+            "Two-factor turned off",
+            "Authenticator codes are no longer required to sign in.".to_string(),
+        ),
 
         _ => return None,
     };
@@ -4736,6 +4905,7 @@ fn error_banner_message(error: &str) -> &'static str {
         // preserved (see members_invite_form_page).
         "email_required" => "Enter an email address.",
         "new_password_required" => "Enter a new password.",
+        "totp_setup_expired" => "Two-factor setup expired. Start again from Security.",
         "cannot_invite_higher_role" => "You can't invite someone at a higher role than your own.",
         "email_already_in_use" => "A member with that email already exists.",
         "active_invite_exists" => "An open invitation already exists for that email.",

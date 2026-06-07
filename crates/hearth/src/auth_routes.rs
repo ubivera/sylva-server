@@ -31,6 +31,25 @@ pub struct ErrorResponse {
     pub error: &'static str,
 }
 
+/// How long the "password verified, awaiting second factor" token is
+/// valid (seconds). Mirrors the web `hearth_mfa` cookie TTL.
+const MFA_PENDING_TTL_SECS: i64 = 600;
+
+/// Returned by `/auth/login` (200) when the account has a second factor:
+/// the client must call `/auth/login/verify` with `mfa_token` + a code.
+#[derive(Serialize)]
+pub struct MfaRequiredResponse {
+    pub mfa_required: bool,
+    pub mfa_token: String,
+}
+
+#[derive(Deserialize)]
+pub struct LoginVerifyRequest {
+    pub mfa_token: String,
+    pub code: Option<String>,
+    pub recovery_code: Option<String>,
+}
+
 /// `POST /auth/login` - exchange `{email, password}` for a session token.
 ///
 /// On success: 200 + `{token, expires_at, user_id}`. The token is bearer
@@ -68,17 +87,44 @@ pub async fn login(
     };
 
     match outcome {
-        Ok(user) => match issue_session(&state, user).await {
-            Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-            Err(err) => {
-                tracing::error!(?err, "issuing session");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: "internal" }),
-                )
-                    .into_response()
+        Ok(user) => {
+            // Password is correct. If the user has a second factor, hand
+            // back a single-purpose token instead of a session — the
+            // client must complete `/auth/login/verify`.
+            match auth::user_totp::is_enrolled(&state.db, user.id).await {
+                Ok(true) => {
+                    let expires_at =
+                        chrono::Utc::now().timestamp() + MFA_PENDING_TTL_SECS;
+                    let mfa_token = crate::signed_token::sign(
+                        &state.csrf_secret,
+                        crate::signed_token::PURPOSE_MFA_PENDING,
+                        user.id.0,
+                        expires_at,
+                    );
+                    (StatusCode::OK, Json(MfaRequiredResponse { mfa_required: true, mfa_token }))
+                        .into_response()
+                }
+                Ok(false) => match issue_session(&state, user).await {
+                    Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+                    Err(err) => {
+                        tracing::error!(?err, "issuing session");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse { error: "internal" }),
+                        )
+                            .into_response()
+                    }
+                },
+                Err(err) => {
+                    tracing::error!(?err, "totp enrollment check");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: "internal" }),
+                    )
+                        .into_response()
+                }
             }
-        },
+        }
         Err(why) => {
             state.rate_limiter.record_failure(&rl_key);
             if let Err(err) = audit_signin_failure(&state, &req.email, why).await {
@@ -93,11 +139,148 @@ pub async fn login(
     }
 }
 
+/// `POST /auth/login/verify` — complete sign-in with a second factor.
+/// Takes the `mfa_token` from `/auth/login` plus either a TOTP `code` or
+/// a `recovery_code` (break-glass). Rate-limited per user.
+pub async fn login_verify(
+    State(state): State<AppState>,
+    Json(req): Json<LoginVerifyRequest>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp();
+    let user_id = match crate::signed_token::verify(
+        &state.csrf_secret,
+        crate::signed_token::PURPOSE_MFA_PENDING,
+        &req.mfa_token,
+        now,
+    ) {
+        Some(uid) => UserId::new(uid),
+        None => {
+            return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "mfa_token_invalid" }))
+                .into_response();
+        }
+    };
+
+    let rl_key = format!("mfa:{}", user_id.0);
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(ErrorResponse { error: "rate_limited" }))
+            .into_response();
+    }
+
+    let user = match state.users.find_by_id(user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "mfa_token_invalid" }))
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(?err, "login_verify: user lookup");
+            return internal_error().into_response();
+        }
+    };
+
+    // TOTP code (primary).
+    if let Some(code) = req.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        let secret = match auth::user_totp::load_verified_secret(
+            &state.db,
+            &state.secret_key,
+            user_id,
+        )
+        .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse { error: "mfa_token_invalid" }),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                tracing::error!(?err, "login_verify: load secret");
+                return internal_error().into_response();
+            }
+        };
+        if auth::totp::verify_code(&secret, code, now) {
+            return finish_mfa_session(&state, user, "totp").await;
+        }
+        state.rate_limiter.record_failure(&rl_key);
+        return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid_code" }))
+            .into_response();
+    }
+
+    // Recovery-code break-glass.
+    if let Some(rc) = req
+        .recovery_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        let ok = match verify_recovery_code(&state, user_id, rc).await {
+            Ok(ok) => ok,
+            Err(err) => {
+                tracing::error!(?err, "login_verify: recovery verify");
+                return internal_error().into_response();
+            }
+        };
+        if ok {
+            return finish_mfa_session(&state, user, "recovery_code").await;
+        }
+        state.rate_limiter.record_failure(&rl_key);
+        return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid_code" }))
+            .into_response();
+    }
+
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: "code_required" })).into_response()
+}
+
+async fn verify_recovery_code(
+    state: &AppState,
+    user_id: UserId,
+    presented: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = state.db.begin().await?;
+    let ok = auth::user_recovery_code::verify_and_stamp(&mut tx, user_id, presented).await?;
+    tx.commit().await?;
+    Ok(ok)
+}
+
+async fn finish_mfa_session(state: &AppState, user: User, factor: &str) -> Response {
+    match issue_session_with_mfa(state, user, Some(factor)).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(err) => {
+            tracing::error!(?err, "login_verify: issue session");
+            internal_error().into_response()
+        }
+    }
+}
+
 async fn issue_session(state: &AppState, user: User) -> anyhow::Result<LoginResponse> {
+    issue_session_with_mfa(state, user, None).await
+}
+
+/// Issue a session, recording in the audit event which second factor (if
+/// any) was used. When the factor was TOTP, also stamps its `last_used_at`
+/// in the same transaction.
+async fn issue_session_with_mfa(
+    state: &AppState,
+    user: User,
+    mfa: Option<&str>,
+) -> anyhow::Result<LoginResponse> {
     let mut tx = state.db.begin().await?;
     let (session, token) =
         SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
 
+    if mfa == Some("totp") {
+        auth::user_totp::stamp_used(&mut tx, user.id).await?;
+    }
+
+    let mut data = serde_json::json!({
+        "email": user.email,
+        "session_id": session.id,
+    });
+    if let Some(factor) = mfa {
+        data["mfa"] = serde_json::Value::from(factor);
+    }
     audit::append(
         &mut tx,
         Some(&Actor {
@@ -106,10 +289,7 @@ async fn issue_session(state: &AppState, user: User) -> anyhow::Result<LoginResp
         }),
         None,
         "signin_success",
-        serde_json::json!({
-            "email": user.email,
-            "session_id": session.id,
-        }),
+        data,
     )
     .await?;
 

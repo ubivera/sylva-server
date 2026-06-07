@@ -22,6 +22,10 @@ pub fn ui_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::root_redirect))
         .route("/login", get(routes::login_page).post(routes::login_submit))
+        .route(
+            "/login/verify",
+            get(routes::login_verify_page).post(routes::login_verify_submit),
+        )
         .route("/recover", get(routes::recover_page).post(routes::recover_submit))
         .route(
             "/recover/reset",
@@ -39,6 +43,9 @@ pub fn ui_router(state: AppState) -> Router {
             "/me/recovery-code/regenerate",
             post(routes::me_recovery_regenerate),
         )
+        .route("/me/totp/start", post(routes::me_totp_start))
+        .route("/me/totp/confirm", post(routes::me_totp_confirm))
+        .route("/me/totp/disable", post(routes::me_totp_disable))
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in

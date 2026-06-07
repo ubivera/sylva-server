@@ -137,6 +137,22 @@ pub async fn login_submit(
         }
     };
 
+    // Password is correct. If the user has a second factor, don't issue a
+    // session yet — hand off to /login/verify with a short-lived,
+    // single-purpose cookie instead.
+    match auth::user_totp::is_enrolled(&state.db, user.id).await {
+        Ok(true) => {
+            let mut resp = Redirect::to("/login/verify").into_response();
+            set_cookie_header(&mut resp, &mfa_pending_cookie(&state, user.id));
+            return resp;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!(?err, "login: TOTP enrollment check");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    }
+
     let actor = audit::Actor {
         user_id: user.id,
         display_name: user.display_name.clone(),
@@ -341,6 +357,14 @@ pub async fn account_settings_modal(
             tracing::warn!(?err, "loading recovery-code metadata for settings modal");
             None
         });
+    // TOTP enrollment metadata drives the Security tab's Two-factor
+    // section ("on since …" vs "set up"). Degrade to "not set up" on error.
+    let totp_meta = auth::user_totp::metadata(&state.db, auth.user.id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "loading TOTP metadata for settings modal");
+            None
+        });
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -348,7 +372,7 @@ pub async fn account_settings_modal(
         pending_count: None,
     };
     Html(
-        views::account_settings_modal(&ctx, recovery_meta.as_ref())
+        views::account_settings_modal(&ctx, recovery_meta.as_ref(), totp_meta.as_ref())
             .into_string(),
     )
     .into_response()
@@ -809,6 +833,222 @@ pub async fn me_recovery_regenerate(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal error",
             )
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /me/totp/* — authenticator (TOTP) enrollment, reauth-gated
+// ────────────────────────────────────────────────────────────────────────
+
+/// Render a QR code for `data` as an inline SVG string (no raster deps).
+/// Empty string on the (practically impossible) too-long-data error.
+fn render_qr_svg(data: &str) -> String {
+    use qrcode::{QrCode, render::svg};
+    match QrCode::new(data.as_bytes()) {
+        Ok(code) => code
+            .render::<svg::Color<'_>>()
+            .min_dimensions(184, 184)
+            .quiet_zone(true)
+            .dark_color(svg::Color("#101828"))
+            .light_color(svg::Color("#ffffff"))
+            .build(),
+        Err(err) => {
+            tracing::error!(?err, "rendering TOTP QR");
+            String::new()
+        }
+    }
+}
+
+/// `POST /me/totp/start` — begin authenticator enrollment. Reauth-gated:
+/// the Security-tab "Set up" button chains through `dlg-reauth` for the
+/// password. Generates a secret, stores it encrypted + unverified, and
+/// swaps the QR + confirm-code fragment into the reauth modal.
+pub async fn me_totp_start(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<MeReauthOnlyForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let htmx = headers.contains_key("hx-request");
+
+    let password_ok = match auth::verify_user_password(&state.db, auth.user.id, &form.password).await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::error!(?err, "totp_start: verify password");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    if !password_ok {
+        return reauth_invalid_password_response(
+            &state,
+            auth.session_id,
+            &auth.user,
+            "/me/totp/start",
+            &[],
+            htmx,
+        );
+    }
+
+    let secret = auth::totp::generate_secret();
+    let stored: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        auth::user_totp::start_enrollment(&mut tx, &state.secret_key, auth.user.id, &secret).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = stored {
+        tracing::error!(?err, "totp_start: store secret");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+
+    let secret_b32 = auth::totp::base32_encode(&secret);
+    let uri = auth::totp::otpauth_uri(&state.instance_name, &auth.user.email, &secret_b32);
+    let qr = render_qr_svg(&uri);
+    let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    Html(views::totp_enroll_modal_content(&qr, &secret_b32, &csrf, None).into_string())
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct MeTotpConfirmForm {
+    pub csrf_token: String,
+    pub code: String,
+}
+
+/// `POST /me/totp/confirm` — finish enrollment by proving a code from the
+/// app. Already reauthenticated at `/me/totp/start`, so no password here.
+/// Marks the secret verified; on a wrong code, re-renders the QR
+/// fragment with an inline error.
+pub async fn me_totp_confirm(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<MeTotpConfirmForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+
+    let secret = match auth::user_totp::load_secret(&state.db, &state.secret_key, auth.user.id).await
+    {
+        Ok(Some(s)) => s,
+        // No enrollment in progress (e.g. it was confirmed/cleared in
+        // another tab). Bounce out and let them start over.
+        Ok(None) => return redirect_to_me_with_error(true, "totp_setup_expired"),
+        Err(err) => {
+            tracing::error!(?err, "totp_confirm: load secret");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if !auth::totp::verify_code(&secret, form.code.trim(), now) {
+        let secret_b32 = auth::totp::base32_encode(&secret);
+        let uri = auth::totp::otpauth_uri(&state.instance_name, &auth.user.email, &secret_b32);
+        let qr = render_qr_svg(&uri);
+        let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
+        return Html(
+            views::totp_enroll_modal_content(
+                &qr,
+                &secret_b32,
+                &csrf,
+                Some("That code didn't match. Try again."),
+            )
+            .into_string(),
+        )
+        .into_response();
+    }
+
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        auth::user_totp::confirm(&mut tx, auth.user.id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "totp_enrolled",
+            serde_json::json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => Html(views::totp_enrolled_success_content().into_string()).into_response(),
+        Err(err) => {
+            tracing::error!(?err, "totp_confirm: confirm");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
+/// `POST /me/totp/disable` — turn off the authenticator. Reauth-gated.
+pub async fn me_totp_disable(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<MeReauthOnlyForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let htmx = headers.contains_key("hx-request");
+
+    let password_ok = match auth::verify_user_password(&state.db, auth.user.id, &form.password).await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::error!(?err, "totp_disable: verify password");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    if !password_ok {
+        return reauth_invalid_password_response(
+            &state,
+            auth.session_id,
+            &auth.user,
+            "/me/totp/disable",
+            &[],
+            htmx,
+        );
+    }
+
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        auth::user_totp::disable(&mut tx, auth.user.id).await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "totp_disabled",
+            serde_json::json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => redirect_to_me_with_action(htmx, "totp_disabled"),
+        Err(err) => {
+            tracing::error!(?err, "totp_disable");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
         }
     }
 }
@@ -1380,12 +1620,12 @@ fn recovery_cookie_value(token: &str, clearing: bool) -> String {
     }
 }
 
-/// Pull the raw recovery cookie value out of the `Cookie` header.
-fn recovery_cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
+/// Pull a named cookie's value out of the `Cookie` request header.
+fn read_cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     raw.split(';')
         .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(name, _)| *name == RECOVERY_COOKIE_NAME)
+        .find(|(n, _)| *n == name)
         .map(|(_, value)| value.to_string())
 }
 
@@ -1395,9 +1635,289 @@ fn recovery_user_id(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> Option<identity::UserId> {
-    let token = recovery_cookie_token(headers)?;
+    let token = read_cookie(headers, RECOVERY_COOKIE_NAME)?;
     let now = chrono::Utc::now().timestamp();
-    hearth::recovery_token::verify(&state.csrf_secret, &token, now).map(identity::UserId::new)
+    hearth::signed_token::verify(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_RECOVERY_RESET,
+        &token,
+        now,
+    )
+    .map(identity::UserId::new)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /login/verify — second-factor challenge (TOTP, recovery-code bypass)
+// ────────────────────────────────────────────────────────────────────────
+
+/// Cookie carrying the "password verified, awaiting second factor" token
+/// between `POST /login` and `/login/verify`. Same posture as the
+/// recovery cookie: HttpOnly + SameSite=Lax + short-lived.
+const MFA_COOKIE_NAME: &str = "hearth_mfa";
+/// How long the password-verified grant lasts before the user must
+/// re-enter their password. 10 minutes.
+const MFA_PENDING_TTL_SECS: i64 = 600;
+
+fn mfa_cookie_value(token: &str, clearing: bool) -> String {
+    if clearing {
+        format!("{MFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+    } else {
+        format!(
+            "{MFA_COOKIE_NAME}={token}; Path=/; Max-Age={MFA_PENDING_TTL_SECS}; HttpOnly; SameSite=Lax"
+        )
+    }
+}
+
+/// Mint the `hearth_mfa` cookie for a user who passed the password step
+/// but still owes a second factor. Used by both web and (indirectly) the
+/// login flow.
+pub(crate) fn mfa_pending_cookie(state: &AppState, user_id: identity::UserId) -> String {
+    let expires_at = chrono::Utc::now().timestamp() + MFA_PENDING_TTL_SECS;
+    let token = hearth::signed_token::sign(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_MFA_PENDING,
+        user_id.0,
+        expires_at,
+    );
+    mfa_cookie_value(&token, /* clearing = */ false)
+}
+
+/// Resolve the `hearth_mfa` cookie to the pending user, or `None` if it's
+/// missing / tampered / expired.
+fn mfa_pending_user_id(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<identity::UserId> {
+    let token = read_cookie(headers, MFA_COOKIE_NAME)?;
+    let now = chrono::Utc::now().timestamp();
+    hearth::signed_token::verify(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_MFA_PENDING,
+        &token,
+        now,
+    )
+    .map(identity::UserId::new)
+}
+
+/// `GET /login/verify` — render the second-factor challenge. Bounces to
+/// `/login` without a valid pending-MFA cookie.
+pub async fn login_verify_page(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    match mfa_pending_user_id(&state, &headers) {
+        Some(_) => Html(views::login_verify_page(None).into_string()).into_response(),
+        None => Redirect::to("/login").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LoginVerifyForm {
+    pub code: Option<String>,
+    pub recovery_code: Option<String>,
+}
+
+/// `POST /login/verify` — finish sign-in by checking the second factor.
+/// TOTP code (primary) or a recovery code (break-glass). On success
+/// issues the real session, clears the pending cookie, and lands `/me`.
+/// Rate-limited per user (`mfa:{id}`).
+pub async fn login_verify_submit(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LoginVerifyForm>,
+) -> Response {
+    let user_id = match mfa_pending_user_id(&state, &headers) {
+        Some(id) => id,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    let rl_key = format!("mfa:{}", user_id.0);
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(
+                views::login_verify_page(Some(
+                    "Too many attempts. Wait a moment and try again.",
+                ))
+                .into_string(),
+            ),
+        )
+            .into_response();
+    }
+
+    let user = match state.users.find_by_id(user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Redirect::to("/login").into_response(),
+        Err(err) => {
+            tracing::error!(?err, "login_verify: user lookup");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    // TOTP code path (primary).
+    if let Some(code) = form.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        let secret = match auth::user_totp::load_verified_secret(
+            &state.db,
+            &state.secret_key,
+            user_id,
+        )
+        .await
+        {
+            Ok(Some(s)) => s,
+            // No verified TOTP → the pending state is stale; restart.
+            Ok(None) => return Redirect::to("/login").into_response(),
+            Err(err) => {
+                tracing::error!(?err, "login_verify: load secret");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            }
+        };
+        if auth::totp::verify_code(&secret, code, chrono::Utc::now().timestamp()) {
+            return issue_session_after_mfa(&state, &user, MfaFactor::Totp).await;
+        }
+        state.rate_limiter.record_failure(&rl_key);
+        audit_mfa_failed(&state, &user, "totp").await;
+        return Html(
+            views::login_verify_page(Some("That code didn't match. Try again."))
+                .into_string(),
+        )
+        .into_response();
+    }
+
+    // Recovery-code break-glass path.
+    if let Some(rc) = form
+        .recovery_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        let ok = match verify_recovery_code(&state, user_id, rc).await {
+            Ok(ok) => ok,
+            Err(err) => {
+                tracing::error!(?err, "login_verify: recovery verify");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            }
+        };
+        if ok {
+            return issue_session_after_mfa(&state, &user, MfaFactor::RecoveryCode).await;
+        }
+        state.rate_limiter.record_failure(&rl_key);
+        audit_mfa_failed(&state, &user, "recovery_code").await;
+        return Html(
+            views::login_verify_page(Some("That recovery code didn't match."))
+                .into_string(),
+        )
+        .into_response();
+    }
+
+    Html(views::login_verify_page(Some("Enter your authenticator code.")).into_string())
+        .into_response()
+}
+
+#[derive(Clone, Copy)]
+enum MfaFactor {
+    Totp,
+    RecoveryCode,
+}
+
+impl MfaFactor {
+    fn label(self) -> &'static str {
+        match self {
+            MfaFactor::Totp => "totp",
+            MfaFactor::RecoveryCode => "recovery_code",
+        }
+    }
+}
+
+/// Verify a recovery code for `user_id` (stamps `last_used_at`). Its own
+/// transaction; the code stays valid for reuse as the recovery factor.
+async fn verify_recovery_code(
+    state: &AppState,
+    user_id: identity::UserId,
+    presented: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = state.db.begin().await?;
+    let ok = auth::user_recovery_code::verify_and_stamp(&mut tx, user_id, presented).await?;
+    tx.commit().await?;
+    Ok(ok)
+}
+
+/// Issue the real session once the second factor has passed: create the
+/// session, stamp TOTP usage (if that was the factor), audit
+/// `signin_success {mfa}`, set `hearth_session`, clear `hearth_mfa`.
+async fn issue_session_after_mfa(
+    state: &AppState,
+    user: &identity::User,
+    factor: MfaFactor,
+) -> Response {
+    let actor = audit::Actor {
+        user_id: user.id,
+        display_name: user.display_name.clone(),
+    };
+    let result: anyhow::Result<String> = async {
+        let mut tx = state.db.begin().await?;
+        let (session, token) =
+            auth::SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
+        if matches!(factor, MfaFactor::Totp) {
+            auth::user_totp::stamp_used(&mut tx, user.id).await?;
+        }
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "signin_success",
+            serde_json::json!({
+                "email": user.email,
+                "session_id": session.id,
+                "via": "web",
+                "mfa": factor.label(),
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(token)
+    }
+    .await;
+
+    match result {
+        Ok(token) => {
+            let mut resp = Redirect::to("/me").into_response();
+            append_cookie_header(
+                &mut resp,
+                &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+            );
+            append_cookie_header(&mut resp, &mfa_cookie_value("", /* clearing = */ true));
+            resp
+        }
+        Err(err) => {
+            tracing::error!(?err, "login_verify: issue session");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
+/// Best-effort audit of a failed second-factor attempt.
+async fn audit_mfa_failed(state: &AppState, user: &identity::User, factor: &str) {
+    let actor = audit::Actor {
+        user_id: user.id,
+        display_name: user.display_name.clone(),
+    };
+    let logged: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "mfa_failed",
+            serde_json::json!({ "via": "web", "factor": factor }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = logged {
+        tracing::error!(?err, "login_verify: audit mfa_failed");
+    }
 }
 
 #[derive(Deserialize)]
@@ -1511,8 +2031,12 @@ pub async fn recover_submit(
     match verified {
         Some(user_id) => {
             let expires_at = chrono::Utc::now().timestamp() + RESET_TTL_SECS;
-            let token =
-                hearth::recovery_token::sign(&state.csrf_secret, user_id.0, expires_at);
+            let token = hearth::signed_token::sign(
+                &state.csrf_secret,
+                hearth::signed_token::PURPOSE_RECOVERY_RESET,
+                user_id.0,
+                expires_at,
+            );
             let mut resp = Redirect::to("/recover/reset").into_response();
             set_cookie_header(&mut resp, &recovery_cookie_value(&token, false));
             resp
