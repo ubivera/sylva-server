@@ -32,6 +32,9 @@ pub struct AppState {
     /// sessions. Behind an `Arc` so cloning [`AppState`] doesn't copy 32
     /// bytes per request.
     pub csrf_secret: Arc<[u8; csrf::SECRET_LEN]>,
+    /// Per-client throttle for the brute-forceable auth endpoints
+    /// (login / recover). Process-local; see [`crate::rate_limit`].
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 }
 
 /// Convenience used by the integration test harness. Constructs the
@@ -56,6 +59,7 @@ pub fn router(
         public_base_url,
         instance_name,
         csrf_secret: Arc::new(csrf::generate_secret()),
+        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::auth_default()),
     };
 
     let health = Router::new()

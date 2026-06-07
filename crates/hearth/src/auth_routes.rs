@@ -41,8 +41,20 @@ pub struct ErrorResponse {
 /// distinction is recorded in the audit log only.
 pub async fn login(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    // Shares the per-IP "login:" bucket with the web form — both are
+    // password guesses from the same client.
+    let rl_key = format!("login:{}", crate::rate_limit::client_key(&headers));
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse { error: "rate_limited" }),
+        )
+            .into_response();
+    }
+
     let outcome = match auth::verify_credentials(&state.db, &req.email, &req.password).await {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -68,6 +80,7 @@ pub async fn login(
             }
         },
         Err(why) => {
+            state.rate_limiter.record_failure(&rl_key);
             if let Err(err) = audit_signin_failure(&state, &req.email, why).await {
                 tracing::error!(?err, "auditing signin failure");
             }

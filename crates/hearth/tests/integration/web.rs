@@ -1375,3 +1375,756 @@ async fn me_email_submit_invalid_email_shape_rejected() {
     .unwrap();
     assert_eq!(row.0, "u@test.local");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Account settings — change password (Security tab)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The Security tab's change-password form ships in the on-demand
+/// account-settings fragment: new-password field, client-side confirm
+/// guard, and a reauth-chain submit (the current password is collected
+/// by the reauth modal, not inline).
+#[tokio::test]
+async fn account_settings_security_renders_change_password_form() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"data-settings-panel="security""#));
+    assert!(body.contains(r#"id="form-change-password""#));
+    assert!(body.contains(r#"name="new_password""#));
+    // Confirm field is a client-side guard only (no name → not submitted).
+    assert!(body.contains(r#"data-pw-confirm="change-pw-new""#));
+    // Submit routes through the reauth chain, not a native submit.
+    assert!(body.contains(r#"data-reauth-confirm="form-change-password""#));
+}
+
+/// POST /me/password with the correct current password updates the
+/// hash, writes a `password_changed` audit event, and the new password
+/// works for sign-in while the old one no longer does.
+#[tokio::test]
+async fn me_password_change_succeeds_with_correct_current() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "oldpw123", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "oldpw123").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&password={}&new_password={}",
+        urlencoding(&csrf),
+        urlencoding("oldpw123"),
+        urlencoding("brandnewpw456"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/password")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/me"),
+        "successful password change should HX-Redirect to /me"
+    );
+    let trigger = resp
+        .headers()
+        .get("HX-Trigger")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        trigger.contains("Password changed") || trigger.contains("password"),
+        "HX-Trigger should carry the password_changed toast: {trigger}"
+    );
+
+    let (audit_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'password_changed' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1);
+
+    assert!(
+        web_login(&app, "u@test.local", "brandnewpw456").await.is_some(),
+        "new password should authenticate"
+    );
+    assert!(
+        web_login(&app, "u@test.local", "oldpw123").await.is_none(),
+        "old password should no longer authenticate"
+    );
+}
+
+/// Wrong current password re-renders the reauth modal with the
+/// `invalid_password` banner and the staged new password preserved;
+/// the stored password is unchanged.
+#[tokio::test]
+async fn me_password_change_wrong_current_returns_reauth_error() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "oldpw123", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "oldpw123").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&password={}&new_password={}",
+        urlencoding(&csrf),
+        urlencoding("WRONGcurrent"),
+        urlencoding("brandnewpw456"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/password")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains(r#"action="/me/password""#), "reauth content should target /me/password");
+    assert!(body.contains("Incorrect password"), "reauth content should show the invalid_password banner");
+    assert!(body.contains(r#"name="new_password""#), "staged new_password should survive the retry");
+
+    assert!(
+        web_login(&app, "u@test.local", "oldpw123").await.is_some(),
+        "password must be unchanged after a wrong-current-password attempt"
+    );
+}
+
+/// Empty new password is rejected (HX-Redirect to /me with an error
+/// toast); the stored password is unchanged.
+#[tokio::test]
+async fn me_password_change_empty_new_rejected() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "oldpw123", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "oldpw123").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!(
+        "csrf_token={}&password={}&new_password=",
+        urlencoding(&csrf),
+        urlencoding("oldpw123"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/password")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/me"),
+    );
+    assert!(
+        web_login(&app, "u@test.local", "oldpw123").await.is_some(),
+        "password must be unchanged when new password is empty"
+    );
+}
+
+/// Changing the password revokes every *other* active session for the
+/// user, while the session that made the change stays alive. Mirrors
+/// the JSON `change_password` behavior.
+#[tokio::test]
+async fn me_password_change_revokes_other_sessions() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "oldpw123", InstanceRole::Member)
+        .await;
+    let cookie_a = cookie_name_value(&web_login(&app, "u@test.local", "oldpw123").await.unwrap());
+    let cookie_b = cookie_name_value(&web_login(&app, "u@test.local", "oldpw123").await.unwrap());
+    let session_a = app.session_id_for_cookie(&cookie_a).await;
+    let csrf_a = app.csrf_for(session_a);
+
+    let body = format!(
+        "csrf_token={}&password={}&new_password={}",
+        urlencoding(&csrf_a),
+        urlencoding("oldpw123"),
+        urlencoding("brandnewpw456"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/password")
+        .header(header::COOKIE, cookie_a.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (status_b, _) = get_with_cookie(&app, "/me", Some(&cookie_b)).await;
+    assert_eq!(status_b, StatusCode::SEE_OTHER, "other session should be revoked");
+    let (status_a, _) = get_with_cookie(&app, "/me", Some(&cookie_a)).await;
+    assert_eq!(status_a, StatusCode::OK, "current session should stay alive");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Account settings — regenerate recovery code (Data Control tab)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The Data Control tab's Recovery code section ships in the on-demand
+/// account-settings fragment with a reauth-chained Regenerate button.
+#[tokio::test]
+async fn account_settings_data_renders_recovery_section() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let set_cookie = web_login(&app, "u@test.local", "pw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"data-settings-panel="data""#));
+    assert!(body.contains("Recovery code"));
+    assert!(body.contains(r#"id="form-regenerate-recovery""#));
+    assert!(body.contains(r#"data-reauth-confirm="form-regenerate-recovery""#));
+}
+
+/// Regenerating with the correct password mints a new code (shown once
+/// in the response), invalidates the old one, and audits
+/// `recovery_code_rotated`. The displayed code's hash matches the new
+/// DB row; the old code's hash no longer does.
+#[tokio::test]
+async fn me_recovery_regenerate_succeeds_and_rotates() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "rightpw", InstanceRole::Member)
+        .await;
+    // Seed a known starting code so we can prove it's invalidated.
+    let old_code = "OLD0-OLD0-OLD0-OLD0-OLD0-OLD0-OLD0-OLD0";
+    {
+        let mut tx = app.pool.begin().await.unwrap();
+        auth::user_recovery_code::bootstrap(&mut tx, user.id, old_code)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let set_cookie = web_login(&app, "u@test.local", "rightpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!("csrf_token={}&password={}", urlencoding(&csrf), urlencoding("rightpw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/recovery-code/regenerate")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    // Fragment (not a full page) with the one-time code + copy button.
+    assert!(!body.contains("<html"));
+    assert!(body.contains(r#"data-copy-target="recovery-code""#));
+
+    // Extract the displayed code from the readonly input's value.
+    let anchor = r#"id="recovery-code""#;
+    let id_pos = body.find(anchor).expect("recovery-code input in body");
+    let v_anchor = "value=\"";
+    let v_start = body[id_pos..].find(v_anchor).expect("value attr") + id_pos + v_anchor.len();
+    let v_end = v_start + body[v_start..].find('"').expect("closing quote");
+    let new_code = &body[v_start..v_end];
+    assert_eq!(new_code.len(), 39, "got: {new_code:?}");
+
+    // DB now stores the new code's hash, not the old one's.
+    let row: (Vec<u8>,) = sqlx::query_as(
+        "SELECT code_hash FROM auth.user_recovery_codes WHERE user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    let new_hash = auth::recovery_code::hash_code(new_code);
+    let old_hash = auth::recovery_code::hash_code(old_code);
+    assert_eq!(row.0.as_slice(), &new_hash[..], "DB should hold the new code's hash");
+    assert_ne!(row.0.as_slice(), &old_hash[..], "old code must be invalidated");
+
+    // Audit row written.
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'recovery_code_rotated' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// Wrong current password re-renders the reauth modal with the error
+/// banner; the stored recovery code is left untouched.
+#[tokio::test]
+async fn me_recovery_regenerate_wrong_password_leaves_code() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "rightpw", InstanceRole::Member)
+        .await;
+    let old_code = "KEEP-KEEP-KEEP-KEEP-KEEP-KEEP-KEEP-KEEP";
+    {
+        let mut tx = app.pool.begin().await.unwrap();
+        auth::user_recovery_code::bootstrap(&mut tx, user.id, old_code)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let set_cookie = web_login(&app, "u@test.local", "rightpw").await.unwrap();
+    let cookie = cookie_name_value(&set_cookie);
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!("csrf_token={}&password={}", urlencoding(&csrf), urlencoding("WRONGpw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/recovery-code/regenerate")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains(r#"action="/me/recovery-code/regenerate""#));
+    assert!(body.contains("Incorrect password"));
+    assert!(!body.contains(r#"data-copy-target="recovery-code""#), "no new code on failure");
+
+    // Stored code is unchanged.
+    let row: (Vec<u8>,) = sqlx::query_as(
+        "SELECT code_hash FROM auth.user_recovery_codes WHERE user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_slice(), &auth::recovery_code::hash_code(old_code)[..]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Offline forgot-password flow (/recover + /recover/reset)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Pull a named cookie's value out of a response's `Set-Cookie` headers.
+fn set_cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    for v in headers.get_all(header::SET_COOKIE) {
+        if let Ok(s) = v.to_str()
+            && let Some(rest) = s.strip_prefix(&prefix)
+        {
+            return Some(rest.split(';').next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn login_page_links_to_recover() {
+    let app = TestApp::new().await;
+    let (status, body) = get_with_cookie(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"href="/recover""#), "login should offer a recovery link");
+}
+
+#[tokio::test]
+async fn recover_page_renders_email_and_code_fields() {
+    let app = TestApp::new().await;
+    let (status, body) = get_with_cookie(&app, "/recover", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"action="/recover""#));
+    assert!(body.contains(r#"name="email""#));
+    assert!(body.contains(r#"name="recovery_code""#));
+}
+
+/// End-to-end: a locked-out user proves email + recovery code, sets a
+/// new password, and the old code is rotated. The new password works,
+/// the old one doesn't, and the new code shown matches the DB.
+#[tokio::test]
+async fn recover_full_flow_resets_password_and_rotates_code() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("locked@test.local", "Locked", "forgotten", InstanceRole::Member)
+        .await;
+    let old_code = "RCV0-RCV0-RCV0-RCV0-RCV0-RCV0-RCV0-RCV0";
+    {
+        let mut tx = app.pool.begin().await.unwrap();
+        auth::user_recovery_code::bootstrap(&mut tx, user.id, old_code)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Step 1: POST /recover with email + code → redirect + reset cookie.
+    let body = format!(
+        "email={}&recovery_code={}",
+        urlencoding("locked@test.local"),
+        urlencoding(old_code),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/recover/reset")
+    );
+    let reset_token = set_cookie_value(resp.headers(), "hearth_recovery")
+        .expect("recover should set the reset cookie");
+    assert!(!reset_token.is_empty());
+    let reset_cookie = format!("hearth_recovery={reset_token}");
+
+    // Step 2: GET /recover/reset with the cookie renders the form.
+    let (status, reset_form) = get_with_cookie(&app, "/recover/reset", Some(&reset_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(reset_form.contains(r#"action="/recover/reset""#));
+
+    // Step 3: POST the new password.
+    let body = format!(
+        "new_password={}&confirm_password={}",
+        urlencoding("brand-new-pw"),
+        urlencoding("brand-new-pw"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover/reset")
+        .header(header::COOKIE, reset_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp_headers = resp.headers().clone();
+    // A fresh session is issued for this device.
+    assert!(
+        set_cookie_value(&resp_headers, "hearth_session").is_some(),
+        "reset should log the device in"
+    );
+    let reset_body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    // The new recovery code is shown once.
+    let anchor = r#"id="recovery-code""#;
+    let id_pos = reset_body.find(anchor).expect("interstitial shows the new code");
+    let v_start = reset_body[id_pos..].find("value=\"").expect("value attr") + id_pos + 7;
+    let v_end = v_start + reset_body[v_start..].find('"').unwrap();
+    let new_code = &reset_body[v_start..v_end];
+    assert_eq!(new_code.len(), 39);
+
+    // Password rotated: new works, old fails.
+    assert!(web_login(&app, "locked@test.local", "brand-new-pw").await.is_some());
+    assert!(web_login(&app, "locked@test.local", "forgotten").await.is_none());
+
+    // Recovery code rotated: DB holds the new code's hash, not the old.
+    let row: (Vec<u8>,) = sqlx::query_as(
+        "SELECT code_hash FROM auth.user_recovery_codes WHERE user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_slice(), &auth::recovery_code::hash_code(new_code)[..]);
+    assert_ne!(row.0.as_slice(), &auth::recovery_code::hash_code(old_code)[..]);
+
+    // Audit trail recorded both ends.
+    for event in ["recovery_started", "recovery_succeeded"] {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM audit.events WHERE event_type = $1 AND actor_user_id = $2",
+        )
+        .bind(event)
+        .bind(user.id.0)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "expected one {event} event");
+    }
+}
+
+/// A wrong recovery code yields the generic error, sets no reset cookie,
+/// and records a failed attempt.
+#[tokio::test]
+async fn recover_wrong_code_is_generic_and_sets_no_cookie() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("locked@test.local", "Locked", "pw", InstanceRole::Member)
+        .await;
+    {
+        let mut tx = app.pool.begin().await.unwrap();
+        auth::user_recovery_code::bootstrap(&mut tx, user.id, "GOOD-GOOD-GOOD-GOOD-GOOD-GOOD-GOOD-GOOD")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let body = format!(
+        "email={}&recovery_code={}",
+        urlencoding("locked@test.local"),
+        urlencoding("WRONG-CODE"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(set_cookie_value(resp.headers(), "hearth_recovery").is_none());
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains("didn't match"), "should show the generic error");
+
+    let (failed,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events WHERE event_type = 'recovery_failed'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(failed, 1);
+}
+
+/// Unknown email behaves identically to a wrong code (no enumeration).
+#[tokio::test]
+async fn recover_unknown_email_is_generic() {
+    let app = TestApp::new().await;
+    let body = format!(
+        "email={}&recovery_code={}",
+        urlencoding("nobody@test.local"),
+        urlencoding("WHATEVER-CODE"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(set_cookie_value(resp.headers(), "hearth_recovery").is_none());
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains("didn't match"));
+}
+
+/// The reset step is gated by the cookie: no cookie → bounce to /recover.
+#[tokio::test]
+async fn recover_reset_without_cookie_redirects_to_recover() {
+    let app = TestApp::new().await;
+    // GET
+    let (status, _) = get_with_cookie(&app, "/recover/reset", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // POST
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover/reset")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from("new_password=x&confirm_password=x"))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/recover")
+    );
+}
+
+/// A tampered/garbage reset cookie is rejected the same way.
+#[tokio::test]
+async fn recover_reset_with_garbage_cookie_redirects() {
+    let app = TestApp::new().await;
+    let (status, _) =
+        get_with_cookie(&app, "/recover/reset", Some("hearth_recovery=not-a-valid-token")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+/// Mismatched confirm re-renders with an error; password stays put.
+#[tokio::test]
+async fn recover_reset_password_mismatch_rerenders() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("locked@test.local", "Locked", "original", InstanceRole::Member)
+        .await;
+    {
+        let mut tx = app.pool.begin().await.unwrap();
+        auth::user_recovery_code::bootstrap(&mut tx, user.id, "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // Get a valid reset cookie.
+    let body = format!(
+        "email={}&recovery_code={}",
+        urlencoding("locked@test.local"),
+        urlencoding("AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA"),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let reset_cookie = format!(
+        "hearth_recovery={}",
+        set_cookie_value(resp.headers(), "hearth_recovery").unwrap()
+    );
+
+    let body = "new_password=abcdefgh&confirm_password=DIFFERENT";
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/recover/reset")
+        .header(header::COOKIE, reset_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains("don't match"));
+    // Original password still works.
+    assert!(web_login(&app, "locked@test.local", "original").await.is_some());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auth endpoint rate limiting
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn post_form_with_ip(app: &TestApp, uri: &str, ip: &str, body: String) -> StatusCode {
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("x-forwarded-for", ip)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    tower::ServiceExt::oneshot(app.router.clone(), req)
+        .await
+        .unwrap()
+        .status()
+}
+
+/// After a burst of failed `/recover` attempts from one IP, the next is
+/// throttled with 429 — while a different IP is unaffected (independent
+/// buckets, keyed off `X-Forwarded-For`).
+#[tokio::test]
+async fn recover_is_rate_limited_per_ip() {
+    let app = TestApp::new().await;
+    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let body = || {
+        format!(
+            "email={}&recovery_code={}",
+            urlencoding("nobody@test.local"),
+            urlencoding("WRONG"),
+        )
+    };
+
+    for _ in 0..burst {
+        assert_eq!(
+            post_form_with_ip(&app, "/recover", "10.9.9.9", body()).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        post_form_with_ip(&app, "/recover", "10.9.9.9", body()).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "burst+1 from the same IP should be throttled"
+    );
+    assert_eq!(
+        post_form_with_ip(&app, "/recover", "10.9.9.10", body()).await,
+        StatusCode::OK,
+        "a different IP has its own bucket"
+    );
+}
+
+/// The login form is throttled the same way. Unknown-email attempts
+/// skip the Argon2 path, so draining the bucket stays cheap.
+#[tokio::test]
+async fn login_is_rate_limited_per_ip() {
+    let app = TestApp::new().await;
+    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let body = || {
+        format!(
+            "email={}&password={}",
+            urlencoding("nobody@test.local"),
+            urlencoding("x"),
+        )
+    };
+
+    for _ in 0..burst {
+        assert_eq!(
+            post_form_with_ip(&app, "/login", "10.8.8.8", body()).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        post_form_with_ip(&app, "/login", "10.8.8.8", body()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+/// A successful login does not consume the throttle budget — a user who
+/// signs in correctly is never throttled by their own activity.
+#[tokio::test]
+async fn successful_login_does_not_consume_rate_budget() {
+    let app = TestApp::new().await;
+    app.seed_user("good@test.local", "Good", "rightpw", InstanceRole::Member)
+        .await;
+    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    for _ in 0..(burst + 2) {
+        let ok = format!(
+            "email={}&password={}",
+            urlencoding("good@test.local"),
+            urlencoding("rightpw"),
+        );
+        // 303 redirect to /me on success.
+        assert_eq!(
+            post_form_with_ip(&app, "/login", "10.7.7.7", ok).await,
+            StatusCode::SEE_OTHER
+        );
+    }
+}
