@@ -26,6 +26,7 @@ use crate::app::AppState;
 
 const PURPOSE_REGISTER: &str = "register";
 const PURPOSE_AUTH: &str = "authenticate";
+const PURPOSE_DISCOVERABLE: &str = "discoverable";
 
 /// Upper bound on passkeys per user (parallels the authenticator cap).
 pub const MAX_PASSKEYS: i64 = 50;
@@ -230,6 +231,87 @@ pub async fn finish_authentication(
     Ok(true)
 }
 
+// ── Passwordless (discoverable) ceremony ──────────────────────────────────
+
+/// Begin a passwordless sign-in: a *discoverable* assertion with no user
+/// identified up front. Returns `(challenge_id, options)`; the ceremony
+/// state is stored userless and resolved on finish from the assertion's
+/// user handle. (webauthn-rs forces `mediation: conditional` in the
+/// options — the client ignores that field to drive a click-to-pick modal
+/// instead of autofill.)
+pub async fn start_discoverable(state: &AppState) -> anyhow::Result<(Uuid, Value)> {
+    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let (rcr, disc_state) = webauthn.start_discoverable_authentication()?;
+    let challenge_id =
+        insert_discoverable_challenge(&state.db, &serde_json::to_value(&disc_state)?).await?;
+    Ok((challenge_id, serde_json::to_value(&rcr)?))
+}
+
+/// Finish a passwordless sign-in. Reads the user handle from the assertion
+/// to locate the account, verifies against that user's passkeys, stamps
+/// the matched credential, and returns the authenticated user id. Any
+/// failure (bad assertion, unknown user, no passkeys, rejected) returns
+/// `Ok(None)` — the caller renders a generic error.
+pub async fn finish_discoverable(
+    state: &AppState,
+    challenge_id: Uuid,
+    credential_json: &str,
+) -> anyhow::Result<Option<UserId>> {
+    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let pkc: PublicKeyCredential = match serde_json::from_str(credential_json) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(?err, "malformed passwordless assertion");
+            return Ok(None);
+        }
+    };
+    let state_json = match take_discoverable_challenge(&state.db, challenge_id).await? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let disc_state: DiscoverableAuthentication = serde_json::from_value(state_json)?;
+
+    let user_uuid = match webauthn.identify_discoverable_authentication(&pkc) {
+        Ok((uuid, _cred_id)) => uuid,
+        Err(err) => {
+            tracing::warn!(?err, "passwordless: identify");
+            return Ok(None);
+        }
+    };
+    let user_id = UserId(user_uuid);
+    let mut passkeys = all_passkeys(&state.db, user_id).await?;
+    if passkeys.is_empty() {
+        return Ok(None);
+    }
+    let disc_keys: Vec<DiscoverableKey> =
+        passkeys.iter().map(|(_, pk)| DiscoverableKey::from(pk)).collect();
+    let result = match webauthn.finish_discoverable_authentication(&pkc, disc_state, &disc_keys) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(?err, "passwordless: finish");
+            return Ok(None);
+        }
+    };
+
+    for (row_id, passkey) in passkeys.iter_mut() {
+        if passkey.cred_id() == result.cred_id() {
+            if passkey.update_credential(&result) == Some(true) {
+                sqlx::query("UPDATE auth.webauthn_credentials SET credential = $2 WHERE id = $1")
+                    .bind(*row_id)
+                    .bind(serde_json::to_value(&*passkey)?)
+                    .execute(&state.db)
+                    .await?;
+            }
+            sqlx::query("UPDATE auth.webauthn_credentials SET last_used_at = now() WHERE id = $1")
+                .bind(*row_id)
+                .execute(&state.db)
+                .await?;
+            break;
+        }
+    }
+    Ok(Some(user_id))
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────
 
 async fn existing_cred_ids(pool: &PgPool, user_id: UserId) -> anyhow::Result<Vec<CredentialID>> {
@@ -294,6 +376,42 @@ async fn take_challenge(
     .bind(id)
     .bind(user_id)
     .bind(purpose)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// Insert a userless (passwordless) ceremony state. There's no user to
+/// scope by, so we prune stale discoverable challenges by age instead of
+/// per-user. Returns the challenge id.
+async fn insert_discoverable_challenge(pool: &PgPool, state_json: &Value) -> anyhow::Result<Uuid> {
+    sqlx::query(
+        "DELETE FROM auth.webauthn_challenges
+         WHERE purpose = $1 AND created_at < now() - interval '10 minutes'",
+    )
+    .bind(PURPOSE_DISCOVERABLE)
+    .execute(pool)
+    .await?;
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO auth.webauthn_challenges (user_id, purpose, state)
+         VALUES (NULL, $1, $2) RETURNING id",
+    )
+    .bind(PURPOSE_DISCOVERABLE)
+    .bind(state_json)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Consume a userless discoverable ceremony state by id.
+async fn take_discoverable_challenge(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<Value>> {
+    let row: Option<(Value,)> = sqlx::query_as(
+        "DELETE FROM auth.webauthn_challenges
+         WHERE id = $1 AND purpose = $2
+         RETURNING state",
+    )
+    .bind(id)
+    .bind(PURPOSE_DISCOVERABLE)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(v,)| v))

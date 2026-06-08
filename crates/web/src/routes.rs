@@ -137,10 +137,10 @@ pub async fn login_submit(
         }
     };
 
-    // Password is correct. If the user has a second factor, don't issue a
-    // session yet — hand off to /login/verify with a short-lived,
-    // single-purpose cookie instead.
-    match auth::user_totp::is_enrolled(&state.db, user.id).await {
+    // Password is correct. If the user has any second factor (TOTP or a
+    // passkey), don't issue a session yet — hand off to /login/verify
+    // with a short-lived, single-purpose cookie instead.
+    match hearth::mfa::has_second_factor(&state.db, user.id).await {
         Ok(true) => {
             let mut resp = Redirect::to("/login/verify").into_response();
             set_cookie_header(&mut resp, &mfa_pending_cookie(&state, user.id));
@@ -148,7 +148,7 @@ pub async fn login_submit(
         }
         Ok(false) => {}
         Err(err) => {
-            tracing::error!(?err, "login: TOTP enrollment check");
+            tracing::error!(?err, "login: second-factor check");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     }
@@ -196,6 +196,100 @@ pub async fn login_submit(
         &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
     );
     response
+}
+
+/// `POST /login/passkey/start` — begin a passwordless (discoverable)
+/// passkey sign-in. Returns the WebAuthn request options + a challenge id
+/// as JSON. Public; lightly rate-limited per IP to bound challenge churn.
+pub async fn login_passkey_start(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let rl_key = format!("pklogin:{}", hearth::rate_limit::client_key(&headers));
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
+    }
+    match hearth::webauthn::start_discoverable(&state).await {
+        Ok((challenge_id, options)) => axum::Json(serde_json::json!({
+            "challenge_id": challenge_id,
+            "options": options,
+        }))
+        .into_response(),
+        Err(err) => {
+            tracing::error!(?err, "login_passkey_start");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LoginPasskeyFinishForm {
+    pub challenge_id: uuid::Uuid,
+    pub passkey: String,
+}
+
+/// `POST /login/passkey/finish` — complete a passwordless sign-in. The
+/// assertion identifies the user (via its user handle); on success we
+/// issue a session directly — no password, no second step (a passkey
+/// requires user verification, so it's inherently multi-factor). Still
+/// gated on the account being **active**, mirroring `verify_credentials`.
+pub async fn login_passkey_finish(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LoginPasskeyFinishForm>,
+) -> Response {
+    let rl_key = format!("login:{}", hearth::rate_limit::client_key(&headers));
+    if !state.rate_limiter.allowed(&rl_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(
+                views::login_page(Some("Too many attempts. Wait a moment and try again."), None)
+                    .into_string(),
+            ),
+        )
+            .into_response();
+    }
+
+    let user_id = match hearth::webauthn::finish_discoverable(&state, form.challenge_id, &form.passkey)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            state.rate_limiter.record_failure(&rl_key);
+            return Html(
+                views::login_page(
+                    Some("Passkey sign-in didn't work. Try again, or sign in with your password."),
+                    None,
+                )
+                .into_string(),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            tracing::error!(?err, "login_passkey_finish");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    let user = match state.users.find_by_id(user_id).await {
+        // Only active accounts may sign in (deactivated / deleted users may
+        // still have passkey rows — the password path gates this via the
+        // `lifecycle = 'active'` filter, so we must too).
+        Ok(Some(u)) if matches!(u.lifecycle, identity::UserLifecycle::Active) => u,
+        Ok(_) => {
+            state.rate_limiter.record_failure(&rl_key);
+            return Html(
+                views::login_page(Some("That account can't sign in."), None).into_string(),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            tracing::error!(?err, "login_passkey_finish: user lookup");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+
+    issue_session_after_mfa(&state, &user, MfaFactor::Passkey).await
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2113,6 +2207,19 @@ fn mfa_pending_user_id(
     .map(identity::UserId::new)
 }
 
+/// Which second factors a pending-MFA user has, for rendering the
+/// challenge page. Errors degrade to `false` (the recovery-code fallback
+/// is always available regardless).
+async fn login_verify_factors(state: &AppState, user_id: identity::UserId) -> (bool, bool) {
+    let has_totp = auth::user_totp::is_enrolled(&state.db, user_id)
+        .await
+        .unwrap_or(false);
+    let has_passkey = hearth::webauthn::has_any(&state.db, user_id)
+        .await
+        .unwrap_or(false);
+    (has_totp, has_passkey)
+}
+
 /// `GET /login/verify` — render the second-factor challenge. Bounces to
 /// `/login` without a valid pending-MFA cookie.
 pub async fn login_verify_page(
@@ -2120,7 +2227,11 @@ pub async fn login_verify_page(
     headers: axum::http::HeaderMap,
 ) -> Response {
     match mfa_pending_user_id(&state, &headers) {
-        Some(_) => Html(views::login_verify_page(None).into_string()).into_response(),
+        Some(uid) => {
+            let (has_totp, has_passkey) = login_verify_factors(&state, uid).await;
+            Html(views::login_verify_page(None, has_totp, has_passkey).into_string())
+                .into_response()
+        }
         None => Redirect::to("/login").into_response(),
     }
 }
@@ -2129,12 +2240,15 @@ pub async fn login_verify_page(
 pub struct LoginVerifyForm {
     pub code: Option<String>,
     pub recovery_code: Option<String>,
+    /// WebAuthn assertion JSON (passkey path) + its challenge id.
+    pub passkey: Option<String>,
+    pub challenge_id: Option<uuid::Uuid>,
 }
 
-/// `POST /login/verify` — finish sign-in by checking the second factor.
-/// TOTP code (primary) or a recovery code (break-glass). On success
-/// issues the real session, clears the pending cookie, and lands `/me`.
-/// Rate-limited per user (`mfa:{id}`).
+/// `POST /login/verify` — finish sign-in by checking the second factor:
+/// a passkey assertion, a TOTP code, or a recovery code (break-glass).
+/// On success issues the real session, clears the pending cookie, and
+/// lands `/me`. Rate-limited per user (`mfa:{id}`).
 pub async fn login_verify_submit(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -2144,15 +2258,18 @@ pub async fn login_verify_submit(
         Some(id) => id,
         None => return Redirect::to("/login").into_response(),
     };
+    let (has_totp, has_passkey) = login_verify_factors(&state, user_id).await;
 
     let rl_key = format!("mfa:{}", user_id.0);
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Html(
-                views::login_verify_page(Some(
-                    "Too many attempts. Wait a moment and try again.",
-                ))
+                views::login_verify_page(
+                    Some("Too many attempts. Wait a moment and try again."),
+                    has_totp,
+                    has_passkey,
+                )
                 .into_string(),
             ),
         )
@@ -2168,7 +2285,38 @@ pub async fn login_verify_submit(
         }
     };
 
-    // TOTP code path (primary). Try the code against every enrolled
+    // Passkey path: a WebAuthn assertion (+ its challenge id), produced
+    // by the navigator.credentials.get ceremony.
+    if let Some(assertion) = form.passkey.as_deref().filter(|c| !c.is_empty()) {
+        let Some(challenge_id) = form.challenge_id else {
+            return Redirect::to("/login/verify").into_response();
+        };
+        match hearth::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await
+        {
+            Ok(true) => {
+                return issue_session_after_mfa(&state, &user, MfaFactor::Passkey).await;
+            }
+            Ok(false) => {
+                state.rate_limiter.record_failure(&rl_key);
+                audit_mfa_failed(&state, &user, "passkey").await;
+                return Html(
+                    views::login_verify_page(
+                        Some("That passkey didn't work. Try again."),
+                        has_totp,
+                        has_passkey,
+                    )
+                    .into_string(),
+                )
+                .into_response();
+            }
+            Err(err) => {
+                tracing::error!(?err, "login_verify: passkey finish");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            }
+        }
+    }
+
+    // TOTP code path. Try the code against every enrolled
     // authenticator until one accepts it.
     if let Some(code) = form.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         let secrets = match auth::user_totp::verified_secrets(
@@ -2198,8 +2346,12 @@ pub async fn login_verify_submit(
         state.rate_limiter.record_failure(&rl_key);
         audit_mfa_failed(&state, &user, "totp").await;
         return Html(
-            views::login_verify_page(Some("That code didn't match. Try again."))
-                .into_string(),
+            views::login_verify_page(
+                Some("That code didn't match. Try again."),
+                has_totp,
+                has_passkey,
+            )
+            .into_string(),
         )
         .into_response();
     }
@@ -2224,14 +2376,25 @@ pub async fn login_verify_submit(
         state.rate_limiter.record_failure(&rl_key);
         audit_mfa_failed(&state, &user, "recovery_code").await;
         return Html(
-            views::login_verify_page(Some("That recovery code didn't match."))
-                .into_string(),
+            views::login_verify_page(
+                Some("That recovery code didn't match."),
+                has_totp,
+                has_passkey,
+            )
+            .into_string(),
         )
         .into_response();
     }
 
-    Html(views::login_verify_page(Some("Enter your authenticator code.")).into_string())
-        .into_response()
+    Html(
+        views::login_verify_page(
+            Some("Choose a verification method to continue."),
+            has_totp,
+            has_passkey,
+        )
+        .into_string(),
+    )
+    .into_response()
 }
 
 #[derive(Clone, Copy)]
@@ -2239,6 +2402,9 @@ enum MfaFactor {
     /// TOTP, carrying the credential id that accepted the code (stamped
     /// as last-used when the session is issued).
     Totp(uuid::Uuid),
+    /// Passkey — `finish_authentication` already stamped the matched
+    /// credential, so no id is threaded here.
+    Passkey,
     RecoveryCode,
 }
 
@@ -2246,7 +2412,35 @@ impl MfaFactor {
     fn label(self) -> &'static str {
         match self {
             MfaFactor::Totp(_) => "totp",
+            MfaFactor::Passkey => "passkey",
             MfaFactor::RecoveryCode => "recovery_code",
+        }
+    }
+}
+
+/// `POST /login/verify/passkey/start` — begin a passkey assertion for the
+/// pending-MFA user. Returns the WebAuthn request options (+ a challenge
+/// id) as JSON for the browser ceremony. Gated by the `hearth_mfa` cookie.
+pub async fn login_verify_passkey_start(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let user_id = match mfa_pending_user_id(&state, &headers) {
+        Some(id) => id,
+        None => {
+            return (StatusCode::UNAUTHORIZED, "session expired").into_response();
+        }
+    };
+    match hearth::webauthn::start_authentication(&state, user_id).await {
+        Ok(Some((challenge_id, options))) => axum::Json(serde_json::json!({
+            "challenge_id": challenge_id,
+            "options": options,
+        }))
+        .into_response(),
+        Ok(None) => (StatusCode::BAD_REQUEST, "no passkeys").into_response(),
+        Err(err) => {
+            tracing::error!(?err, "login_verify_passkey_start");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
         }
     }
 }

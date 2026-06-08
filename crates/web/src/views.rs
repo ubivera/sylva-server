@@ -299,6 +299,12 @@ pub fn shell_public(title: &str, content: Markup) -> Markup {
                 footer class="site" {
                     code { (env!("CARGO_PKG_VERSION")) }
                 }
+                // Passkey ceremony glue — needed by the "Use a passkey"
+                // button on /login/verify (and the passwordless button on
+                // /login). Delegated + dormant on pages without passkeys.
+                script {
+                    (maud::PreEscaped(WEBAUTHN_JS))
+                }
             }
         }
     }
@@ -577,6 +583,14 @@ const WEBAUTHN_JS: &str = r#"
         return !!(window.PublicKeyCredential && navigator.credentials);
     }
 
+    // On a browser without WebAuthn, hide the sign-in passkey buttons so
+    // we don't offer something that can't work (the handlers still guard).
+    if (!supported()) {
+        document.querySelectorAll('[data-passkey-auth]').forEach(function(b) {
+            b.hidden = true;
+        });
+    }
+
     // Enrollment: navigator.credentials.create
     document.addEventListener('click', function(e) {
         var btn = e.target.closest('[data-passkey-create]');
@@ -616,6 +630,55 @@ const WEBAUTHN_JS: &str = r#"
             btn.disabled = false;
             showError(form, 'Passkey setup was cancelled or did not complete.');
         });
+    });
+
+    // Sign-in 2nd factor: fetch the challenge, run
+    // navigator.credentials.get, then native-submit the assertion to the
+    // verify endpoint (full-page POST → session + redirect).
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-passkey-auth]');
+        if (!btn) return;
+        e.preventDefault();
+        var startUrl = btn.getAttribute('data-passkey-auth');
+        var form = document.getElementById(btn.getAttribute('data-passkey-form'));
+        if (!form) return;
+        if (!supported()) {
+            showError(document, 'This browser does not support passkeys.');
+            return;
+        }
+        btn.disabled = true;
+        fetch(startUrl, { method: 'POST', headers: { 'Accept': 'application/json' } })
+            .then(function(r) { if (!r.ok) throw new Error('start'); return r.json(); })
+            .then(function(data) {
+                var opts = data.options.publicKey;
+                opts.challenge = b64urlToBuf(opts.challenge);
+                if (Array.isArray(opts.allowCredentials)) {
+                    opts.allowCredentials.forEach(function(c) { c.id = b64urlToBuf(c.id); });
+                }
+                return navigator.credentials.get({ publicKey: opts }).then(function(assertion) {
+                    var out = {
+                        id: assertion.id,
+                        rawId: bufToB64url(assertion.rawId),
+                        type: assertion.type,
+                        response: {
+                            authenticatorData: bufToB64url(assertion.response.authenticatorData),
+                            clientDataJSON: bufToB64url(assertion.response.clientDataJSON),
+                            signature: bufToB64url(assertion.response.signature),
+                            userHandle: assertion.response.userHandle
+                                ? bufToB64url(assertion.response.userHandle) : null,
+                        },
+                        extensions: assertion.getClientExtensionResults
+                            ? assertion.getClientExtensionResults() : {},
+                    };
+                    form.querySelector('[name="challenge_id"]').value = data.challenge_id;
+                    form.querySelector('[name="passkey"]').value = JSON.stringify(out);
+                    form.submit();
+                });
+            })
+            .catch(function() {
+                btn.disabled = false;
+                showError(document, 'Passkey sign-in was cancelled or did not complete.');
+            });
     });
 })();
 "#;
@@ -1332,6 +1395,23 @@ pub fn login_page(error: Option<&str>, prefill_email: Option<&str>) -> Markup {
                 }
                 button type="submit" class="btn" { "Sign in" }
             }
+            p class="login-verify-or" { "or" }
+            // Passwordless passkey sign-in. The hidden form is submitted by
+            // WEBAUTHN_JS after the navigator.credentials.get ceremony
+            // (reusing the [data-passkey-auth] handler); it posts the
+            // assertion to /login/passkey/finish, which resolves the user
+            // and issues a session.
+            form id="form-passkey-login" method="post" action="/login/passkey/finish" {
+                input type="hidden" name="challenge_id";
+                input type="hidden" name="passkey";
+            }
+            p class="error" id="passkey-error" hidden {}
+            button type="button" class="btn-secondary login-passkey-btn"
+                   data-passkey-auth="/login/passkey/start"
+                   data-passkey-form="form-passkey-login" {
+                (fingerprint_icon())
+                span { "Sign in with a passkey" }
+            }
             p class="login-recover-link" {
                 a href="/recover" { "Lost access?" }
             }
@@ -1414,30 +1494,57 @@ pub fn recover_reset_page(error: Option<&str>) -> Markup {
 /// correct password when the user has TOTP enrolled. Reachable only with
 /// a valid `hearth_mfa` cookie. Offers the authenticator code (primary)
 /// and a recovery-code break-glass (in a native `<details>`, no JS).
-pub fn login_verify_page(error: Option<&str>) -> Markup {
+pub fn login_verify_page(error: Option<&str>, has_totp: bool, has_passkey: bool) -> Markup {
     let content = html! {
         h1 { "Two-step verification" }
         div class="card" {
-            p class="muted recover-intro" {
-                "Enter the 6-digit code from your authenticator app to "
-                "finish signing in."
+            @if let Some(msg) = error {
+                p class="error" { (msg) }
             }
-            form method="post" action="/login/verify" {
-                @if let Some(msg) = error {
-                    p class="error" { (msg) }
+            @if has_passkey {
+                p class="muted recover-intro" {
+                    "Use one of your registered passkeys to finish signing in."
                 }
-                div class="field" {
-                    label for="code" { "Authenticator code" }
-                    input type="text" name="code" id="code"
-                          inputmode="numeric" autocomplete="one-time-code"
-                          pattern="[0-9]*" maxlength="6" required autofocus;
+                // Native form submitted by WEBAUTHN_JS after the
+                // navigator.credentials.get ceremony (full-page POST, not
+                // htmx — this is the public login flow).
+                form method="post" action="/login/verify" id="form-passkey-login" {
+                    input type="hidden" name="challenge_id";
+                    input type="hidden" name="passkey";
                 }
-                button type="submit" class="btn" { "Verify" }
+                p class="error" id="passkey-error" hidden {}
+                button type="button" class="btn"
+                       data-passkey-auth="/login/verify/passkey/start"
+                       data-passkey-form="form-passkey-login" {
+                    "Use a passkey"
+                }
+            }
+            @if has_totp {
+                @if has_passkey {
+                    p class="login-verify-or" { "or enter a code" }
+                }
+                @else {
+                    p class="muted recover-intro" {
+                        "Enter the 6-digit code from your authenticator app "
+                        "to finish signing in."
+                    }
+                }
+                form method="post" action="/login/verify" {
+                    div class="field" {
+                        label for="code" { "Authenticator code" }
+                        input type="text" name="code" id="code"
+                              inputmode="numeric" autocomplete="one-time-code"
+                              pattern="[0-9]*" maxlength="6" required;
+                    }
+                    button type="submit" class=(if has_passkey { "btn-secondary" } else { "btn" }) {
+                        "Verify"
+                    }
+                }
             }
             details class="login-verify-alt" {
                 summary { "Use a recovery code instead" }
                 p class="muted" {
-                    "If you've lost access to your authenticator, enter one "
+                    "If you've lost access to your second factor, enter one "
                     "of your saved recovery codes to sign in, then re-enroll "
                     "from settings."
                 }

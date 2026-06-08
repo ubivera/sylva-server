@@ -74,11 +74,13 @@ CREATE INDEX webauthn_credentials_user_idx ON auth.webauthn_credentials (user_id
 
 -- Short-lived WebAuthn ceremony state (registration / authentication),
 -- held between the start and finish requests. Rows are consumed on finish
--- and replaced on a new start; `purpose` keeps register vs authenticate
--- separate.
+-- and replaced on a new start; `purpose` keeps register / authenticate /
+-- discoverable separate. `user_id` is NULL for the passwordless
+-- (discoverable) ceremony — no user is known until the assertion's user
+-- handle is read on finish.
 CREATE TABLE auth.webauthn_challenges (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id    UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    user_id    UUID NULL REFERENCES identity.users(id) ON DELETE CASCADE,
     purpose    TEXT NOT NULL,
     state      JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()

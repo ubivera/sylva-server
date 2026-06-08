@@ -2599,3 +2599,122 @@ async fn passkey_section_renders_for_authed_user() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(r#"id="passkey-section""#));
 }
+
+/// Insert a placeholder passkey row. The login-gating + page-rendering
+/// paths only COUNT passkeys (they don't deserialize the credential), so
+/// a stub credential is enough to simulate "this user has a passkey"
+/// without a real WebAuthn ceremony.
+async fn seed_stub_passkey(app: &TestApp, user_id: identity::UserId) {
+    sqlx::query(
+        "INSERT INTO auth.webauthn_credentials (user_id, label, credential)
+         VALUES ($1, 'Test Passkey', '{}'::jsonb)",
+    )
+    .bind(user_id.0)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn login_with_passkey_only_defers_session() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_stub_passkey(&app, user.id).await;
+
+    // A user with only a passkey (no TOTP) must still be challenged.
+    let body = format!("email={}&password={}", urlencoding("u@test.local"), urlencoding("pw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/login/verify")
+    );
+    let mfa_cookie = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").expect("pending cookie")
+    );
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+
+    // The challenge page offers the passkey path.
+    let (status, body) = get_with_cookie(&app, "/login/verify", Some(&mfa_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Use a passkey"));
+    assert!(body.contains(r#"data-passkey-auth="/login/verify/passkey/start""#));
+    // The ceremony JS must be loaded on this public page, or the button
+    // is dead (regression guard: WEBAUTHN_JS belongs in shell_public).
+    assert!(body.contains("__hearthWebauthnLoaded"));
+}
+
+#[tokio::test]
+async fn login_verify_passkey_start_requires_pending_cookie() {
+    let app = TestApp::new().await;
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify/passkey/start")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Passwordless passkey sign-in (/login/passkey/{start,finish})
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn login_page_shows_passwordless_passkey_button() {
+    let app = TestApp::new().await;
+    let (status, body) = get_with_cookie(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Sign in with a passkey"));
+    assert!(body.contains(r#"data-passkey-auth="/login/passkey/start""#));
+    // The ceremony JS must be present on the public page.
+    assert!(body.contains("__hearthWebauthnLoaded"));
+}
+
+#[tokio::test]
+async fn login_passkey_start_returns_challenge_options() {
+    let app = TestApp::new().await;
+    // No auth needed — discoverable start identifies the user later.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/passkey/start")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(body.contains("challenge_id"));
+    // The WebAuthn request options for navigator.credentials.get.
+    assert!(body.contains("publicKey"));
+    assert!(body.contains("challenge"));
+}
+
+#[tokio::test]
+async fn login_passkey_finish_rejects_bad_assertion() {
+    let app = TestApp::new().await;
+    let body = format!(
+        "challenge_id={}&passkey={}",
+        uuid::Uuid::new_v4(),
+        urlencoding("not-a-valid-assertion")
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/passkey/finish")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    // Re-renders the login page with an error; no session is issued.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+}

@@ -22,9 +22,15 @@ pub fn ui_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::root_redirect))
         .route("/login", get(routes::login_page).post(routes::login_submit))
+        .route("/login/passkey/start", post(routes::login_passkey_start))
+        .route("/login/passkey/finish", post(routes::login_passkey_finish))
         .route(
             "/login/verify",
             get(routes::login_verify_page).post(routes::login_verify_submit),
+        )
+        .route(
+            "/login/verify/passkey/start",
+            post(routes::login_verify_passkey_start),
         )
         .route("/recover", get(routes::recover_page).post(routes::recover_submit))
         .route(

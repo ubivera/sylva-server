@@ -88,10 +88,10 @@ pub async fn login(
 
     match outcome {
         Ok(user) => {
-            // Password is correct. If the user has a second factor, hand
-            // back a single-purpose token instead of a session — the
-            // client must complete `/auth/login/verify`.
-            match auth::user_totp::is_enrolled(&state.db, user.id).await {
+            // Password is correct. If the user has any second factor (TOTP
+            // or passkey), hand back a single-purpose token instead of a
+            // session — the client must complete `/auth/login/verify`.
+            match crate::mfa::has_second_factor(&state.db, user.id).await {
                 Ok(true) => {
                     let expires_at =
                         chrono::Utc::now().timestamp() + MFA_PENDING_TTL_SECS;

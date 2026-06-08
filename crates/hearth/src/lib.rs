@@ -9,6 +9,7 @@ pub mod db;
 pub mod health;
 #[cfg(windows)]
 pub mod job_object;
+pub mod mfa;
 pub mod postgres;
 pub mod rate_limit;
 pub mod shutdown;
