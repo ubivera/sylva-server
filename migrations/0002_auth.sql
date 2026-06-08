@@ -39,3 +39,51 @@ CREATE TABLE auth.user_recovery_codes (
     generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ NULL
 );
+
+-- TOTP (authenticator-app) second factors: many per user, each with a
+-- user-chosen label. The secret is AEAD-encrypted (XChaCha20-Poly1305)
+-- under the instance secret key, not hashed, because the server must
+-- recover it to verify codes. A row with verified_at IS NULL is a
+-- half-finished enrollment (not an active factor); 2FA is "on" for a
+-- user while at least one verified row exists.
+CREATE TABLE auth.totp_credentials (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    label        TEXT NOT NULL,
+    secret_enc   BYTEA NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    verified_at  TIMESTAMPTZ NULL,
+    last_used_at TIMESTAMPTZ NULL
+);
+
+CREATE INDEX totp_credentials_user_idx ON auth.totp_credentials (user_id);
+
+-- WebAuthn passkeys: many per user, each with a user-chosen label. Stores
+-- only the PUBLIC credential (serialized webauthn-rs `Passkey`), so no
+-- encryption is needed (unlike TOTP secrets).
+CREATE TABLE auth.webauthn_credentials (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    label        TEXT NOT NULL,
+    credential   JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ NULL
+);
+
+CREATE INDEX webauthn_credentials_user_idx ON auth.webauthn_credentials (user_id);
+
+-- Short-lived WebAuthn ceremony state (registration / authentication),
+-- held between the start and finish requests. Rows are consumed on finish
+-- and replaced on a new start; `purpose` keeps register / authenticate /
+-- discoverable separate. `user_id` is NULL for the passwordless
+-- (discoverable) ceremony — no user is known until the assertion's user
+-- handle is read on finish.
+CREATE TABLE auth.webauthn_challenges (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    purpose    TEXT NOT NULL,
+    state      JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX webauthn_challenges_user_idx ON auth.webauthn_challenges (user_id);

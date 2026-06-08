@@ -32,9 +32,18 @@ chrono = { version = "0.4", features = ["serde"] }
 
 argon2 = "0.5"
 sha2 = "0.10"
+sha1 = "0.10"
 hmac = "0.12"
 subtle = "2"
 rand = "0.8"
+base32 = "0.5"
+chacha20poly1305 = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+webauthn-rs = { version = "0.5", features = [
+    "danger-allow-state-serialisation",
+    "conditional-ui",
+] }
+url = "2.5"
 maud = "0.27"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls", "smtp-transport", "builder", "ring", "webpki-roots"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }

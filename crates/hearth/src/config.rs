@@ -62,7 +62,10 @@ const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_FILTER: &str = "info,hearth=debug";
 const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_POSTGRES_URL: &str = "postgresql://hearth@127.0.0.1:15432/hearth";
-const DEFAULT_PUBLIC_BASE_URL: &str = "http://127.0.0.1:8443";
+// `localhost` (not a bare `127.0.0.1`) so WebAuthn/passkeys work in dev:
+// webauthn-rs requires the RP origin to have a domain, and an IP literal
+// has none. localhost still resolves to the loopback listener.
+const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:8443";
 const DEFAULT_INSTANCE_NAME: &str = "Hearth";
 const DEFAULT_NOTIFICATIONS_MODE: &str = "disabled";
 const DEFAULT_SMTP_PORT: u16 = 587;
@@ -149,6 +152,83 @@ impl Config {
             .parse::<PgConnectOptions>()
             .map(|opts| opts.get_port())
             .unwrap_or(15432)
+    }
+
+    /// Resolve the persistent per-instance secret key used to encrypt
+    /// recoverable secrets at rest (today: TOTP shared secrets). From
+    /// `HEARTH_SECRET_KEY` (64 hex chars) when set, otherwise read from
+    /// or freshly created at `{data_dir}/secret.key` (raw 32 bytes,
+    /// 0600 on unix). Unlike the per-process CSRF secret this MUST be
+    /// stable across restarts, or previously-sealed data can't decrypt.
+    /// Does filesystem IO — called once at startup, not in `from_env`.
+    pub fn load_secret_key(&self) -> anyhow::Result<[u8; 32]> {
+        if let Ok(hex) = env::var("HEARTH_SECRET_KEY") {
+            let hex = hex.trim();
+            if !hex.is_empty() {
+                return decode_hex32(hex)
+                    .context("HEARTH_SECRET_KEY must be 64 hex chars (32 bytes)");
+            }
+        }
+
+        let path = self.data_dir.join("secret.key");
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Ok(key)
+            }
+            Ok(_) => bail!(
+                "{} exists but is not a 32-byte key; delete it to regenerate",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key = generate_key();
+                write_secret_key(&path, &key)?;
+                Ok(key)
+            }
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+}
+
+fn generate_key() -> [u8; 32] {
+    use rand::RngCore;
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    key
+}
+
+fn write_secret_key(path: &std::path::Path, key: &[u8; 32]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, key).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn decode_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
+    if s.len() != 64 {
+        bail!("expected 64 hex chars, got {}", s.len());
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        out[i] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> anyhow::Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => bail!("invalid hex digit"),
     }
 }
 

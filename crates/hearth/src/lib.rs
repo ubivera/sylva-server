@@ -9,10 +9,12 @@ pub mod db;
 pub mod health;
 #[cfg(windows)]
 pub mod job_object;
+pub mod mfa;
 pub mod postgres;
 pub mod rate_limit;
-pub mod recovery_token;
 pub mod shutdown;
+pub mod signed_token;
+pub mod webauthn;
 pub mod telemetry;
 pub mod views;
 
@@ -129,6 +131,7 @@ async fn serve(
         instance_name: config.instance_name.clone(),
         csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
         rate_limiter: std::sync::Arc::new(rate_limit::RateLimiter::auth_default()),
+        secret_key: std::sync::Arc::new(config.load_secret_key()?),
     };
 
     let health = axum::Router::new()

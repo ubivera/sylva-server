@@ -35,6 +35,10 @@ pub struct AppState {
     /// Per-client throttle for the brute-forceable auth endpoints
     /// (login / recover). Process-local; see [`crate::rate_limit`].
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// Persistent per-instance key for at-rest encryption of recoverable
+    /// secrets (TOTP shared secrets). Stable across restarts — unlike
+    /// `csrf_secret` — so sealed data stays decryptable.
+    pub secret_key: Arc<[u8; 32]>,
 }
 
 /// Convenience used by the integration test harness. Constructs the
@@ -60,6 +64,9 @@ pub fn router(
         instance_name,
         csrf_secret: Arc::new(csrf::generate_secret()),
         rate_limiter: Arc::new(crate::rate_limit::RateLimiter::auth_default()),
+        // Ephemeral key for this test-harness constructor; production
+        // composition in `crate::run` loads the persistent key.
+        secret_key: Arc::new(csrf::generate_secret()),
     };
 
     let health = Router::new()
@@ -79,6 +86,7 @@ pub fn router(
 pub fn api_router(state: AppState) -> Router {
     Router::new()
         .route("/auth/login", post(auth_routes::login))
+        .route("/auth/login/verify", post(auth_routes::login_verify))
         .route("/auth/logout", post(auth_routes::logout))
         .route("/auth/accept-invite", post(auth_routes::accept_invite))
         .route("/me", get(auth_routes::me))

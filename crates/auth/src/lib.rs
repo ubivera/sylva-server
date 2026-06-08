@@ -12,7 +12,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod recovery_code;
+pub mod secretbox;
+pub mod totp;
 pub mod user_recovery_code;
+pub mod user_totp;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -21,6 +24,9 @@ pub enum AuthError {
 
     #[error("password hash is malformed")]
     MalformedHash(argon2::password_hash::Error),
+
+    #[error("authenticated-encryption failure")]
+    Crypto,
 
     #[error("database error")]
     Database(#[from] sqlx::Error),

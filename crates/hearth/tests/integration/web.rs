@@ -943,9 +943,11 @@ async fn account_settings_modal_fragment_renders_full_modal() {
     assert!(body.contains(r#"data-settings-tab="profile""#), "Profile");
     assert!(body.contains(r#"data-settings-tab="security""#), "Security");
     assert!(body.contains(r#"data-settings-tab="devices""#), "Devices");
-    assert!(body.contains(r#"data-settings-tab="authenticators""#), "Authenticators");
-    assert!(body.contains(r#"data-settings-tab="passkeys""#), "Passkeys");
     assert!(body.contains(r#"data-settings-tab="data""#), "Data Control");
+    // Authenticators + Passkeys were folded into the Security tab as
+    // sections, so their standalone tabs are gone.
+    assert!(!body.contains(r#"data-settings-tab="authenticators""#));
+    assert!(!body.contains(r#"data-settings-tab="passkeys""#));
     // Profile panel + Account Information section + the two forms.
     assert!(body.contains(r#"data-settings-panel="profile""#));
     assert!(body.contains("Account Information"));
@@ -2127,4 +2129,592 @@ async fn successful_login_does_not_consume_rate_budget() {
             StatusCode::SEE_OTHER
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Two-factor (TOTP) — Security tab enrollment + login challenge
+// ─────────────────────────────────────────────────────────────────────────
+
+/// RFC-style 20-byte secrets used to seed TOTP enrollments in tests.
+const TEST_TOTP_SECRET: &[u8] = b"12345678901234567890";
+const TEST_TOTP_SECRET_2: &[u8] = b"ABCDEFGHIJ1234567890";
+
+/// Seed a *verified* authenticator with a given secret + label,
+/// encrypted under the app key exactly as the server does. Returns its id.
+async fn seed_totp(
+    app: &TestApp,
+    user_id: identity::UserId,
+    secret: &[u8],
+    label: &str,
+) -> uuid::Uuid {
+    let mut tx = app.pool.begin().await.unwrap();
+    let id = auth::user_totp::start_enrollment(&mut tx, &app.secret_key, user_id, secret)
+        .await
+        .unwrap();
+    auth::user_totp::confirm(&mut tx, user_id, id, label).await.unwrap();
+    tx.commit().await.unwrap();
+    id
+}
+
+/// Convenience: seed one verified authenticator using the primary secret.
+async fn seed_verified_totp(app: &TestApp, user_id: identity::UserId) -> uuid::Uuid {
+    seed_totp(app, user_id, TEST_TOTP_SECRET, "Authenticator").await
+}
+
+fn code_for(secret: &[u8]) -> String {
+    auth::totp::code_at(secret, chrono::Utc::now().timestamp())
+}
+
+fn current_totp_code() -> String {
+    code_for(TEST_TOTP_SECRET)
+}
+
+#[tokio::test]
+async fn security_tab_shows_totp_setup_when_not_enrolled() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Registered Authenticators"));
+    assert!(body.contains(r#"data-reauth-confirm="form-totp-start""#));
+    assert!(body.contains("No authenticators yet"));
+    // The explainer card.
+    assert!(body.contains("What are authenticators?"));
+}
+
+#[tokio::test]
+async fn security_tab_lists_enrolled_authenticators() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_totp(&app, user.id, TEST_TOTP_SECRET, "1Password").await;
+    seed_totp(&app, user.id, TEST_TOTP_SECRET_2, "Ente Auth").await;
+    // web_login can't reach a session for a TOTP user (it stops at the
+    // challenge), so sign in via the full two-step flow.
+    let session = totp_login(&app, "u@test.local", "pw").await;
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("1Password"));
+    assert!(body.contains("Ente Auth"));
+    // Each row offers rename + remove affordances.
+    assert!(body.contains("/edit"));
+    assert!(body.contains("/confirm-delete"));
+}
+
+/// Drive the full password → TOTP challenge → session flow and return
+/// the resulting `hearth_session` cookie (name=value).
+async fn totp_login(app: &TestApp, email: &str, password: &str) -> String {
+    // Step 1: password.
+    let body = format!("email={}&password={}", urlencoding(email), urlencoding(password));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let mfa_cookie = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").expect("mfa cookie")
+    );
+    // Step 2: TOTP code.
+    let body = format!("code={}", urlencoding(&current_totp_code()));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify")
+        .header(header::COOKIE, mfa_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    format!(
+        "hearth_session={}",
+        set_cookie_value(resp.headers(), "hearth_session").expect("session cookie")
+    )
+}
+
+#[tokio::test]
+async fn login_with_totp_enrolled_defers_session() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_verified_totp(&app, user.id).await;
+
+    let body = format!("email={}&password={}", urlencoding("u@test.local"), urlencoding("pw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/login/verify")
+    );
+    // No real session yet — only the pending-MFA cookie.
+    assert!(set_cookie_value(resp.headers(), "hearth_mfa").is_some());
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+}
+
+#[tokio::test]
+async fn login_verify_with_correct_totp_issues_session() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_verified_totp(&app, user.id).await;
+
+    let session = totp_login(&app, "u@test.local", "pw").await;
+    // The issued session authenticates.
+    let (status, _) = get_with_cookie(&app, "/me", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE event_type = 'signin_success'
+           AND actor_user_id = $1
+           AND event_data->>'mfa' = 'totp'",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn login_verify_rejects_wrong_totp() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_verified_totp(&app, user.id).await;
+
+    // Get a pending-MFA cookie.
+    let body = format!("email={}&password={}", urlencoding("u@test.local"), urlencoding("pw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let mfa_cookie = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").unwrap()
+    );
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify")
+        .header(header::COOKIE, mfa_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from("code=000000"))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    // Re-render (200), no session issued.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+
+    let (failed,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events WHERE event_type = 'mfa_failed' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(failed, 1);
+}
+
+#[tokio::test]
+async fn login_verify_recovery_code_bypasses_totp() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_verified_totp(&app, user.id).await;
+    let recovery = "BYP0-BYP0-BYP0-BYP0-BYP0-BYP0-BYP0-BYP0";
+    {
+        let mut tx = app.pool.begin().await.unwrap();
+        auth::user_recovery_code::bootstrap(&mut tx, user.id, recovery)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Password step → pending cookie.
+    let body = format!("email={}&password={}", urlencoding("u@test.local"), urlencoding("pw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let mfa_cookie = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").unwrap()
+    );
+
+    // Recovery code instead of TOTP → session issued.
+    let body = format!("recovery_code={}", urlencoding(recovery));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify")
+        .header(header::COOKIE, mfa_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_some());
+}
+
+#[tokio::test]
+async fn login_verify_without_cookie_redirects_to_login() {
+    let app = TestApp::new().await;
+    let (status, _) = get_with_cookie(&app, "/login/verify", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn totp_confirm_enrolls_with_valid_code() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    // Seed an unverified credential (the start step), then confirm via HTTP.
+    let cred_id = {
+        let mut tx = app.pool.begin().await.unwrap();
+        let id = auth::user_totp::start_enrollment(&mut tx, &app.secret_key, user.id, TEST_TOTP_SECRET)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        id
+    };
+    assert!(!auth::user_totp::is_enrolled(&app.pool, user.id).await.unwrap());
+
+    let body = format!(
+        "csrf_token={}&cred_id={}&label={}&code={}",
+        urlencoding(&csrf),
+        urlencoding(&cred_id.to_string()),
+        urlencoding("My Phone"),
+        urlencoding(&current_totp_code()),
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/totp/confirm")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(body.contains("Authenticator added"));
+    // The response also carries an out-of-band refresh of the list so the
+    // still-open settings modal updates live (keep-source-open flow).
+    assert!(body.contains(r#"id="totp-section""#));
+    assert!(body.contains(r#"hx-swap-oob="true""#));
+    assert!(body.contains("My Phone"));
+    assert!(auth::user_totp::is_enrolled(&app.pool, user.id).await.unwrap());
+    // The chosen label stuck.
+    let creds = auth::user_totp::list_verified(&app.pool, user.id).await.unwrap();
+    assert_eq!(creds.len(), 1);
+    assert_eq!(creds[0].label, "My Phone");
+
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events WHERE event_type = 'totp_enrolled' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn totp_rename_updates_label() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cred_id = seed_totp(&app, user.id, TEST_TOTP_SECRET, "Old Name").await;
+    let session = totp_login(&app, "u@test.local", "pw").await;
+    let session_id = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!("csrf_token={}&label={}", urlencoding(&csrf), urlencoding("New Name"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/totp/{cred_id}/rename"))
+        .header(header::COOKIE, session)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    // The refreshed island shows the new name.
+    assert!(body.contains("New Name"));
+    assert!(!body.contains("Old Name"));
+    let creds = auth::user_totp::list_verified(&app.pool, user.id).await.unwrap();
+    assert_eq!(creds[0].label, "New Name");
+}
+
+#[tokio::test]
+async fn totp_delete_removes_one_of_several() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let keep = seed_totp(&app, user.id, TEST_TOTP_SECRET, "Keep").await;
+    let drop = seed_totp(&app, user.id, TEST_TOTP_SECRET_2, "Drop").await;
+    let _ = keep;
+    let session = totp_login(&app, "u@test.local", "pw").await;
+    let session_id = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(session_id);
+
+    let body = format!("csrf_token={}", urlencoding(&csrf));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/totp/{drop}/delete"))
+        .header(header::COOKIE, session)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Still enrolled (one remains); the dropped one is gone.
+    let creds = auth::user_totp::list_verified(&app.pool, user.id).await.unwrap();
+    assert_eq!(creds.len(), 1);
+    assert_eq!(creds[0].label, "Keep");
+
+    let (removed,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events WHERE event_type = 'totp_removed' AND actor_user_id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(removed, 1);
+}
+
+#[tokio::test]
+async fn login_verify_tries_all_authenticators() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    // Two authenticators with different secrets.
+    seed_totp(&app, user.id, TEST_TOTP_SECRET, "First").await;
+    seed_totp(&app, user.id, TEST_TOTP_SECRET_2, "Second").await;
+
+    // Password → pending cookie.
+    let body = format!("email={}&password={}", urlencoding("u@test.local"), urlencoding("pw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let mfa_cookie = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").unwrap()
+    );
+
+    // Submit a code from the SECOND authenticator — the loop must find it.
+    let body = format!("code={}", urlencoding(&code_for(TEST_TOTP_SECRET_2)));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify")
+        .header(header::COOKIE, mfa_cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_some());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Passkeys (WebAuthn) — Security tab rendering + endpoint gating
+//
+// The actual create/get ceremonies need a real browser authenticator, so
+// they're validated manually; these cover the non-ceremony surface.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn security_tab_shows_passkeys_section() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"id="passkey-section""#));
+    assert!(body.contains("What are passkeys?"));
+    // Test harness base URL is localhost → WebAuthn is configurable, so
+    // the reauth-chained Add button renders.
+    assert!(body.contains(r#"data-reauth-confirm="form-passkey-start""#));
+    assert!(body.contains("No passkeys yet"));
+}
+
+#[tokio::test]
+async fn passkey_section_requires_auth() {
+    let app = TestApp::new().await;
+    let (status, _) = get_with_cookie(&app, "/me/passkey/section", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER); // bounced to /login
+}
+
+#[tokio::test]
+async fn passkey_section_renders_for_authed_user() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let (status, body) = get_with_cookie(&app, "/me/passkey/section", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"id="passkey-section""#));
+}
+
+/// Insert a placeholder passkey row. The login-gating + page-rendering
+/// paths only COUNT passkeys (they don't deserialize the credential), so
+/// a stub credential is enough to simulate "this user has a passkey"
+/// without a real WebAuthn ceremony.
+async fn seed_stub_passkey(app: &TestApp, user_id: identity::UserId) {
+    sqlx::query(
+        "INSERT INTO auth.webauthn_credentials (user_id, label, credential)
+         VALUES ($1, 'Test Passkey', '{}'::jsonb)",
+    )
+    .bind(user_id.0)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn login_with_passkey_only_defers_session() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_stub_passkey(&app, user.id).await;
+
+    // A user with only a passkey (no TOTP) must still be challenged.
+    let body = format!("email={}&password={}", urlencoding("u@test.local"), urlencoding("pw"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/login/verify")
+    );
+    let mfa_cookie = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").expect("pending cookie")
+    );
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+
+    // The challenge page offers the passkey path.
+    let (status, body) = get_with_cookie(&app, "/login/verify", Some(&mfa_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Use a passkey"));
+    assert!(body.contains(r#"data-passkey-auth="/login/verify/passkey/start""#));
+    // The ceremony JS must be loaded on this public page, or the button
+    // is dead (regression guard: WEBAUTHN_JS belongs in shell_public).
+    assert!(body.contains("__hearthWebauthnLoaded"));
+}
+
+#[tokio::test]
+async fn login_verify_passkey_start_requires_pending_cookie() {
+    let app = TestApp::new().await;
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify/passkey/start")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Passwordless passkey sign-in (/login/passkey/{start,finish})
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn login_page_shows_passwordless_passkey_button() {
+    let app = TestApp::new().await;
+    let (status, body) = get_with_cookie(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Sign in with a passkey"));
+    assert!(body.contains(r#"data-passkey-auth="/login/passkey/start""#));
+    // The ceremony JS must be present on the public page.
+    assert!(body.contains("__hearthWebauthnLoaded"));
+}
+
+#[tokio::test]
+async fn login_passkey_start_returns_challenge_options() {
+    let app = TestApp::new().await;
+    // No auth needed — discoverable start identifies the user later.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/passkey/start")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(body.contains("challenge_id"));
+    // The WebAuthn request options for navigator.credentials.get.
+    assert!(body.contains("publicKey"));
+    assert!(body.contains("challenge"));
+}
+
+#[tokio::test]
+async fn login_passkey_finish_rejects_bad_assertion() {
+    let app = TestApp::new().await;
+    let body = format!(
+        "challenge_id={}&passkey={}",
+        uuid::Uuid::new_v4(),
+        urlencoding("not-a-valid-assertion")
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/passkey/finish")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    // Re-renders the login page with an error; no session is issued.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
 }

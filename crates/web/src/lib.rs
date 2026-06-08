@@ -22,6 +22,16 @@ pub fn ui_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(routes::root_redirect))
         .route("/login", get(routes::login_page).post(routes::login_submit))
+        .route("/login/passkey/start", post(routes::login_passkey_start))
+        .route("/login/passkey/finish", post(routes::login_passkey_finish))
+        .route(
+            "/login/verify",
+            get(routes::login_verify_page).post(routes::login_verify_submit),
+        )
+        .route(
+            "/login/verify/passkey/start",
+            post(routes::login_verify_passkey_start),
+        )
         .route("/recover", get(routes::recover_page).post(routes::recover_submit))
         .route(
             "/recover/reset",
@@ -39,6 +49,26 @@ pub fn ui_router(state: AppState) -> Router {
             "/me/recovery-code/regenerate",
             post(routes::me_recovery_regenerate),
         )
+        .route("/me/totp/start", post(routes::me_totp_start))
+        .route("/me/totp/confirm", post(routes::me_totp_confirm))
+        .route("/me/totp/section", get(routes::me_totp_section))
+        .route("/me/totp/{id}/edit", get(routes::me_totp_edit))
+        .route("/me/totp/{id}/rename", post(routes::me_totp_rename))
+        .route(
+            "/me/totp/{id}/confirm-delete",
+            get(routes::me_totp_confirm_delete),
+        )
+        .route("/me/totp/{id}/delete", post(routes::me_totp_delete))
+        .route("/me/passkey/start", post(routes::me_passkey_start))
+        .route("/me/passkey/finish", post(routes::me_passkey_finish))
+        .route("/me/passkey/section", get(routes::me_passkey_section))
+        .route("/me/passkey/{id}/edit", get(routes::me_passkey_edit))
+        .route("/me/passkey/{id}/rename", post(routes::me_passkey_rename))
+        .route(
+            "/me/passkey/{id}/confirm-delete",
+            get(routes::me_passkey_confirm_delete),
+        )
+        .route("/me/passkey/{id}/delete", post(routes::me_passkey_delete))
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in

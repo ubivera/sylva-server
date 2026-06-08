@@ -188,6 +188,9 @@ pub struct TestApp {
     /// can compute valid tokens via [`TestApp::csrf_for`] without scraping
     /// rendered HTML.
     csrf_secret: std::sync::Arc<[u8; hearth::csrf::SECRET_LEN]>,
+    /// The instance secret key used by this app's `AppState`. Held here so
+    /// TOTP tests can seed encrypted secrets the same way the server does.
+    pub secret_key: std::sync::Arc<[u8; 32]>,
     #[allow(dead_code)] // retained so a future Drop impl can clean up the DB
     db_name: String,
 }
@@ -246,16 +249,18 @@ impl TestApp {
         // UI at root, plus `/health`. Mirrors the composition in
         // `hearth::serve` and `web::ui_router`.
         let csrf_secret = std::sync::Arc::new(hearth::csrf::generate_secret());
+        let secret_key = std::sync::Arc::new(hearth::csrf::generate_secret());
         let app_state = app::AppState {
             started_at: Instant::now(),
             db: pool.clone(),
             users,
             sessions,
             invitations,
-            public_base_url: "http://127.0.0.1:8443".to_string(),
+            public_base_url: "http://localhost:8443".to_string(),
             instance_name: "test-instance".to_string(),
             csrf_secret: csrf_secret.clone(),
             rate_limiter: std::sync::Arc::new(hearth::rate_limit::RateLimiter::auth_default()),
+            secret_key: secret_key.clone(),
         };
         let health = axum::Router::new()
             .route(
@@ -276,6 +281,7 @@ impl TestApp {
             pool,
             notification_worker: std::sync::Mutex::new(worker),
             csrf_secret,
+            secret_key,
             db_name,
         }
     }
