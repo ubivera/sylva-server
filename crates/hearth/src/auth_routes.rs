@@ -60,12 +60,12 @@ pub struct LoginVerifyRequest {
 /// distinction is recorded in the audit log only.
 pub async fn login(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    crate::rate_limit::ClientIp(client_ip): crate::rate_limit::ClientIp,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
     // Shares the per-IP "login:" bucket with the web form — both are
     // password guesses from the same client.
-    let rl_key = format!("login:{}", crate::rate_limit::client_key(&headers));
+    let rl_key = format!("login:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -178,37 +178,25 @@ pub async fn login_verify(
         }
     };
 
-    // TOTP code (primary). Try every enrolled authenticator.
+    // TOTP code (primary). Verify against every enrolled authenticator and
+    // consume the match (single-use — no replay within the code's window).
     if let Some(code) = req.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        let secrets = match auth::user_totp::verified_secrets(
-            &state.db,
-            &state.secret_key,
-            user_id,
-        )
-        .await
+        match auth::user_totp::verify_and_consume(&state.db, &state.secret_key, user_id, code, now)
+            .await
         {
-            Ok(s) => s,
+            Ok(Some(cred_id)) => {
+                return finish_mfa_session(&state, user, "totp", Some(cred_id)).await;
+            }
+            Ok(None) => {
+                state.rate_limiter.record_failure(&rl_key);
+                return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid_code" }))
+                    .into_response();
+            }
             Err(err) => {
-                tracing::error!(?err, "login_verify: load secrets");
+                tracing::error!(?err, "login_verify: totp verify");
                 return internal_error().into_response();
             }
-        };
-        if secrets.is_empty() {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse { error: "mfa_token_invalid" }),
-            )
-                .into_response();
         }
-        if let Some((cred_id, _)) = secrets
-            .iter()
-            .find(|(_, secret)| auth::totp::verify_code(secret, code, now))
-        {
-            return finish_mfa_session(&state, user, "totp", Some(*cred_id)).await;
-        }
-        state.rate_limiter.record_failure(&rl_key);
-        return (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid_code" }))
-            .into_response();
     }
 
     // Recovery-code break-glass.

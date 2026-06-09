@@ -95,10 +95,10 @@ pub struct LoginForm {
 /// browser doesn't replace the page with a custom error UI).
 pub async fn login_submit(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let rl_key = format!("login:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("login:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -193,7 +193,7 @@ pub async fn login_submit(
     let mut response = Redirect::to("/me").into_response();
     set_cookie_header(
         &mut response,
-        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false, cookie_secure(&state)),
     );
     response
 }
@@ -203,9 +203,9 @@ pub async fn login_submit(
 /// as JSON. Public; lightly rate-limited per IP to bound challenge churn.
 pub async fn login_passkey_start(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
 ) -> Response {
-    let rl_key = format!("pklogin:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("pklogin:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
@@ -235,10 +235,10 @@ pub struct LoginPasskeyFinishForm {
 /// gated on the account being **active**, mirroring `verify_credentials`.
 pub async fn login_passkey_finish(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     Form(form): Form<LoginPasskeyFinishForm>,
 ) -> Response {
-    let rl_key = format!("login:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("login:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -364,6 +364,7 @@ pub async fn accept_invite_submit(
                     SESSION_COOKIE_NAME,
                     &outcome.raw_session_token,
                     /* clearing = */ false,
+                    cookie_secure(&state),
                 ),
             );
             response
@@ -2026,7 +2027,7 @@ pub async fn logout_submit(
     let mut response = Redirect::to(target).into_response();
     set_cookie_header(
         &mut response,
-        &cookie_value(SESSION_COOKIE_NAME, "", /* clearing = */ true),
+        &cookie_value(SESSION_COOKIE_NAME, "", /* clearing = */ true, cookie_secure(&state)),
     );
     response
 }
@@ -2070,6 +2071,14 @@ fn set_cookie_header(response: &mut Response, value: &str) {
     }
 }
 
+/// Whether auth cookies should carry the `Secure` flag — true when the
+/// instance is served over HTTPS (so dev over plain-HTTP localhost still
+/// works, while a real https deployment never sends the session cookie in
+/// cleartext). Derived from the configured public base URL scheme.
+pub(crate) fn cookie_secure(state: &AppState) -> bool {
+    state.public_base_url.starts_with("https://")
+}
+
 /// Format a `Set-Cookie` header value. When `clearing` is true, sets
 /// `Max-Age=0` to instruct the browser to delete the cookie immediately.
 ///
@@ -2078,14 +2087,14 @@ fn set_cookie_header(response: &mut Response, value: &str) {
 ///   defense-in-depth posture we want for session credentials).
 /// - `SameSite=Lax` — sent on top-level navigations + GET cross-site;
 ///   blocked on cross-site POST. Good default for an admin UI.
-/// - **`Secure` is intentionally omitted** because dev ships plain
-///   HTTP. Once TLS lands, `Secure` should be flipped on conditionally
-///   based on the public base URL scheme.
-fn cookie_value(name: &str, value: &str, clearing: bool) -> String {
+/// - `Secure` — added when `secure` (HTTPS deployment) so the cookie is
+///   never transmitted over plaintext; see [`cookie_secure`].
+fn cookie_value(name: &str, value: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
     if clearing {
-        format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
     } else {
-        format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax")
+        format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax{sec}")
     }
 }
 
@@ -2118,12 +2127,13 @@ const RECOVERY_COOKIE_NAME: &str = "hearth_recovery";
 /// enough that a leaked token has a tiny window.
 const RESET_TTL_SECS: i64 = 600;
 
-fn recovery_cookie_value(token: &str, clearing: bool) -> String {
+fn recovery_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
     if clearing {
-        format!("{RECOVERY_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        format!("{RECOVERY_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
     } else {
         format!(
-            "{RECOVERY_COOKIE_NAME}={token}; Path=/; Max-Age={RESET_TTL_SECS}; HttpOnly; SameSite=Lax"
+            "{RECOVERY_COOKIE_NAME}={token}; Path=/; Max-Age={RESET_TTL_SECS}; HttpOnly; SameSite=Lax{sec}"
         )
     }
 }
@@ -2166,12 +2176,13 @@ const MFA_COOKIE_NAME: &str = "hearth_mfa";
 /// re-enter their password. 10 minutes.
 const MFA_PENDING_TTL_SECS: i64 = 600;
 
-fn mfa_cookie_value(token: &str, clearing: bool) -> String {
+fn mfa_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
     if clearing {
-        format!("{MFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        format!("{MFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
     } else {
         format!(
-            "{MFA_COOKIE_NAME}={token}; Path=/; Max-Age={MFA_PENDING_TTL_SECS}; HttpOnly; SameSite=Lax"
+            "{MFA_COOKIE_NAME}={token}; Path=/; Max-Age={MFA_PENDING_TTL_SECS}; HttpOnly; SameSite=Lax{sec}"
         )
     }
 }
@@ -2187,7 +2198,7 @@ pub(crate) fn mfa_pending_cookie(state: &AppState, user_id: identity::UserId) ->
         user_id.0,
         expires_at,
     );
-    mfa_cookie_value(&token, /* clearing = */ false)
+    mfa_cookie_value(&token, /* clearing = */ false, cookie_secure(state))
 }
 
 /// Resolve the `hearth_mfa` cookie to the pending user, or `None` if it's
@@ -2316,44 +2327,35 @@ pub async fn login_verify_submit(
         }
     }
 
-    // TOTP code path. Try the code against every enrolled
-    // authenticator until one accepts it.
+    // TOTP code path. Verify against every enrolled authenticator and
+    // consume the matching one (single-use — a code can't be replayed
+    // within its window).
     if let Some(code) = form.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        let secrets = match auth::user_totp::verified_secrets(
-            &state.db,
-            &state.secret_key,
-            user_id,
-        )
-        .await
+        let now = chrono::Utc::now().timestamp();
+        match auth::user_totp::verify_and_consume(&state.db, &state.secret_key, user_id, code, now)
+            .await
         {
-            Ok(s) => s,
+            Ok(Some(cred_id)) => {
+                return issue_session_after_mfa(&state, &user, MfaFactor::Totp(cred_id)).await;
+            }
+            Ok(None) => {
+                state.rate_limiter.record_failure(&rl_key);
+                audit_mfa_failed(&state, &user, "totp").await;
+                return Html(
+                    views::login_verify_page(
+                        Some("That code didn't match. Try again."),
+                        has_totp,
+                        has_passkey,
+                    )
+                    .into_string(),
+                )
+                .into_response();
+            }
             Err(err) => {
-                tracing::error!(?err, "login_verify: load secrets");
+                tracing::error!(?err, "login_verify: totp verify");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
-        };
-        // No verified authenticators → the pending state is stale.
-        if secrets.is_empty() {
-            return Redirect::to("/login").into_response();
         }
-        let now = chrono::Utc::now().timestamp();
-        if let Some((cred_id, _)) = secrets
-            .iter()
-            .find(|(_, secret)| auth::totp::verify_code(secret, code, now))
-        {
-            return issue_session_after_mfa(&state, &user, MfaFactor::Totp(*cred_id)).await;
-        }
-        state.rate_limiter.record_failure(&rl_key);
-        audit_mfa_failed(&state, &user, "totp").await;
-        return Html(
-            views::login_verify_page(
-                Some("That code didn't match. Try again."),
-                has_totp,
-                has_passkey,
-            )
-            .into_string(),
-        )
-        .into_response();
     }
 
     // Recovery-code break-glass path.
@@ -2500,9 +2502,9 @@ async fn issue_session_after_mfa(
             let mut resp = Redirect::to("/me").into_response();
             append_cookie_header(
                 &mut resp,
-                &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+                &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false, cookie_secure(state)),
             );
-            append_cookie_header(&mut resp, &mfa_cookie_value("", /* clearing = */ true));
+            append_cookie_header(&mut resp, &mfa_cookie_value("", /* clearing = */ true, cookie_secure(state)));
             resp
         }
         Err(err) => {
@@ -2560,10 +2562,10 @@ pub async fn recover_page() -> Response {
 /// generic error. Audits `recovery_started` / `recovery_failed`.
 pub async fn recover_submit(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     Form(form): Form<RecoverForm>,
 ) -> Response {
-    let rl_key = format!("recover:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("recover:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -2655,7 +2657,7 @@ pub async fn recover_submit(
                 expires_at,
             );
             let mut resp = Redirect::to("/recover/reset").into_response();
-            set_cookie_header(&mut resp, &recovery_cookie_value(&token, false));
+            set_cookie_header(&mut resp, &recovery_cookie_value(&token, false, cookie_secure(&state)));
             resp
         }
         None => {
@@ -2767,9 +2769,9 @@ pub async fn recover_reset_submit(
         Html(views::accept_invite_recovery_code_page(&new_code).into_string()).into_response();
     append_cookie_header(
         &mut resp,
-        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false, cookie_secure(&state)),
     );
-    append_cookie_header(&mut resp, &recovery_cookie_value("", /* clearing = */ true));
+    append_cookie_header(&mut resp, &recovery_cookie_value("", /* clearing = */ true, cookie_secure(&state)));
     resp
 }
 

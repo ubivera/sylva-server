@@ -46,9 +46,18 @@ pub fn otpauth_uri(issuer: &str, account: &str, secret_b32: &str) -> String {
 /// Constant-time digit comparison; rejects anything not exactly 6 ASCII
 /// digits.
 pub fn verify_code(secret: &[u8], code: &str, unix_time: i64) -> bool {
+    matched_step(secret, code, unix_time).is_some()
+}
+
+/// Like [`verify_code`], but returns the **time-step counter** that the
+/// code matched (current ±1 step). Callers enforce single-use by
+/// recording the highest accepted step and rejecting any step ≤ it — so a
+/// code can't be replayed within its validity window. Returns `None` for
+/// a non-matching or malformed code.
+pub fn matched_step(secret: &[u8], code: &str, unix_time: i64) -> Option<i64> {
     let code = code.trim();
     if code.len() != DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+        return None;
     }
     let base = (unix_time / TIME_STEP_SECS).max(0);
     for delta in [-1i64, 0, 1] {
@@ -58,10 +67,10 @@ pub fn verify_code(secret: &[u8], code: &str, unix_time: i64) -> bool {
         }
         let expected = format_code(hotp(secret, counter as u64));
         if bool::from(expected.as_bytes().ct_eq(code.as_bytes())) {
-            return true;
+            return Some(counter);
         }
     }
-    false
+    None
 }
 
 /// The code for `secret` at `unix_time`. Production only ever *verifies*

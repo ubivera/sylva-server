@@ -2265,6 +2265,72 @@ async fn login_with_totp_enrolled_defers_session() {
 }
 
 #[tokio::test]
+async fn totp_code_is_single_use() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_verified_totp(&app, user.id).await;
+    // The SAME code is presented twice (captured once, within one window).
+    let code = current_totp_code();
+
+    // First sign-in: password → pending cookie → code accepted.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!(
+            "email={}&password={}",
+            urlencoding("u@test.local"),
+            urlencoding("pw")
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let mfa1 = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").expect("mfa cookie")
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify")
+        .header(header::COOKIE, mfa1)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!("code={}", urlencoding(&code))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_some());
+
+    // Second sign-in: replaying the same code on a fresh challenge is
+    // rejected — TOTP codes are single-use within their window.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!(
+            "email={}&password={}",
+            urlencoding("u@test.local"),
+            urlencoding("pw")
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let mfa2 = format!(
+        "hearth_mfa={}",
+        set_cookie_value(resp.headers(), "hearth_mfa").expect("mfa cookie")
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login/verify")
+        .header(header::COOKIE, mfa2)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!("code={}", urlencoding(&code))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK); // re-rendered challenge, not a redirect
+    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+}
+
+#[tokio::test]
 async fn login_verify_with_correct_totp_issues_session() {
     let app = TestApp::new().await;
     let user = app

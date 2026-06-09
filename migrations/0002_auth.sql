@@ -47,13 +47,17 @@ CREATE TABLE auth.user_recovery_codes (
 -- half-finished enrollment (not an active factor); 2FA is "on" for a
 -- user while at least one verified row exists.
 CREATE TABLE auth.totp_credentials (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id      UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
-    label        TEXT NOT NULL,
-    secret_enc   BYTEA NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    verified_at  TIMESTAMPTZ NULL,
-    last_used_at TIMESTAMPTZ NULL
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    label         TEXT NOT NULL,
+    secret_enc    BYTEA NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    verified_at   TIMESTAMPTZ NULL,
+    last_used_at  TIMESTAMPTZ NULL,
+    -- Highest TOTP time-step counter ever accepted for this credential.
+    -- A code is single-use: verification only succeeds for a step strictly
+    -- greater than this, so a code can't be replayed within its 30s window.
+    last_used_step BIGINT NULL
 );
 
 CREATE INDEX totp_credentials_user_idx ON auth.totp_credentials (user_id);

@@ -39,6 +39,10 @@ pub struct AppState {
     /// secrets (TOTP shared secrets). Stable across restarts — unlike
     /// `csrf_secret` — so sealed data stays decryptable.
     pub secret_key: Arc<[u8; 32]>,
+    /// Whether `X-Forwarded-For` / `X-Real-IP` are trusted for rate-limit
+    /// client-IP keying (set behind a reverse proxy). Off → key on the
+    /// socket peer. See [`crate::rate_limit`].
+    pub trust_proxy: bool,
 }
 
 /// Convenience used by the integration test harness. Constructs the
@@ -67,6 +71,9 @@ pub fn router(
         // Ephemeral key for this test-harness constructor; production
         // composition in `crate::run` loads the persistent key.
         secret_key: Arc::new(csrf::generate_secret()),
+        // Test convenience constructor: trust forwarding headers so tests
+        // can simulate distinct clients via `X-Forwarded-For`.
+        trust_proxy: true,
     };
 
     let health = Router::new()

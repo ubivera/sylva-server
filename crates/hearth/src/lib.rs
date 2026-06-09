@@ -132,6 +132,7 @@ async fn serve(
         csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
         rate_limiter: std::sync::Arc::new(rate_limit::RateLimiter::auth_default()),
         secret_key: std::sync::Arc::new(config.load_secret_key()?),
+        trust_proxy: config.trust_proxy,
     };
 
     let health = axum::Router::new()
@@ -150,10 +151,16 @@ async fn serve(
 
     tracing::info!(listen = %config.listen_addr, "http server listening");
 
-    let serve_outcome = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown::signal())
-        .await
-        .context("server error");
+    // `into_make_service_with_connect_info` surfaces the socket peer
+    // address to handlers (via `ConnectInfo`), which the `ClientIp`
+    // extractor uses for rate-limit keying when no trusted proxy is set.
+    let serve_outcome = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown::signal())
+    .await
+    .context("server error");
 
     // Tell the workers to wind down, then await them (best-effort).
     let _ = worker_shutdown_tx.send(true);

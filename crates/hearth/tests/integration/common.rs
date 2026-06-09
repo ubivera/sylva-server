@@ -261,6 +261,10 @@ impl TestApp {
             csrf_secret: csrf_secret.clone(),
             rate_limiter: std::sync::Arc::new(hearth::rate_limit::RateLimiter::auth_default()),
             secret_key: secret_key.clone(),
+            // Trust forwarding headers in tests: requests via `oneshot`
+            // carry no socket peer, so rate-limit tests simulate distinct
+            // clients through `X-Forwarded-For`.
+            trust_proxy: true,
         };
         let health = axum::Router::new()
             .route(
