@@ -12,7 +12,6 @@ use uuid::Uuid;
 use crate::{
     admin_routes::{
         LifecycleActionForm, is_htmx, redirect_with_action_toast, redirect_with_error_toast,
-        require_password,
     },
     routes::{BrowserAuth, check_csrf_token, error_response},
     views,
@@ -150,9 +149,8 @@ pub async fn veto_pending(
     // the session id + user so audit attribution lines up.
     let admin = hearth::auth_routes::AdminUser(auth);
     let htmx = is_htmx(&headers);
-    let action_url = format!("/pending/{transition_id}/veto");
     if let Err(resp) =
-        require_password(&state, &admin, &form.password, htmx, &action_url, &[]).await
+        crate::routes::require_sudo(&state, &headers, admin.0.user.id)
     {
         return resp;
     }

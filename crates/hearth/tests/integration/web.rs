@@ -1124,22 +1124,20 @@ async fn me_email_submit_changes_email_with_correct_password() {
     let cookie = cookie_name_value(&set_cookie);
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
+    // Step-up: mint a sudo grant (what the reauth chain does in-browser).
+    let sudo = app.sudo_cookie(&cookie, &csrf, "rightpw").await;
 
-    // The settings email form posts through the reauth chain, so the
-    // hx-request header is set when HTMX submits. Success returns 200
-    // with an `HX-Redirect: /me` header + a hearth-toast trigger;
-    // both modals (settings + reauth) close on the client-side
-    // navigation that follows.
+    // The settings email form posts through the reauth chain; success
+    // returns 200 with `HX-Redirect: /me` + a hearth-toast trigger.
     let body = format!(
-        "csrf_token={}&email={}&password={}",
+        "csrf_token={}&email={}",
         urlencoding(&csrf),
         urlencoding("new@test.local"),
-        urlencoding("rightpw"),
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/email")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -1185,10 +1183,9 @@ async fn me_email_submit_changes_email_with_correct_password() {
     assert!(new_set_cookie.is_some(), "login with new email should succeed");
 }
 
-/// Wrong password rejects the email change. The response is the reauth
-/// modal content with an `invalid_password` banner so the operator can
-/// retry without losing the email value (it's staged in a hidden
-/// input). DB unchanged, no audit event written.
+/// A wrong password at the step-up gate (`POST /me/reauth`) re-renders
+/// the modal with an error and mints **no** grant — so the email-change
+/// action can't proceed (no `hearth_sudo` cookie). DB unchanged.
 #[tokio::test]
 async fn me_email_submit_rejects_wrong_password() {
     let app = TestApp::new().await;
@@ -1200,46 +1197,48 @@ async fn me_email_submit_rejects_wrong_password() {
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
 
-    let body = format!(
-        "csrf_token={}&email={}&password={}",
-        urlencoding(&csrf),
-        urlencoding("new@test.local"),
-        urlencoding("wrongpw"),
+    // /me/reauth with the wrong password: 200 modal re-render, no grant.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/reauth")
+        .header(header::COOKIE, cookie.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password=wrongpw",
+            urlencoding(&csrf)
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        set_cookie_value(resp.headers(), "hearth_sudo").is_none(),
+        "wrong password must not mint a sudo grant"
     );
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(
+        body.contains("password is incorrect"),
+        "reauth modal should show the wrong-password error: {body}"
+    );
+
+    // Without a grant, the email-change action is refused (403).
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/email")
         .header(header::COOKIE, cookie)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
-        .body(axum::body::Body::from(body))
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&email={}",
+            urlencoding(&csrf),
+            urlencoding("new@test.local")
+        )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = String::from_utf8_lossy(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .to_string();
-    // Body is the reauth modal partial — has the password input and
-    // points back at /me/email so a retry posts with a new password.
-    assert!(
-        body.contains(r#"action="/me/email""#),
-        "reauth content should point at /me/email"
-    );
-    assert!(
-        body.contains(r#"name="password""#),
-        "reauth content should expose the password input"
-    );
-    assert!(
-        body.contains("Incorrect password"),
-        "reauth content should render the invalid_password banner"
-    );
-    // The staged email value rides as a hidden input so the retry
-    // doesn't lose it.
-    assert!(
-        body.contains(r#"name="email""#),
-        "staged email input should be present in the reauth retry partial"
-    );
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let row: (String,) = sqlx::query_as(
         "SELECT email FROM identity.users WHERE id = $1",
@@ -1279,17 +1278,17 @@ async fn me_email_submit_rejects_email_in_use() {
     let cookie = cookie_name_value(&set_cookie);
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, "rightpw").await;
 
     let body = format!(
-        "csrf_token={}&email={}&password={}",
+        "csrf_token={}&email={}",
         urlencoding(&csrf),
         urlencoding("taken@test.local"),
-        urlencoding("rightpw"),
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/email")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -1336,6 +1335,7 @@ async fn me_email_submit_invalid_email_shape_rejected() {
     let cookie = cookie_name_value(&set_cookie);
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, "rightpw").await;
 
     let body = format!(
         "csrf_token={}&email={}&password={}",
@@ -1346,7 +1346,7 @@ async fn me_email_submit_invalid_email_shape_rejected() {
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/email")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -1399,9 +1399,11 @@ async fn account_settings_security_renders_change_password_form() {
     assert!(body.contains(r#"data-settings-panel="security""#));
     assert!(body.contains(r#"id="form-change-password""#));
     assert!(body.contains(r#"name="new_password""#));
-    // Confirm field is a client-side guard only (no name → not submitted).
-    assert!(body.contains(r#"data-pw-confirm="change-pw-new""#));
-    // Submit routes through the reauth chain, not a native submit.
+    // A single field with a show/hide eye toggle (no confirm box).
+    assert!(body.contains(r#"data-pw-toggle="change-pw-new""#));
+    assert!(!body.contains(r#"data-pw-confirm"#));
+    // Submit routes through the reauth chain, not a native submit; the
+    // button lives in the section header now.
     assert!(body.contains(r#"data-reauth-confirm="form-change-password""#));
 }
 
@@ -1418,36 +1420,36 @@ async fn me_password_change_succeeds_with_correct_current() {
     let cookie = cookie_name_value(&set_cookie);
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, "oldpw123").await;
 
     let body = format!(
-        "csrf_token={}&password={}&new_password={}",
+        "csrf_token={}&new_password={}",
         urlencoding(&csrf),
-        urlencoding("oldpw123"),
         urlencoding("brandnewpw456"),
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/password")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    // Success renders a confirmation into the (kept-open) reauth modal
+    // instead of navigating away, so the settings modal stays open.
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
-        Some("/me"),
-        "successful password change should HX-Redirect to /me"
-    );
-    let trigger = resp
-        .headers()
-        .get("HX-Trigger")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     assert!(
-        trigger.contains("Password changed") || trigger.contains("password"),
-        "HX-Trigger should carry the password_changed toast: {trigger}"
+        resp.headers().get("HX-Redirect").is_none(),
+        "password change should no longer navigate away"
+    );
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .to_string();
+    assert!(
+        body.contains("Password updated"),
+        "should render the in-modal success confirmation: {body}"
     );
 
     let (audit_count,): (i64,) = sqlx::query_as(
@@ -1474,7 +1476,7 @@ async fn me_password_change_succeeds_with_correct_current() {
 /// `invalid_password` banner and the staged new password preserved;
 /// the stored password is unchanged.
 #[tokio::test]
-async fn me_password_change_wrong_current_returns_reauth_error() {
+async fn me_password_change_without_grant_is_refused() {
     let app = TestApp::new().await;
     app.seed_user("u@test.local", "U", "oldpw123", InstanceRole::Member)
         .await;
@@ -1483,10 +1485,10 @@ async fn me_password_change_wrong_current_returns_reauth_error() {
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
 
+    // No sudo grant (the chain mints one via /me/reauth first) → refused.
     let body = format!(
-        "csrf_token={}&password={}&new_password={}",
+        "csrf_token={}&new_password={}",
         urlencoding(&csrf),
-        urlencoding("WRONGcurrent"),
         urlencoding("brandnewpw456"),
     );
     let req = axum::http::Request::builder()
@@ -1498,18 +1500,11 @@ async fn me_password_change_wrong_current_returns_reauth_error() {
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = String::from_utf8_lossy(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .to_string();
-    assert!(body.contains(r#"action="/me/password""#), "reauth content should target /me/password");
-    assert!(body.contains("Incorrect password"), "reauth content should show the invalid_password banner");
-    assert!(body.contains(r#"name="new_password""#), "staged new_password should survive the retry");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     assert!(
         web_login(&app, "u@test.local", "oldpw123").await.is_some(),
-        "password must be unchanged after a wrong-current-password attempt"
+        "password must be unchanged when no grant authorizes the change"
     );
 }
 
@@ -1524,16 +1519,16 @@ async fn me_password_change_empty_new_rejected() {
     let cookie = cookie_name_value(&set_cookie);
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, "oldpw123").await;
 
     let body = format!(
-        "csrf_token={}&password={}&new_password=",
+        "csrf_token={}&new_password=",
         urlencoding(&csrf),
-        urlencoding("oldpw123"),
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/password")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -1562,17 +1557,17 @@ async fn me_password_change_revokes_other_sessions() {
     let cookie_b = cookie_name_value(&web_login(&app, "u@test.local", "oldpw123").await.unwrap());
     let session_a = app.session_id_for_cookie(&cookie_a).await;
     let csrf_a = app.csrf_for(session_a);
+    let sudo = app.sudo_cookie(&cookie_a, &csrf_a, "oldpw123").await;
 
     let body = format!(
-        "csrf_token={}&password={}&new_password={}",
+        "csrf_token={}&new_password={}",
         urlencoding(&csrf_a),
-        urlencoding("oldpw123"),
         urlencoding("brandnewpw456"),
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/password")
-        .header(header::COOKIE, cookie_a.clone())
+        .header(header::COOKIE, format!("{cookie_a}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -1632,12 +1627,13 @@ async fn me_recovery_regenerate_succeeds_and_rotates() {
     let cookie = cookie_name_value(&set_cookie);
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, "rightpw").await;
 
-    let body = format!("csrf_token={}&password={}", urlencoding(&csrf), urlencoding("rightpw"));
+    let body = format!("csrf_token={}", urlencoding(&csrf));
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/recovery-code/regenerate")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -1707,7 +1703,8 @@ async fn me_recovery_regenerate_wrong_password_leaves_code() {
     let session_id = app.session_id_for_cookie(&cookie).await;
     let csrf = app.csrf_for(session_id);
 
-    let body = format!("csrf_token={}&password={}", urlencoding(&csrf), urlencoding("WRONGpw"));
+    // No sudo grant attached (a wrong password mints none) → refused.
+    let body = format!("csrf_token={}", urlencoding(&csrf));
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/me/recovery-code/regenerate")
@@ -1717,14 +1714,7 @@ async fn me_recovery_regenerate_wrong_password_leaves_code() {
         .body(axum::body::Body::from(body))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = String::from_utf8_lossy(
-        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .to_string();
-    assert!(body.contains(r#"action="/me/recovery-code/regenerate""#));
-    assert!(body.contains("Incorrect password"));
-    assert!(!body.contains(r#"data-copy-target="recovery-code""#), "no new code on failure");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // Stored code is unchanged.
     let row: (Vec<u8>,) = sqlx::query_as(
@@ -1735,6 +1725,41 @@ async fn me_recovery_regenerate_wrong_password_leaves_code() {
     .await
     .unwrap();
     assert_eq!(row.0.as_slice(), &auth::recovery_code::hash_code(old_code)[..]);
+}
+
+/// Step-up AAL: when the account has a second factor (TOTP), a password
+/// alone at `/me/reauth` is rejected and mints **no** sudo grant — so a
+/// stolen session that only knows the password can't reach the bar.
+#[tokio::test]
+async fn reauth_password_alone_rejected_when_totp_enrolled() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_verified_totp(&app, user.id).await;
+    // TOTP-enrolled login completes the challenge; returns the session.
+    let cookie = totp_login(&app, "u@test.local", "pw").await;
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    // Password only, no authenticator code → not AAL2 → no grant.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/reauth")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&password=pw",
+            urlencoding(&csrf)
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        set_cookie_value(resp.headers(), "hearth_sudo").is_none(),
+        "password alone must not mint a grant when TOTP is enrolled"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────

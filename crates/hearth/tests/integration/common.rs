@@ -297,6 +297,38 @@ impl TestApp {
         hearth::csrf::compute_token(&self.csrf_secret, session_id)
     }
 
+    /// Mint a step-up "sudo" grant for `session_cookie` via `POST
+    /// /me/reauth` (the no-2FA password path) and return the
+    /// `hearth_sudo=<token>` cookie pair to attach to the follow-up
+    /// reauth-gated action request. Returns an empty string if the grant
+    /// wasn't issued (e.g. a wrong password). Mirrors what the
+    /// `REAUTH_CHAIN_JS` flow does in the browser.
+    pub async fn sudo_cookie(&self, session_cookie: &str, csrf: &str, password: &str) -> String {
+        let body = format!("csrf_token={csrf}&password={password}");
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/me/reauth")
+            .header(axum::http::header::COOKIE, session_cookie)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(self.router.clone(), req)
+            .await
+            .unwrap();
+        for v in resp.headers().get_all(axum::http::header::SET_COOKIE) {
+            if let Ok(s) = v.to_str()
+                && let Some(rest) = s.strip_prefix("hearth_sudo=")
+            {
+                let val = rest.split(';').next().unwrap_or("");
+                return format!("hearth_sudo={val}");
+            }
+        }
+        String::new()
+    }
+
     /// Look up the `auth.sessions.id` for a session whose token lives in
     /// the given `hearth_session=<token>` cookie pair. The web login
     /// helper returns the full `Set-Cookie` header; trim it down to just
