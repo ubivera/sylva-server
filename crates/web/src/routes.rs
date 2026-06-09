@@ -95,10 +95,10 @@ pub struct LoginForm {
 /// browser doesn't replace the page with a custom error UI).
 pub async fn login_submit(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let rl_key = format!("login:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("login:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -193,7 +193,7 @@ pub async fn login_submit(
     let mut response = Redirect::to("/me").into_response();
     set_cookie_header(
         &mut response,
-        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false, cookie_secure(&state)),
     );
     response
 }
@@ -203,9 +203,9 @@ pub async fn login_submit(
 /// as JSON. Public; lightly rate-limited per IP to bound challenge churn.
 pub async fn login_passkey_start(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
 ) -> Response {
-    let rl_key = format!("pklogin:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("pklogin:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
@@ -235,10 +235,10 @@ pub struct LoginPasskeyFinishForm {
 /// gated on the account being **active**, mirroring `verify_credentials`.
 pub async fn login_passkey_finish(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     Form(form): Form<LoginPasskeyFinishForm>,
 ) -> Response {
-    let rl_key = format!("login:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("login:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -364,6 +364,7 @@ pub async fn accept_invite_submit(
                     SESSION_COOKIE_NAME,
                     &outcome.raw_session_token,
                     /* clearing = */ false,
+                    cookie_secure(&state),
                 ),
             );
             response
@@ -495,6 +496,167 @@ pub async fn account_settings_modal(
 pub async fn reauth_modal(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Always return the modal shell, but flag whether a fresh sudo grant
+    // already covers this user — the chain reads `data-sudo-fresh` to skip
+    // the factor step (and still has the shell to host an enrollment QR).
+    let fresh = require_fresh_sudo(&state, &headers, auth.user.id);
+    let (has_totp, has_passkey) = enrolled_factors(&state, auth.user.id).await;
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::reauth_modal(&ctx, has_totp, has_passkey, fresh).into_string()).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct MeReauthForm {
+    pub csrf_token: String,
+    pub password: Option<String>,
+    pub code: Option<String>,
+    pub challenge_id: Option<uuid::Uuid>,
+    pub passkey: Option<String>,
+}
+
+/// `POST /me/reauth` — step-up reauthentication. Verifies the factors the
+/// account's assurance level demands (passkey one-tap; or password, plus
+/// the authenticator code when TOTP is enrolled), then mints the
+/// `hearth_sudo` grant and fires `reauth-ok` so the chain runs the
+/// original action. Rate-limited `reauth:{user_id}`. Never accepts a
+/// password alone when a second factor is enrolled (no AAL downgrade).
+pub async fn me_reauth_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<MeReauthForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let user_id = auth.user.id;
+    let rl_key = format!("reauth:{}", user_id.0);
+    let (has_totp, has_passkey) = enrolled_factors(&state, user_id).await;
+
+    if !state.rate_limiter.allowed(&rl_key) {
+        return reauth_modal_error(
+            &state,
+            &auth,
+            has_totp,
+            has_passkey,
+            "Too many attempts. Wait a moment and try again.",
+        );
+    }
+
+    // Passkey path (one-tap, AAL2 by itself).
+    if let Some(assertion) = form.passkey.as_deref().filter(|s| !s.is_empty()) {
+        let Some(challenge_id) = form.challenge_id else {
+            return reauth_modal_error(&state, &auth, has_totp, has_passkey, "Passkey verification failed. Try again.");
+        };
+        return match hearth::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await {
+            Ok(true) => grant_and_proceed(&state, &auth, "passkey").await,
+            Ok(false) => {
+                state.rate_limiter.record_failure(&rl_key);
+                audit_reauth(&state, &auth, "passkey", false).await;
+                reauth_modal_error(&state, &auth, has_totp, has_passkey, "That passkey didn't work. Try again.")
+            }
+            Err(err) => {
+                tracing::error!(?err, "reauth: passkey finish");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+            }
+        };
+    }
+
+    // Password (+ TOTP) path. A passkey-but-no-TOTP account has no
+    // password fallback — that would drop below the account's AAL.
+    if has_passkey && !has_totp {
+        return reauth_modal_error(&state, &auth, has_totp, has_passkey, "Verify with your passkey to continue.");
+    }
+    let password = form.password.as_deref().unwrap_or("");
+    if password.is_empty() {
+        return reauth_modal_error(&state, &auth, has_totp, has_passkey, "Enter your password to continue.");
+    }
+    let password_ok = match auth::verify_user_password(&state.db, user_id, password).await {
+        Ok(ok) => ok,
+        Err(err) => {
+            tracing::error!(?err, "reauth: verify password");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    if !password_ok {
+        state.rate_limiter.record_failure(&rl_key);
+        audit_reauth(&state, &auth, "password", false).await;
+        return reauth_modal_error(&state, &auth, has_totp, has_passkey, "That password is incorrect.");
+    }
+    if has_totp {
+        let code = form.code.as_deref().map(str::trim).unwrap_or("");
+        let now = chrono::Utc::now().timestamp();
+        match auth::user_totp::verify_and_consume(&state.db, &state.secret_key, user_id, code, now).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                state.rate_limiter.record_failure(&rl_key);
+                audit_reauth(&state, &auth, "password+totp", false).await;
+                return reauth_modal_error(&state, &auth, has_totp, has_passkey, "That authenticator code didn't match.");
+            }
+            Err(err) => {
+                tracing::error!(?err, "reauth: totp verify");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+            }
+        }
+    }
+    let factor = if has_totp { "password+totp" } else { "password" };
+    grant_and_proceed(&state, &auth, factor).await
+}
+
+/// `POST /me/reauth/passkey/start` — begin a passkey assertion for the
+/// logged-in user (step-up). Returns the WebAuthn request options + a
+/// challenge id as JSON for the get-ceremony.
+pub async fn me_reauth_passkey_start(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    match hearth::webauthn::start_authentication(&state, auth.user.id).await {
+        Ok(Some((challenge_id, options))) => axum::Json(serde_json::json!({
+            "challenge_id": challenge_id,
+            "options": options,
+        }))
+        .into_response(),
+        Ok(None) => (StatusCode::BAD_REQUEST, "no passkeys").into_response(),
+        Err(err) => {
+            tracing::error!(?err, "reauth_passkey_start");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
+}
+
+/// Successful step-up: mint the `hearth_sudo` grant + fire `reauth-ok`
+/// (204, so htmx swaps nothing) so `REAUTH_CHAIN_JS` runs the original
+/// action.
+async fn grant_and_proceed(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    factor: &str,
+) -> Response {
+    audit_reauth(state, auth, factor, true).await;
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut().insert(
+        "HX-Trigger",
+        axum::http::HeaderValue::from_static("reauth-ok"),
+    );
+    set_cookie_header(&mut resp, &sudo_grant_cookie(state, auth.user.id));
+    resp
+}
+
+/// Re-render the reauth modal body with a retry message (HTMX swaps it
+/// back into `#reauth-modal-content`).
+fn reauth_modal_error(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    has_totp: bool,
+    has_passkey: bool,
+    msg: &str,
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
@@ -503,7 +665,39 @@ pub async fn reauth_modal(
         csrf_token: &csrf_token,
         pending_count: None,
     };
-    Html(views::reauth_modal(&ctx).into_string()).into_response()
+    Html(views::reauth_modal_content(&ctx, has_totp, has_passkey, Some(msg)).into_string())
+        .into_response()
+}
+
+/// Best-effort audit of a step-up attempt.
+async fn audit_reauth(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    factor: &str,
+    success: bool,
+) {
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let event = if success { "reauth_success" } else { "reauth_failed" };
+    let logged: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            event,
+            serde_json::json!({ "factor": factor }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = logged {
+        tracing::warn!(?err, "audit reauth");
+    }
 }
 
 #[derive(Deserialize)]
@@ -516,7 +710,6 @@ pub struct MeProfileForm {
 pub struct MeEmailForm {
     pub csrf_token: String,
     pub email: String,
-    pub password: String,
 }
 
 /// `POST /me/profile` — update the operator's `display_name` and
@@ -630,37 +823,11 @@ pub async fn me_email_submit(
 
     let new_email = form.email.trim().to_string();
 
-    // Verify the current password before touching the row. A stolen
-    // session cookie would let an attacker pivot the login email and
-    // lock the operator out; the password check makes that an
-    // additional credential-theft step. Wrong password keeps the
-    // reauth modal open with a banner (HTMX) or bounces with an
-    // error toast (non-HTMX edge case).
-    let password_ok = match auth::verify_user_password(
-        &state.db,
-        auth.user.id,
-        &form.password,
-    )
-    .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            tracing::error!(?err, "verify_user_password for email change");
-            return error_response(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error",
-            );
-        }
-    };
-    if !password_ok {
-        return reauth_invalid_password_response(
-            &state,
-            auth.session_id,
-            &auth.user,
-            "/me/email",
-            &[("email", &new_email)],
-            htmx,
-        );
+    // Step-up gate: a fresh sudo grant (minted by POST /me/reauth at the
+    // account's assurance level) is required. A stolen session alone
+    // can't pivot the login email and lock the operator out.
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
+        return resp;
     }
 
     // Cheap "looks like an email" check. Browser-side validation in
@@ -741,9 +908,9 @@ pub async fn me_email_submit(
 #[derive(Deserialize)]
 pub struct MePasswordForm {
     pub csrf_token: String,
-    /// Current password, collected by the reauth modal.
-    pub password: String,
-    /// New password, staged from the Security tab's form.
+    /// New password, staged from the Security tab's form. The current
+    /// password is no longer collected — the `hearth_sudo` grant is the
+    /// reauth.
     pub new_password: String,
 }
 
@@ -775,31 +942,10 @@ pub async fn me_password_submit(
         return redirect_to_me_with_error(htmx, "new_password_required");
     }
 
-    let password_ok = match auth::verify_user_password(
-        &state.db,
-        auth.user.id,
-        &form.password,
-    )
-    .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            tracing::error!(?err, "verify_user_password for password change");
-            return error_response(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error",
-            );
-        }
-    };
-    if !password_ok {
-        return reauth_invalid_password_response(
-            &state,
-            auth.session_id,
-            &auth.user,
-            "/me/password",
-            &[("new_password", &form.new_password)],
-            htmx,
-        );
+    // Step-up gate (sudo grant). The new password rides the staged
+    // payload; the current-password check is now the reauth grant.
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
+        return resp;
     }
 
     let new_phc = match auth::hash_password(&form.new_password) {
@@ -843,7 +989,10 @@ pub async fn me_password_submit(
     .await;
 
     match result {
-        Ok(()) => redirect_to_me_with_action(htmx, "password_changed"),
+        // Keep the settings modal open: render a confirmation into the
+        // (kept-open) reauth modal rather than navigating away. The
+        // current session stays alive; other sessions were revoked above.
+        Ok(()) => Html(views::password_changed_success_content().into_string()).into_response(),
         Err(err) => {
             tracing::error!(?err, "me_password_submit");
             error_response(
@@ -854,12 +1003,12 @@ pub async fn me_password_submit(
     }
 }
 
-/// Form for reauth-gated actions that carry no payload beyond the
-/// confirmation password (e.g. regenerate recovery code).
+/// Form for reauth-gated actions that carry no payload of their own (e.g.
+/// regenerate recovery code, add authenticator/passkey). Authorization is
+/// the `hearth_sudo` grant; only the CSRF token rides along.
 #[derive(Deserialize)]
 pub struct MeReauthOnlyForm {
     pub csrf_token: String,
-    pub password: String,
 }
 
 /// `POST /me/recovery-code/regenerate` — mint a fresh offline recovery
@@ -878,33 +1027,9 @@ pub async fn me_recovery_regenerate(
     if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
         return resp;
     }
-    let htmx = headers.contains_key("hx-request");
 
-    let password_ok = match auth::verify_user_password(
-        &state.db,
-        auth.user.id,
-        &form.password,
-    )
-    .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            tracing::error!(?err, "verify_user_password for recovery regenerate");
-            return error_response(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error",
-            );
-        }
-    };
-    if !password_ok {
-        return reauth_invalid_password_response(
-            &state,
-            auth.session_id,
-            &auth.user,
-            "/me/recovery-code/regenerate",
-            &[],
-            htmx,
-        );
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
+        return resp;
     }
 
     let new_code = auth::recovery_code::generate_code();
@@ -1034,25 +1159,9 @@ pub async fn me_totp_start(
     if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
         return resp;
     }
-    let htmx = headers.contains_key("hx-request");
 
-    let password_ok = match auth::verify_user_password(&state.db, auth.user.id, &form.password).await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            tracing::error!(?err, "totp_start: verify password");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
-        }
-    };
-    if !password_ok {
-        return reauth_invalid_password_response(
-            &state,
-            auth.session_id,
-            &auth.user,
-            "/me/totp/start",
-            &[],
-            htmx,
-        );
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
+        return resp;
     }
 
     match auth::user_totp::count_verified(&state.db, auth.user.id).await {
@@ -1338,25 +1447,9 @@ pub async fn me_passkey_start(
     if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
         return resp;
     }
-    let htmx = headers.contains_key("hx-request");
 
-    let password_ok = match auth::verify_user_password(&state.db, auth.user.id, &form.password).await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            tracing::error!(?err, "passkey_start: verify password");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
-        }
-    };
-    if !password_ok {
-        return reauth_invalid_password_response(
-            &state,
-            auth.session_id,
-            &auth.user,
-            "/me/passkey/start",
-            &[],
-            htmx,
-        );
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
+        return resp;
     }
 
     match hearth::webauthn::count(&state.db, auth.user.id).await {
@@ -1561,39 +1654,6 @@ pub async fn me_passkey_delete(
     passkey_section_response(&state, &auth, views::SectionMode::Normal).await
 }
 
-/// Build the "wrong password" response for an account-settings reauth
-/// flow. Mirrors the admin pattern: HTMX → reauth modal partial with
-/// `invalid_password` banner; non-HTMX → redirect to /me with a
-/// generic error toast (rare path; the modal flow requires JS).
-fn reauth_invalid_password_response(
-    state: &AppState,
-    session_id: uuid::Uuid,
-    user: &identity::User,
-    action_url: &str,
-    staged_params: &[(&str, &str)],
-    htmx: bool,
-) -> Response {
-    if !htmx {
-        return redirect_to_me_with_error(htmx, "invalid_password");
-    }
-    let csrf_token = csrf::compute_token(&state.csrf_secret, session_id);
-    let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
-        user,
-        csrf_token: &csrf_token,
-        pending_count: None,
-    };
-    Html(
-        views::reauth_modal_content(
-            &ctx,
-            action_url,
-            staged_params,
-            Some("invalid_password"),
-        )
-        .into_string(),
-    )
-    .into_response()
-}
 
 /// HX-Redirect (when HTMX) or 303 (non-HTMX) to `/me` with a positive
 /// toast for `action`. Mirrors `admin_routes::redirect_with_action_toast`
@@ -2026,7 +2086,7 @@ pub async fn logout_submit(
     let mut response = Redirect::to(target).into_response();
     set_cookie_header(
         &mut response,
-        &cookie_value(SESSION_COOKIE_NAME, "", /* clearing = */ true),
+        &cookie_value(SESSION_COOKIE_NAME, "", /* clearing = */ true, cookie_secure(&state)),
     );
     response
 }
@@ -2070,6 +2130,14 @@ fn set_cookie_header(response: &mut Response, value: &str) {
     }
 }
 
+/// Whether auth cookies should carry the `Secure` flag — true when the
+/// instance is served over HTTPS (so dev over plain-HTTP localhost still
+/// works, while a real https deployment never sends the session cookie in
+/// cleartext). Derived from the configured public base URL scheme.
+pub(crate) fn cookie_secure(state: &AppState) -> bool {
+    state.public_base_url.starts_with("https://")
+}
+
 /// Format a `Set-Cookie` header value. When `clearing` is true, sets
 /// `Max-Age=0` to instruct the browser to delete the cookie immediately.
 ///
@@ -2078,14 +2146,14 @@ fn set_cookie_header(response: &mut Response, value: &str) {
 ///   defense-in-depth posture we want for session credentials).
 /// - `SameSite=Lax` — sent on top-level navigations + GET cross-site;
 ///   blocked on cross-site POST. Good default for an admin UI.
-/// - **`Secure` is intentionally omitted** because dev ships plain
-///   HTTP. Once TLS lands, `Secure` should be flipped on conditionally
-///   based on the public base URL scheme.
-fn cookie_value(name: &str, value: &str, clearing: bool) -> String {
+/// - `Secure` — added when `secure` (HTTPS deployment) so the cookie is
+///   never transmitted over plaintext; see [`cookie_secure`].
+fn cookie_value(name: &str, value: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
     if clearing {
-        format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        format!("{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
     } else {
-        format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax")
+        format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax{sec}")
     }
 }
 
@@ -2118,12 +2186,13 @@ const RECOVERY_COOKIE_NAME: &str = "hearth_recovery";
 /// enough that a leaked token has a tiny window.
 const RESET_TTL_SECS: i64 = 600;
 
-fn recovery_cookie_value(token: &str, clearing: bool) -> String {
+fn recovery_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
     if clearing {
-        format!("{RECOVERY_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        format!("{RECOVERY_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
     } else {
         format!(
-            "{RECOVERY_COOKIE_NAME}={token}; Path=/; Max-Age={RESET_TTL_SECS}; HttpOnly; SameSite=Lax"
+            "{RECOVERY_COOKIE_NAME}={token}; Path=/; Max-Age={RESET_TTL_SECS}; HttpOnly; SameSite=Lax{sec}"
         )
     }
 }
@@ -2166,12 +2235,13 @@ const MFA_COOKIE_NAME: &str = "hearth_mfa";
 /// re-enter their password. 10 minutes.
 const MFA_PENDING_TTL_SECS: i64 = 600;
 
-fn mfa_cookie_value(token: &str, clearing: bool) -> String {
+fn mfa_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
     if clearing {
-        format!("{MFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        format!("{MFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
     } else {
         format!(
-            "{MFA_COOKIE_NAME}={token}; Path=/; Max-Age={MFA_PENDING_TTL_SECS}; HttpOnly; SameSite=Lax"
+            "{MFA_COOKIE_NAME}={token}; Path=/; Max-Age={MFA_PENDING_TTL_SECS}; HttpOnly; SameSite=Lax{sec}"
         )
     }
 }
@@ -2187,7 +2257,7 @@ pub(crate) fn mfa_pending_cookie(state: &AppState, user_id: identity::UserId) ->
         user_id.0,
         expires_at,
     );
-    mfa_cookie_value(&token, /* clearing = */ false)
+    mfa_cookie_value(&token, /* clearing = */ false, cookie_secure(state))
 }
 
 /// Resolve the `hearth_mfa` cookie to the pending user, or `None` if it's
@@ -2207,10 +2277,9 @@ fn mfa_pending_user_id(
     .map(identity::UserId::new)
 }
 
-/// Which second factors a pending-MFA user has, for rendering the
-/// challenge page. Errors degrade to `false` (the recovery-code fallback
-/// is always available regardless).
-async fn login_verify_factors(state: &AppState, user_id: identity::UserId) -> (bool, bool) {
+/// `(has_totp, has_passkey)` for a user — drives both the login challenge
+/// page and the step-up reauth modal. Errors degrade to `false`.
+async fn enrolled_factors(state: &AppState, user_id: identity::UserId) -> (bool, bool) {
     let has_totp = auth::user_totp::is_enrolled(&state.db, user_id)
         .await
         .unwrap_or(false);
@@ -2218,6 +2287,87 @@ async fn login_verify_factors(state: &AppState, user_id: identity::UserId) -> (b
         .await
         .unwrap_or(false);
     (has_totp, has_passkey)
+}
+
+// ── Step-up reauth ("sudo") grant ─────────────────────────────────────────
+
+/// Cookie carrying the "recently reauthenticated" grant that unlocks
+/// sensitive actions for a short window. Same posture as `hearth_mfa`:
+/// HttpOnly + SameSite=Lax + `Secure` on https + short-lived.
+const SUDO_COOKIE_NAME: &str = "hearth_sudo";
+/// How long a single reauth stays valid before the user must confirm
+/// again. 5 minutes — long enough for a burst of actions, short enough
+/// that a walked-up-to session can't act indefinitely.
+const SUDO_TTL_SECS: i64 = 300;
+
+fn sudo_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
+    if clearing {
+        format!("{SUDO_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
+    } else {
+        format!(
+            "{SUDO_COOKIE_NAME}={token}; Path=/; Max-Age={SUDO_TTL_SECS}; HttpOnly; SameSite=Lax{sec}"
+        )
+    }
+}
+
+/// Mint the `hearth_sudo` grant for a user who just passed step-up reauth.
+fn sudo_grant_cookie(state: &AppState, user_id: identity::UserId) -> String {
+    let expires_at = chrono::Utc::now().timestamp() + SUDO_TTL_SECS;
+    let token = hearth::signed_token::sign(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_REAUTH,
+        user_id.0,
+        expires_at,
+    );
+    sudo_cookie_value(&token, /* clearing = */ false, cookie_secure(state))
+}
+
+/// Resolve the `hearth_sudo` cookie to the user it was granted to, or
+/// `None` if missing / tampered / expired.
+fn sudo_user_id(state: &AppState, headers: &axum::http::HeaderMap) -> Option<identity::UserId> {
+    let token = read_cookie(headers, SUDO_COOKIE_NAME)?;
+    let now = chrono::Utc::now().timestamp();
+    hearth::signed_token::verify(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_REAUTH,
+        &token,
+        now,
+    )
+    .map(identity::UserId::new)
+}
+
+/// Whether the request carries a fresh sudo grant **for this exact user**
+/// (so user A's grant can't authorize an action as user B). This is the
+/// single check every reauth-gated handler makes.
+pub(crate) fn require_fresh_sudo(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    user_id: identity::UserId,
+) -> bool {
+    sudo_user_id(state, headers) == Some(user_id)
+}
+
+/// Gate a sensitive action on a fresh sudo grant. `Ok(())` proceeds; the
+/// `Err` is a 403 the operator effectively never sees — the reauth chain
+/// pre-checks the grant via `GET /modals/reauth` before submitting, so
+/// reaching a handler without one means a direct POST or a grant that
+/// expired in the millisecond between the pre-check and the submit.
+#[allow(clippy::result_large_err)]
+pub(crate) fn require_sudo(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    user_id: identity::UserId,
+) -> Result<(), Response> {
+    if require_fresh_sudo(state, headers, user_id) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Please confirm it's you and try again.",
+        )
+            .into_response())
+    }
 }
 
 /// `GET /login/verify` — render the second-factor challenge. Bounces to
@@ -2228,7 +2378,7 @@ pub async fn login_verify_page(
 ) -> Response {
     match mfa_pending_user_id(&state, &headers) {
         Some(uid) => {
-            let (has_totp, has_passkey) = login_verify_factors(&state, uid).await;
+            let (has_totp, has_passkey) = enrolled_factors(&state, uid).await;
             Html(views::login_verify_page(None, has_totp, has_passkey).into_string())
                 .into_response()
         }
@@ -2258,7 +2408,7 @@ pub async fn login_verify_submit(
         Some(id) => id,
         None => return Redirect::to("/login").into_response(),
     };
-    let (has_totp, has_passkey) = login_verify_factors(&state, user_id).await;
+    let (has_totp, has_passkey) = enrolled_factors(&state, user_id).await;
 
     let rl_key = format!("mfa:{}", user_id.0);
     if !state.rate_limiter.allowed(&rl_key) {
@@ -2316,44 +2466,35 @@ pub async fn login_verify_submit(
         }
     }
 
-    // TOTP code path. Try the code against every enrolled
-    // authenticator until one accepts it.
+    // TOTP code path. Verify against every enrolled authenticator and
+    // consume the matching one (single-use — a code can't be replayed
+    // within its window).
     if let Some(code) = form.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        let secrets = match auth::user_totp::verified_secrets(
-            &state.db,
-            &state.secret_key,
-            user_id,
-        )
-        .await
+        let now = chrono::Utc::now().timestamp();
+        match auth::user_totp::verify_and_consume(&state.db, &state.secret_key, user_id, code, now)
+            .await
         {
-            Ok(s) => s,
+            Ok(Some(cred_id)) => {
+                return issue_session_after_mfa(&state, &user, MfaFactor::Totp(cred_id)).await;
+            }
+            Ok(None) => {
+                state.rate_limiter.record_failure(&rl_key);
+                audit_mfa_failed(&state, &user, "totp").await;
+                return Html(
+                    views::login_verify_page(
+                        Some("That code didn't match. Try again."),
+                        has_totp,
+                        has_passkey,
+                    )
+                    .into_string(),
+                )
+                .into_response();
+            }
             Err(err) => {
-                tracing::error!(?err, "login_verify: load secrets");
+                tracing::error!(?err, "login_verify: totp verify");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
-        };
-        // No verified authenticators → the pending state is stale.
-        if secrets.is_empty() {
-            return Redirect::to("/login").into_response();
         }
-        let now = chrono::Utc::now().timestamp();
-        if let Some((cred_id, _)) = secrets
-            .iter()
-            .find(|(_, secret)| auth::totp::verify_code(secret, code, now))
-        {
-            return issue_session_after_mfa(&state, &user, MfaFactor::Totp(*cred_id)).await;
-        }
-        state.rate_limiter.record_failure(&rl_key);
-        audit_mfa_failed(&state, &user, "totp").await;
-        return Html(
-            views::login_verify_page(
-                Some("That code didn't match. Try again."),
-                has_totp,
-                has_passkey,
-            )
-            .into_string(),
-        )
-        .into_response();
     }
 
     // Recovery-code break-glass path.
@@ -2500,9 +2641,9 @@ async fn issue_session_after_mfa(
             let mut resp = Redirect::to("/me").into_response();
             append_cookie_header(
                 &mut resp,
-                &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+                &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false, cookie_secure(state)),
             );
-            append_cookie_header(&mut resp, &mfa_cookie_value("", /* clearing = */ true));
+            append_cookie_header(&mut resp, &mfa_cookie_value("", /* clearing = */ true, cookie_secure(state)));
             resp
         }
         Err(err) => {
@@ -2560,10 +2701,10 @@ pub async fn recover_page() -> Response {
 /// generic error. Audits `recovery_started` / `recovery_failed`.
 pub async fn recover_submit(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     Form(form): Form<RecoverForm>,
 ) -> Response {
-    let rl_key = format!("recover:{}", hearth::rate_limit::client_key(&headers));
+    let rl_key = format!("recover:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -2655,7 +2796,7 @@ pub async fn recover_submit(
                 expires_at,
             );
             let mut resp = Redirect::to("/recover/reset").into_response();
-            set_cookie_header(&mut resp, &recovery_cookie_value(&token, false));
+            set_cookie_header(&mut resp, &recovery_cookie_value(&token, false, cookie_secure(&state)));
             resp
         }
         None => {
@@ -2767,9 +2908,9 @@ pub async fn recover_reset_submit(
         Html(views::accept_invite_recovery_code_page(&new_code).into_string()).into_response();
     append_cookie_header(
         &mut resp,
-        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false),
+        &cookie_value(SESSION_COOKIE_NAME, &token, /* clearing = */ false, cookie_secure(&state)),
     );
-    append_cookie_header(&mut resp, &recovery_cookie_value("", /* clearing = */ true));
+    append_cookie_header(&mut resp, &recovery_cookie_value("", /* clearing = */ true, cookie_secure(&state)));
     resp
 }
 

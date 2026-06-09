@@ -118,13 +118,22 @@ pub async fn is_enrolled(pool: &PgPool, user_id: UserId) -> Result<bool> {
     Ok(matches!(row, Some((true,))))
 }
 
-/// All verified `(id, secret)` pairs for the user. The login challenge
-/// tries each until one accepts the presented code.
-pub async fn verified_secrets(
+/// Verify a presented `code` against the user's verified authenticators
+/// and **consume** the matching one — TOTP codes are single-use. Returns
+/// the credential id that accepted the code, or `None` if none matched or
+/// the code was already used (replay).
+///
+/// Single-use is enforced atomically: the consuming `UPDATE` only lands
+/// for a time-step strictly newer than the last one accepted by that
+/// credential, so two submissions of the same code (concurrent or
+/// sequential, within the 30s window) can't both succeed.
+pub async fn verify_and_consume(
     pool: &PgPool,
     key: &[u8; 32],
     user_id: UserId,
-) -> Result<Vec<(Uuid, Vec<u8>)>> {
+    code: &str,
+    unix_time: i64,
+) -> Result<Option<Uuid>> {
     let rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
         "SELECT id, secret_enc FROM auth.totp_credentials
          WHERE user_id = $1 AND verified_at IS NOT NULL",
@@ -132,11 +141,26 @@ pub async fn verified_secrets(
     .bind(user_id)
     .fetch_all(pool)
     .await?;
-    let mut out = Vec::with_capacity(rows.len());
     for (id, enc) in rows {
-        out.push((id, secretbox::open(key, &enc)?));
+        let secret = secretbox::open(key, &enc)?;
+        if let Some(step) = crate::totp::matched_step(&secret, code, unix_time) {
+            let res = sqlx::query(
+                "UPDATE auth.totp_credentials
+                 SET last_used_step = $2, last_used_at = now()
+                 WHERE id = $1 AND verified_at IS NOT NULL
+                   AND (last_used_step IS NULL OR last_used_step < $2)",
+            )
+            .bind(id)
+            .bind(step)
+            .execute(pool)
+            .await?;
+            // Matched but consume failed → this code (or a newer one) was
+            // already used. No other credential could match the same 6
+            // digits, so stop and treat it as a failed attempt.
+            return Ok((res.rows_affected() == 1).then_some(id));
+        }
     }
-    Ok(out)
+    Ok(None)
 }
 
 /// List the user's verified authenticators for the Security tab,

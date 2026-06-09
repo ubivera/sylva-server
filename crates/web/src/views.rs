@@ -528,23 +528,34 @@ const SETTINGS_TABS_JS: &str = r#"
 })();
 "#;
 
-// Gates the Change-password button: it stays disabled until the new
-// password is >= 8 chars and the confirm field matches. Fires on any
-// input within a form containing a `[data-pw-confirm]` field, so a
-// typo'd confirm can't reach the reauth step. The on-demand modal is
-// fetched fresh each open, so there's no reset-on-close to manage.
+// Change-password field glue:
+//   • Gate — keep the Change-password button (which sits in the section
+//     header, outside the form) disabled until the new password is >= 8
+//     chars. The input carries `data-pw-gate="<form id>"`; the button is
+//     found by `[data-reauth-confirm="<form id>"]`, document-wide.
+//   • Reveal — the eye button (`[data-pw-toggle="<input id>"]`) flips the
+//     input between password/text and swaps which eye glyph shows.
 const CHANGE_PASSWORD_GATE_JS: &str = r#"
 (function() {
     document.addEventListener('input', function(e) {
-        var form = e.target.closest('form');
-        if (!form) return;
-        var confirmField = form.querySelector('[data-pw-confirm]');
-        if (!confirmField) return;
-        var newField = document.getElementById(confirmField.getAttribute('data-pw-confirm'));
-        var btn = form.querySelector('[data-reauth-confirm]');
-        if (!newField || !btn) return;
-        var val = newField.value;
-        btn.disabled = !(val.length >= 8 && val === confirmField.value);
+        var field = e.target.closest('[data-pw-gate]');
+        if (!field) return;
+        var btn = document.querySelector(
+            '[data-reauth-confirm="' + field.getAttribute('data-pw-gate') + '"]'
+        );
+        if (btn) btn.disabled = field.value.length < 8;
+    });
+
+    document.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-pw-toggle]');
+        if (!btn) return;
+        e.preventDefault();
+        var input = document.getElementById(btn.getAttribute('data-pw-toggle'));
+        if (!input) return;
+        var reveal = input.type === 'password';
+        input.type = reveal ? 'text' : 'password';
+        btn.classList.toggle('is-showing', reveal);
+        btn.setAttribute('aria-label', reveal ? 'Hide password' : 'Show password');
     });
 })();
 "#;
@@ -672,7 +683,11 @@ const WEBAUTHN_JS: &str = r#"
                     };
                     form.querySelector('[name="challenge_id"]').value = data.challenge_id;
                     form.querySelector('[name="passkey"]').value = JSON.stringify(out);
-                    form.submit();
+                    // requestSubmit fires a submit event htmx can intercept
+                    // (reauth posts via hx-post); a plain native login form
+                    // just submits. Both work.
+                    if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                    else form.submit();
                 });
             })
             .catch(function() {
@@ -1691,66 +1706,179 @@ fn invite_form_fields(
 /// The form's `action` attribute is empty at render time; the JS
 /// chain in `REAUTH_CHAIN_JS` sets both `action` and `hx-post` to
 /// whichever per-row action URL the operator initiated.
-pub fn reauth_modal(ctx: &ChromeContext) -> Markup {
+pub fn reauth_modal(ctx: &ChromeContext, has_totp: bool, has_passkey: bool, fresh: bool) -> Markup {
     html! {
-        dialog id="dlg-reauth" class="action-dialog reauth-dialog" {
+        dialog id="dlg-reauth" class="action-dialog reauth-dialog"
+               data-sudo-fresh=[fresh.then_some("1")] {
             div id="reauth-modal-content" {
-                (reauth_modal_content(ctx, "", &[], None))
+                (reauth_modal_content(ctx, has_totp, has_passkey, None))
             }
         }
     }
 }
 
-/// Inner content of the reauth modal. `action_url` is what the form
-/// posts to (set per-action at chain time). `staged_params` are
-/// hidden inputs carrying the original action's payload so a wrong
-/// password attempt doesn't make the operator re-pick (e.g., role
-/// selection survives a retry). `error` renders an inline banner
-/// — currently only `"invalid_password"` is wired.
+/// Inner content of the step-up reauth modal. Renders the factors the
+/// account's assurance level demands (see `hearth-mfa.md`): a one-tap
+/// passkey when enrolled, password (+ authenticator code when TOTP is
+/// enrolled) otherwise. Both paths POST to `/me/reauth`, which verifies
+/// the factor and mints the short-lived `hearth_sudo` grant; on success
+/// the response fires `reauth-ok` and `REAUTH_CHAIN_JS` runs the original
+/// action. `error` is a free-text retry message.
+///
+/// A password-only path is deliberately absent for a passkey-without-TOTP
+/// account — falling back to the password alone would drop below the
+/// account's AAL. Such a user verifies with the passkey (or signs out and
+/// uses their recovery code).
 pub fn reauth_modal_content(
     ctx: &ChromeContext,
-    action_url: &str,
-    staged_params: &[(&str, &str)],
+    has_totp: bool,
+    has_passkey: bool,
     error: Option<&str>,
 ) -> Markup {
+    // Password path is offered when there's no passkey, or as the
+    // fallback when a passkey user also has TOTP (still AAL2).
+    let show_password = !has_passkey || has_totp;
+    // The passkey view leads when a passkey is enrolled — unless a
+    // password attempt just failed (the error belongs to the password
+    // view), or there's no password fallback at all (then the passkey
+    // view must stay up to host the server-side error).
+    let passkey_default = has_passkey && (error.is_none() || !show_password);
+    html! {
+        // ── Passkey view (default when a passkey is enrolled) ──────────
+        @if has_passkey {
+            div class="reauth-view" data-reauth-view="passkey" hidden[!passkey_default] {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-passkey" {
+                        (fingerprint_icon())
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 class="dialog-center-title" { "Confirm it's you" }
+                p class="dialog-description dialog-center-text" {
+                    "Use your passkey to continue."
+                }
+                // Hidden form holding the assertion; submitted by WEBAUTHN_JS
+                // (the [data-passkey-auth] handler) after the get-ceremony.
+                // REAUTH_CHAIN_JS auto-triggers the button when this view
+                // opens, so the OS prompt appears without an extra click.
+                form id="form-reauth-passkey" hx-post="/me/reauth"
+                     hx-target="#reauth-modal-content" hx-swap="innerHTML" {
+                    (csrf_input(ctx.csrf_token))
+                    input type="hidden" name="challenge_id";
+                    input type="hidden" name="passkey";
+                }
+                @if let Some(msg) = error {
+                    p class="error" id="passkey-error" { (msg) }
+                } @else {
+                    p class="error" id="passkey-error" hidden {}
+                }
+                button type="button" class="btn login-passkey-btn reauth-passkey-btn"
+                       data-passkey-auth="/me/reauth/passkey/start"
+                       data-passkey-form="form-reauth-passkey" {
+                    "Verify with passkey"
+                }
+                @if show_password {
+                    button type="button" class="reauth-switch-link"
+                           data-reauth-show-password {
+                        "Use password instead"
+                    }
+                } @else {
+                    p class="muted reauth-note" {
+                        "Lost access to your passkey? Sign out and use your "
+                        "saved recovery code to get back in."
+                    }
+                }
+            }
+        }
+
+        // ── Password (+ TOTP) view ─────────────────────────────────────
+        @if show_password {
+            div class="reauth-view" data-reauth-view="password" hidden[passkey_default] {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-shield" {
+                        (shield_icon())
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 class="dialog-center-title" { "Confirm it's you" }
+                p class="dialog-description dialog-center-text" {
+                    @if has_totp {
+                        "Enter your password and authenticator code to continue."
+                    } @else {
+                        "Enter your password to continue."
+                    }
+                }
+                @if let Some(msg) = error {
+                    p class="error" { (msg) }
+                }
+                form id="form-reauth" hx-post="/me/reauth"
+                     hx-target="#reauth-modal-content" hx-swap="innerHTML" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="field" {
+                        label for="reauth-password" { "Password" }
+                        input type="password" id="reauth-password" name="password"
+                              autocomplete="current-password" required;
+                    }
+                    @if has_totp {
+                        div class="field" {
+                            label for="reauth-code" { "Authenticator code" }
+                            input type="text" id="reauth-code" name="code"
+                                  inputmode="numeric" autocomplete="one-time-code"
+                                  pattern="[0-9]*" maxlength="6" required;
+                        }
+                    }
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog {
+                            "Cancel"
+                        }
+                        button type="submit" class="btn" { "Verify" }
+                    }
+                }
+                @if has_passkey {
+                    button type="button" class="reauth-switch-link"
+                           data-reauth-show-passkey {
+                        "Use a passkey instead"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Confirmation rendered into the (kept-open) reauth modal after a
+/// successful password change. Keeps the account-settings modal open
+/// behind it rather than navigating away, so the operator sees the
+/// change land. The current session stays signed in; others were
+/// revoked server-side.
+pub fn password_changed_success_content() -> Markup {
     html! {
         div class="dialog-header" {
-            div class="dialog-icon dialog-icon-shield" {
-                (shield_icon())
+            div class="dialog-icon dialog-icon-success" {
+                (check_circle_icon())
             }
             button type="button" class="dialog-close" data-close-dialog
                    aria-label="Close" {
                 (close_icon())
             }
         }
-        h2 class="dialog-center-title" { "Please enter your password" }
+        h2 class="dialog-center-title" { "Password updated" }
         p class="dialog-description dialog-center-text" {
-            "Enter your password to make this change."
+            "Your password has been changed. Other devices have been "
+            "signed out; this one stays active."
         }
-        @if let Some(code) = error {
-            (error_banner(code))
+        div class="dialog-actions dialog-actions-centered" {
+            button type="button" class="btn" data-close-dialog { "Done" }
         }
-        form id="form-reauth"
-             method="post" action=(action_url)
-             hx-post=(action_url)
-             hx-target="#reauth-modal-content"
-             hx-swap="innerHTML" {
-            div class="field" {
-                label for="reauth-password" { "Password" }
-                input type="password" id="reauth-password" name="password"
-                      autocomplete="current-password" required;
-            }
-            (csrf_input(ctx.csrf_token))
-            @for (name, value) in staged_params {
-                input type="hidden" name=(name) value=(value);
-            }
-            div class="dialog-actions" {
-                button type="button" class="btn-secondary" data-close-dialog {
-                    "Cancel"
-                }
-                button type="submit" class="btn" { "Verify" }
-            }
-        }
+        // Out-of-band resets for the settings form left open behind this
+        // modal: clear the typed password and re-disable the header button.
+        (change_password_input(true))
+        (change_password_button(true))
     }
 }
 
@@ -2035,13 +2163,82 @@ fn settings_profile_panel(ctx: &ChromeContext) -> Markup {
     }
 }
 
-/// Security panel — the Change password section. New + confirm
-/// fields live here; the current password is collected by the reauth
-/// modal (the "Change password" button is a `data-reauth-confirm`
-/// trigger). The button stays disabled until the new password is at
-/// least 8 chars and matches the confirm field (see
-/// `CHANGE_PASSWORD_GATE_JS`), so a typo'd confirm never reaches the
-/// reauth step.
+/// Eye glyph — "show password". Paired with [`eye_off_icon`] in the
+/// password field's reveal toggle (CSS swaps which one is visible).
+fn eye_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" {}
+            circle cx="12" cy="12" r="3" {}
+        }
+    }
+}
+
+/// Eye-with-slash glyph — "hide password" (shown while the password is
+/// revealed).
+fn eye_off_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="18" height="18" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" {}
+            path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" {}
+            path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" {}
+            line x1="2" x2="22" y1="2" y2="22" {}
+        }
+    }
+}
+
+/// The new-password input for the Security tab, with an inline show/hide
+/// (eye) toggle in place of a separate confirm field. `oob` makes it an
+/// `hx-swap-oob` carrier so a successful change can reset the field in
+/// the still-open settings modal.
+fn change_password_input(oob: bool) -> Markup {
+    html! {
+        div class="password-input-wrap" id="change-pw-field"
+            hx-swap-oob=[oob.then_some("true")] {
+            input type="password" id="change-pw-new" name="new_password"
+                  data-pw-gate="form-change-password"
+                  autocomplete="new-password" minlength="8"
+                  placeholder="New password" required;
+            button type="button" class="password-toggle"
+                   data-pw-toggle="change-pw-new" aria-label="Show password" {
+                span class="pw-eye" { (eye_icon()) }
+                span class="pw-eye-off" { (eye_off_icon()) }
+            }
+        }
+    }
+}
+
+/// The Change-password action button, rendered in the section header
+/// (mirrors the authenticator section's Add button). Starts disabled —
+/// `CHANGE_PASSWORD_GATE_JS` enables it once the field holds 8+ chars.
+/// `oob` resets it back to disabled after a successful change.
+fn change_password_button(oob: bool) -> Markup {
+    html! {
+        button type="button" id="change-pw-btn" class="btn-secondary"
+               hx-swap-oob=[oob.then_some("true")]
+               data-reauth-confirm="form-change-password"
+               data-keep-source-open
+               disabled {
+            (key_icon())
+            span { "Change password" }
+        }
+    }
+}
+
+/// Security panel — the Change password section. A single new-password
+/// field (with a show/hide eye toggle) lives in the body; the action
+/// button sits in the section header (like the authenticator section).
+/// The current password is collected by the reauth modal. The button
+/// stays disabled until the new password is at least 8 chars (see
+/// `CHANGE_PASSWORD_GATE_JS`).
 fn settings_security_panel(
     ctx: &ChromeContext,
     totp_creds: &[auth::user_totp::TotpCredential],
@@ -2050,16 +2247,21 @@ fn settings_security_panel(
 ) -> Markup {
     html! {
         section class="settings-section" {
-            div class="settings-section-header" {
-                span class="settings-section-icon" aria-hidden="true" {
-                    (shield_icon())
-                }
-                div {
-                    h3 { "Password" }
-                    p class="settings-section-tagline" {
-                        "Change the password you use to sign in."
+            div class="settings-section-header settings-section-header-actions" {
+                div class="settings-section-heading" {
+                    span class="settings-section-icon" aria-hidden="true" {
+                        (shield_icon())
+                    }
+                    div {
+                        h3 { "Password" }
+                        p class="settings-section-tagline" {
+                            "Change the password you use to sign in."
+                        }
                     }
                 }
+                // The button references the body form by id, so it can live
+                // in the header (outside the form) and still drive the chain.
+                (change_password_button(false))
             }
             div class="settings-section-body" {
                 form id="form-change-password"
@@ -2070,33 +2272,12 @@ fn settings_security_panel(
                     div class="settings-row-label" {
                         label for="change-pw-new" { "New password" }
                         p class="settings-row-hint" {
-                            "At least 8 characters. You'll confirm your "
-                            "current password before the change applies. "
-                            "Changing it signs out your other devices."
+                            "At least 8 characters. Changing it signs out "
+                            "your other devices."
                         }
                     }
                     div class="settings-row-control" {
-                        input type="password"
-                              id="change-pw-new"
-                              name="new_password"
-                              autocomplete="new-password"
-                              minlength="8"
-                              required;
-                        // No `name` — this confirm field is a client-side
-                        // typo guard only; it never reaches the server.
-                        input type="password"
-                              id="change-pw-confirm"
-                              data-pw-confirm="change-pw-new"
-                              autocomplete="new-password"
-                              placeholder="Confirm new password"
-                              required;
-                        div class="settings-row-actions" {
-                            button type="button" class="btn-secondary"
-                                   data-reauth-confirm="form-change-password"
-                                   disabled {
-                                "Change password"
-                            }
-                        }
+                        (change_password_input(false))
                     }
                 }
             }
@@ -2687,11 +2868,12 @@ fn settings_data_panel(
                         p class="settings-row-hint" {
                             "Regenerating shows a new code once and "
                             "immediately invalidates the old one. You'll "
-                            "confirm your current password first."
+                            "confirm it's you first."
                         }
                         div class="settings-row-actions" {
                             button type="button" class="btn-secondary"
-                                   data-reauth-confirm="form-regenerate-recovery" {
+                                   data-reauth-confirm="form-regenerate-recovery"
+                                   data-keep-source-open {
                                 "Regenerate"
                             }
                         }
@@ -2906,7 +3088,7 @@ pub fn settings_name_form(
             div class="settings-row-label" {
                 label for="settings-display-name" { "Display name" }
                 p class="settings-row-hint" {
-                    "How you appear beside your sign-in everywhere on \
+                    "How you appear to others on \
                      this instance."
                 }
             }
@@ -2946,9 +3128,7 @@ pub fn settings_email_form(ctx: &ChromeContext) -> Markup {
             div class="settings-row-label" {
                 label for="settings-email" { "Email address" }
                 p class="settings-row-hint" {
-                    "The address you sign in with. You'll be asked to \
-                     confirm your current password before the change \
-                     applies."
+                    "The address you sign in with."
                 }
             }
             div class="settings-row-control" {
@@ -4260,43 +4440,68 @@ const CONFIRM_CHECKBOX_JS: &str = r#"
 //      input. HTMX takes over on submit.
 const REAUTH_CHAIN_JS: &str = r#"
 (function() {
-    // Idempotency guard. The shell wires this script for every
-    // authed page (the account-settings modal opens from anywhere
-    // and uses the chain for email/password edits), and /members
-    // also loads it in its own script block. Double-binding the
-    // document click listener would stage the payload twice on each
-    // click; the guard keeps the first binding and short-circuits
-    // subsequent loads.
+    // Idempotency guard — the shell wires this for every authed page and
+    // /members loads it again; double-binding would run the chain twice.
     if (window.__hearthReauthChainLoaded) return;
     window.__hearthReauthChainLoaded = true;
+
+    // The source form's payload minus the password — under the sudo-grant
+    // model the action is authorized by the hearth_sudo cookie, not a
+    // password field, so the action handlers no longer accept one.
+    function payloadOf(sourceForm) {
+        var values = {};
+        new FormData(sourceForm).forEach(function(value, key) {
+            if (key === 'password') return;
+            values[key] = value;
+        });
+        return values;
+    }
+
+    // Run the original action via htmx (POST). A single #reauth-modal-content
+    // target serves every action: admin actions drive their outcome with
+    // HX-Redirect, invite with HX-Retarget, and TOTP/passkey enrollment
+    // renders its QR straight into the (open) reauth modal.
+    function runAction(actionUrl, values) {
+        if (window.htmx && typeof window.htmx.ajax === 'function') {
+            window.htmx.ajax('POST', actionUrl, {
+                target: '#reauth-modal-content',
+                swap: 'innerHTML',
+                values: values
+            });
+        }
+    }
+
+    // Dispose the *source* dialog per its hand-off mode (unchanged intent):
+    //   • keep-source-open (TOTP/passkey enrollment) → leave it open behind
+    //     the reauth modal (the action's response refreshes it via OOB).
+    //   • keep-source (invite) → close with the chainTransition flag so it
+    //     survives in #modal-host to be reopened by switch-to-invite-modal.
+    //   • default (per-row) → remove it; the action redirects away anyway.
+    function disposeSource(sourceDialog, keepSource, keepSourceOpen) {
+        if (!sourceDialog) return;
+        if (keepSourceOpen) return;
+        if (keepSource) {
+            sourceDialog.dataset.chainTransition = '1';
+            if (typeof sourceDialog.close === 'function') sourceDialog.close();
+        } else {
+            sourceDialog.remove();
+        }
+    }
+
     document.addEventListener('click', function(e) {
         var btn = e.target.closest('[data-reauth-confirm]');
         if (!btn) return;
         e.preventDefault();
         var sourceForm = document.getElementById(btn.getAttribute('data-reauth-confirm'));
         if (!sourceForm) return;
-        // Run native form validation before opening the reauth modal.
-        // Without this, a malformed email + click on Update email would
-        // open the reauth flow, the operator would type their password,
-        // and only then see the rejection. Surfacing the invalidity at
-        // the source form means the password prompt only appears for
-        // requests that have a chance of succeeding.
-        if (typeof sourceForm.checkValidity === 'function'
-            && !sourceForm.checkValidity()) {
-            if (typeof sourceForm.reportValidity === 'function') {
-                sourceForm.reportValidity();
-            }
+        // Surface form invalidity (e.g. malformed email) before prompting.
+        if (typeof sourceForm.checkValidity === 'function' && !sourceForm.checkValidity()) {
+            if (typeof sourceForm.reportValidity === 'function') sourceForm.reportValidity();
             return;
         }
 
-        // Role-aware intercept — if the source form has a role input
-        // and "owner" is selected, route through the owner-confirm
-        // dialog instead of straight to reauth. Under the on-demand
-        // model the owner-confirm is its own fetched fragment
-        // (`/members/{id}/modal/role-owner-confirm`) with a
-        // self-contained role=owner form; once it's shown we remove
-        // the role-picker dialog entirely (no cross-dialog form
-        // reference to preserve).
+        // Owner-promotion intercept — route owner role changes through the
+        // dedicated confirm fragment instead of straight to reauth.
         if (btn.hasAttribute('data-role-aware')) {
             var roleInput = sourceForm.querySelector('input[name="role"]:checked');
             if (roleInput && roleInput.value === 'owner') {
@@ -4305,111 +4510,112 @@ const REAUTH_CHAIN_JS: &str = r#"
                 window.hearthOpenModal('/members/' + targetId + '/modal/role-owner-confirm')
                     .then(function(oc) {
                         if (oc && typeof oc.showModal === 'function') oc.showModal();
-                        // Remove the role picker — owner-confirm is
-                        // self-contained, so nothing depends on it.
                         if (roleDialog) roleDialog.remove();
                     });
                 return;
             }
         }
 
-        // Fetch the reauth modal on demand (it ships no page markup).
-        // `hearthEnsureModal` reuses a still-mounted dlg-reauth if one
-        // exists, else fetches `/modals/reauth`. The staging + open
-        // happens in the promise callback once the fragment lands.
         var actionUrl = sourceForm.getAttribute('action') || '';
+        var values = payloadOf(sourceForm);
         var sourceDialog = btn.closest('dialog');
         var keepSource = btn.hasAttribute('data-keep-source');
         var keepSourceOpen = btn.hasAttribute('data-keep-source-open');
-        window.hearthEnsureModal('dlg-reauth', '/modals/reauth').then(function(reauthDialog) {
-            var reauthContent = document.getElementById('reauth-modal-content');
-            var reauthForm = reauthContent ? reauthContent.querySelector('form') : null;
-            if (!reauthDialog || !reauthForm) return;
 
-            // Repoint the reauth form at the action URL.
-            reauthForm.setAttribute('action', actionUrl);
-            reauthForm.setAttribute('hx-post', actionUrl);
-            if (window.htmx && typeof window.htmx.process === 'function') {
-                window.htmx.process(reauthForm);
-            }
+        // (Re)fetch the reauth modal — it carries data-sudo-fresh telling us
+        // whether a recent step-up still covers this action. Drop a stale
+        // one first so the flag is current.
+        var stale = document.getElementById('dlg-reauth');
+        if (stale) stale.remove();
+        window.hearthOpenModal('/modals/reauth').then(function(dlg) {
+            if (!dlg) return;
+            var fresh = dlg.dataset.sudoFresh === '1';
 
-            // Drop any previously-staged inputs from an earlier chain.
-            reauthForm.querySelectorAll('input[data-reauth-staged]').forEach(function(el) {
-                el.remove();
-            });
-            // Copy the source form's payload into the reauth form.
-            new FormData(sourceForm).forEach(function(value, key) {
-                if (key === 'csrf_token' || key === 'password') return;
-                var input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = key;
-                input.value = value;
-                input.setAttribute('data-reauth-staged', '');
-                reauthForm.appendChild(input);
-            });
-
-            // Clear the password input from any prior open.
-            var pwInput = reauthForm.querySelector('input[name="password"]');
-            if (pwInput) pwInput.value = '';
-
-            // Dispose of the source dialog now that its payload is
-            // staged into the reauth form. Three modes:
-            //   • `data-keep-source-open` (authenticator add): leave the
-            //     source modal *open* behind the reauth modal. The action
-            //     response refreshes a piece of it live via hx-swap-oob
-            //     (the authenticators list), so closing reauth reveals an
-            //     already-updated settings modal — no reopen needed.
-            //   • `data-keep-source` (invite): the source must survive
-            //     because the success partial gets HX-Retargeted back
-            //     into it. Close it (chainTransition flag stops
-            //     remove-on-close from deleting it) — the
-            //     switch-to-invite-modal event reopens it later.
-            //   • default (per-row actions): remove it outright; the
-            //     reauth form is now the source of truth.
-            if (sourceDialog) {
-                if (keepSourceOpen) {
-                    // intentionally left open
-                } else if (keepSource) {
-                    sourceDialog.dataset.chainTransition = '1';
-                    if (typeof sourceDialog.close === 'function') sourceDialog.close();
-                } else {
-                    sourceDialog.remove();
+            if (fresh) {
+                // Within the sudo window — skip the factor step. For the
+                // open-hosting actions (enrollment QR, recovery code,
+                // password-changed), blank the modal first so it doesn't
+                // flash the now-unnecessary factor prompt before the
+                // action's result swaps in.
+                if (keepSourceOpen && typeof dlg.showModal === 'function') {
+                    var rc = dlg.querySelector('#reauth-modal-content');
+                    if (rc) rc.innerHTML = '';
+                    dlg.showModal();
                 }
+                disposeSource(sourceDialog, keepSource, keepSourceOpen);
+                runAction(actionUrl, values);
+                return;
             }
-            if (typeof reauthDialog.showModal === 'function') {
-                reauthDialog.showModal();
+
+            // Step-up required. Run the action once POST /me/reauth mints
+            // the grant (fires reauth-ok). Keep the listener across failed
+            // attempts; drop it if the user cancels (modal close).
+            function onOk() {
+                document.removeEventListener('reauth-ok', onOk);
+                // Enrollment keeps the reauth modal open to host its QR;
+                // everything else redirects/retargets, so close it.
+                if (!keepSourceOpen && typeof dlg.close === 'function') dlg.close();
+                disposeSource(sourceDialog, keepSource, keepSourceOpen);
+                runAction(actionUrl, values);
             }
-            if (pwInput) pwInput.focus();
+            document.addEventListener('reauth-ok', onOk);
+            dlg.addEventListener('close', function() {
+                document.removeEventListener('reauth-ok', onOk);
+            }, { once: true });
+            if (typeof dlg.showModal === 'function') dlg.showModal();
+            // Passkey-first: auto-trigger the get-ceremony when the modal
+            // opens on the passkey view, so the OS prompt appears without an
+            // extra tap. Runs inside the original click's activation window
+            // (the preceding fetches are local + fast); if a browser blocks
+            // it, the visible "Verify with passkey" button is the fallback.
+            var autoPk = dlg.querySelector(
+                '[data-reauth-view="passkey"]:not([hidden]) [data-passkey-auth]'
+            );
+            if (autoPk) { try { autoPk.click(); } catch (_) {} }
         });
     });
 
-    // Implicit form submission (Enter in a text input) bypasses the
-    // click handler above and POSTs the form natively to its `action`
-    // URL — which for chain forms is the action endpoint, *not* the
-    // reauth modal. Without an interceptor here the result is a body
-    // missing the `password` field, surfacing as Axum's deserialize
-    // error. Affects the invite modal (Enter in email), and the
-    // Delete + Purge dialogs (Enter in the type-to-confirm field).
-    //
-    // The fix: catch the submit event, find the chain button whose
-    // `data-reauth-confirm` points at this form, and synthesize a
-    // click on it. The existing click handler then runs the full
-    // chain (role-aware intercept + payload staging + reauth open).
-    //
-    // `.click()` on a disabled button is a spec-defined no-op, so
-    // the type-to-confirm and role-picker gates stay enforced —
-    // pressing Enter before the gate is satisfied does nothing,
-    // which matches the click behaviour.
+    // Passkey ↔ password view toggle inside the reauth modal. "Use password
+    // instead" / "Use a passkey instead" just flip which view is visible —
+    // no re-fetch, so the in-flight challenge + chain listener survive.
+    document.addEventListener('click', function(e) {
+        var toPw = e.target.closest('[data-reauth-show-password]');
+        var toPk = e.target.closest('[data-reauth-show-passkey]');
+        if (!toPw && !toPk) return;
+        e.preventDefault();
+        var root = (toPw || toPk).closest('#reauth-modal-content') || document;
+        var pkView = root.querySelector('[data-reauth-view="passkey"]');
+        var pwView = root.querySelector('[data-reauth-view="password"]');
+        if (toPw) {
+            if (pkView) pkView.hidden = true;
+            if (pwView) {
+                pwView.hidden = false;
+                var inp = pwView.querySelector('input[name="password"]');
+                if (inp) inp.focus();
+            }
+        } else {
+            if (pwView) pwView.hidden = true;
+            if (pkView) pkView.hidden = false;
+        }
+    });
+
+    // Enter-in-a-textfield submits the source form natively; re-route it
+    // through the chain by clicking the matching confirm button. (A click
+    // on a disabled button is a no-op, so type-to-confirm/role gates hold.)
+    // The reauth modal's own factor forms have no such button, so this
+    // skips them and lets htmx post them to /me/reauth.
     document.addEventListener('submit', function(e) {
         var form = e.target;
-        if (!(form instanceof HTMLFormElement)) return;
-        var btns = form.querySelectorAll('[data-reauth-confirm]');
-        for (var i = 0; i < btns.length; i++) {
-            if (btns[i].getAttribute('data-reauth-confirm') === form.id) {
-                e.preventDefault();
-                btns[i].click();
-                return;
-            }
+        if (!(form instanceof HTMLFormElement) || !form.id) return;
+        // The confirm button may live outside the form (the change-password
+        // button sits in the section header), so search the whole document
+        // for a button bound to this form id. Forms with no such button
+        // (e.g. the reauth modal's own factor form) fall through to their
+        // native/htmx submit.
+        var btn = document.querySelector('[data-reauth-confirm="' + form.id + '"]');
+        if (btn) {
+            e.preventDefault();
+            btn.click();
         }
     });
 })();

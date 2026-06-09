@@ -19,6 +19,11 @@ pub struct Config {
     /// Lets an operator running multiple Hearths tell them apart at a
     /// glance. Defaults to `"Hearth"` when unset.
     pub instance_name: String,
+    /// Trust `X-Forwarded-For` / `X-Real-IP` for rate-limit client-IP
+    /// keying. Off by default (key on the socket peer, which a client
+    /// can't spoof); turn on (`HEARTH_TRUST_PROXY=1`) only behind a
+    /// reverse proxy that sets those headers.
+    pub trust_proxy: bool,
     pub notifications: NotificationsConfig,
 }
 
@@ -123,6 +128,14 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_string());
 
+        // Whether to trust `X-Forwarded-For` / `X-Real-IP` for client-IP
+        // rate-limit keying. Default OFF (secure): we key on the socket
+        // peer so a client can't spoof a header to evade limits. Operators
+        // behind a reverse proxy that sets these headers turn it on.
+        let trust_proxy = get("HEARTH_TRUST_PROXY")
+            .map(|v| parse_bool(&v))
+            .unwrap_or(false);
+
         let notifications = parse_notifications(&get)?;
 
         Ok(Self {
@@ -133,6 +146,7 @@ impl Config {
             postgres_url,
             public_base_url,
             instance_name,
+            trust_proxy,
             notifications,
         })
     }
@@ -230,6 +244,15 @@ fn hex_nibble(b: u8) -> anyhow::Result<u8> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => bail!("invalid hex digit"),
     }
+}
+
+/// Parse a boolean env var. Accepts `1` / `true` / `yes` / `on`
+/// (case-insensitive) as true; anything else is false.
+fn parse_bool(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_notifications<F>(get: &F) -> anyhow::Result<NotificationsConfig>

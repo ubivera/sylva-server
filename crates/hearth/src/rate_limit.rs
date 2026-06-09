@@ -10,20 +10,27 @@
 //! requests never consume tokens, so a legitimate user typing their
 //! password correctly is never throttled.
 //!
-//! Keyed by best-effort client IP via [`client_key`] (first
-//! `X-Forwarded-For` hop, else `X-Real-IP`, else the shared literal
-//! `"direct"`). This assumes a **trusted reverse proxy** sets that
-//! header — the standard self-hosted topology. Without one, the header
-//! is client-controlled and keying degrades to the shared `"direct"`
-//! bucket; see `hearth-recovery.md` for the deployment note.
+//! Keyed by client IP via the [`ClientIp`] extractor. **By default the
+//! socket peer IP is used and forwarding headers are ignored** — a client
+//! could otherwise spoof `X-Forwarded-For` to mint a fresh bucket per
+//! request and defeat the limit entirely. Operators who run behind a
+//! reverse proxy (the standard https topology) set `HEARTH_TRUST_PROXY=1`,
+//! which switches keying to the first `X-Forwarded-For` / `X-Real-IP` hop
+//! the proxy sets. See `hearth-recovery.md` for the deployment note.
 //!
 //! State is process-local (a `Mutex<HashMap>`); a multi-process
 //! deployment would need a shared store. Single-instance is the design
 //! target today.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Instant;
+
+use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::request::Parts;
+
+use crate::app::AppState;
 
 /// Burst size for the auth limiter: how many failed attempts a single
 /// client can make before being throttled.
@@ -115,23 +122,68 @@ impl RateLimiter {
     }
 }
 
-/// Best-effort client identifier for rate-limit keying. See the module
-/// docs for the trusted-proxy assumption.
-pub fn client_key(headers: &axum::http::HeaderMap) -> String {
+/// Resolve the effective client IP for rate-limit keying.
+///
+/// - `trust_proxy = false` (default): use the **socket peer** IP and
+///   ignore forwarding headers (a client could spoof them to evade the
+///   limit). Falls back to `"direct"` when no peer is known (e.g. unit
+///   tests with no live connection).
+/// - `trust_proxy = true`: the instance is behind a reverse proxy that
+///   sets `X-Forwarded-For` / `X-Real-IP`; trust the first hop.
+pub fn resolve_client_ip(
+    peer: Option<IpAddr>,
+    headers: &axum::http::HeaderMap,
+    trust_proxy: bool,
+) -> String {
+    if trust_proxy && let Some(ip) = forwarded_ip(headers) {
+        return ip;
+    }
+    peer.map(|ip| ip.to_string())
+        .unwrap_or_else(|| "direct".to_string())
+}
+
+/// First `X-Forwarded-For` hop, else `X-Real-IP`. Only consulted when the
+/// operator has opted into trusting a proxy.
+fn forwarded_ip(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-forwarded-for")
         && let Ok(s) = v.to_str()
         && let Some(first) = s.split(',').next()
         && !first.trim().is_empty()
     {
-        return first.trim().to_string();
+        return Some(first.trim().to_string());
     }
     if let Some(v) = headers.get("x-real-ip")
         && let Ok(s) = v.to_str()
         && !s.trim().is_empty()
     {
-        return s.trim().to_string();
+        return Some(s.trim().to_string());
     }
-    "direct".to_string()
+    None
+}
+
+/// Extractor yielding the rate-limit client key (the effective client IP).
+/// Reads the socket peer from `ConnectInfo` (wired at serve time via
+/// `into_make_service_with_connect_info`) and the instance's `trust_proxy`
+/// policy from [`AppState`]. Infallible — degrades to `"direct"`.
+pub struct ClientIp(pub String);
+
+impl FromRequestParts<AppState> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        Ok(ClientIp(resolve_client_ip(
+            peer,
+            &parts.headers,
+            state.trust_proxy,
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -186,18 +238,40 @@ mod tests {
         assert!(rl.allowed_at("b", 0), "other key unaffected");
     }
 
-    #[test]
-    fn client_key_prefers_first_forwarded_hop() {
-        let mut h = axum::http::HeaderMap::new();
-        h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_key(&h), "203.0.113.7");
+    fn peer(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
     }
 
     #[test]
-    fn client_key_falls_back_to_real_ip_then_direct() {
+    fn untrusted_proxy_uses_peer_and_ignores_forwarding_headers() {
+        // The spoofable headers must NOT influence the key when the proxy
+        // isn't trusted — otherwise an attacker mints a bucket per request.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        h.insert("x-real-ip", "203.0.113.8".parse().unwrap());
+        assert_eq!(resolve_client_ip(peer("10.0.0.5"), &h, false), "10.0.0.5");
+    }
+
+    #[test]
+    fn untrusted_proxy_without_peer_falls_back_to_direct() {
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(resolve_client_ip(None, &h, false), "direct");
+    }
+
+    #[test]
+    fn trusted_proxy_prefers_first_forwarded_hop() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(resolve_client_ip(peer("10.0.0.9"), &h, true), "203.0.113.7");
+    }
+
+    #[test]
+    fn trusted_proxy_falls_back_to_real_ip_then_peer() {
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-real-ip", "198.51.100.4".parse().unwrap());
-        assert_eq!(client_key(&h), "198.51.100.4");
-        assert_eq!(client_key(&axum::http::HeaderMap::new()), "direct");
+        assert_eq!(resolve_client_ip(peer("10.0.0.9"), &h, true), "198.51.100.4");
+        // No forwarding header → even a trusting proxy uses the peer.
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!(resolve_client_ip(peer("10.0.0.9"), &empty, true), "10.0.0.9");
     }
 }

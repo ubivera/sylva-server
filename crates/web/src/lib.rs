@@ -75,6 +75,11 @@ pub fn ui_router(state: AppState) -> Router {
         // the page source at rest.
         .route("/modals/account-settings", get(routes::account_settings_modal))
         .route("/modals/reauth", get(routes::reauth_modal))
+        .route("/me/reauth", post(routes::me_reauth_submit))
+        .route(
+            "/me/reauth/passkey/start",
+            post(routes::me_reauth_passkey_start),
+        )
         .route("/members", get(routes::members_page))
         .route(
             "/members/invite",

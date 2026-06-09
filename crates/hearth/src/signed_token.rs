@@ -24,6 +24,9 @@ use crate::csrf::SECRET_LEN;
 pub const PURPOSE_RECOVERY_RESET: &str = "recovery-reset";
 /// Purpose tag for the "password ok, awaiting second factor" handoff.
 pub const PURPOSE_MFA_PENDING: &str = "mfa-pending";
+/// Purpose tag for the step-up "recently reauthenticated" sudo grant that
+/// unlocks sensitive actions for a short window.
+pub const PURPOSE_REAUTH: &str = "reauth";
 
 /// Sign a token binding `user_id` to `expires_at` (unix seconds) under
 /// `purpose`. Format: `{user_id}.{expires_at}.{hex(mac)}`.
@@ -94,7 +97,19 @@ mod tests {
         let uid = Uuid::new_v4();
         let token = sign(&SECRET, PURPOSE_RECOVERY_RESET, uid, 10_000);
         assert_eq!(verify(&SECRET, PURPOSE_MFA_PENDING, &token, 9_999), None);
+        assert_eq!(verify(&SECRET, PURPOSE_REAUTH, &token, 9_999), None);
         assert_eq!(verify(&SECRET, PURPOSE_RECOVERY_RESET, &token, 9_999), Some(uid));
+    }
+
+    #[test]
+    fn reauth_purpose_is_isolated() {
+        // A sudo grant must not be usable as a login/recovery handoff, and
+        // neither of those must unlock a sensitive action as a sudo grant.
+        let uid = Uuid::new_v4();
+        let grant = sign(&SECRET, PURPOSE_REAUTH, uid, 10_000);
+        assert_eq!(verify(&SECRET, PURPOSE_REAUTH, &grant, 9_999), Some(uid));
+        assert_eq!(verify(&SECRET, PURPOSE_MFA_PENDING, &grant, 9_999), None);
+        assert_eq!(verify(&SECRET, PURPOSE_RECOVERY_RESET, &grant, 9_999), None);
     }
 
     #[test]

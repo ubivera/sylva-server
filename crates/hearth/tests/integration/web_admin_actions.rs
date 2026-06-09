@@ -55,18 +55,59 @@ async fn web_login_session(
     (cookie, session_id)
 }
 
-/// POST a form to `path` with the given cookie + form body (already
-/// `&`-joined `key=value` pairs), returning the response.
+/// Pull a `key=value` field out of a urlencoded form body.
+fn form_field(body: &str, key: &str) -> Option<String> {
+    body.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| v.to_string())
+    })
+}
+
+/// Mint a step-up sudo grant by POSTing the body's password+csrf to
+/// `/me/reauth` (the no-2FA path), returning the `hearth_sudo=…` cookie
+/// pair on success. Reauth-gated actions are now authorized by this grant
+/// rather than a password in the action body.
+async fn mint_sudo_cookie(app: &TestApp, cookie: &str, body: &str) -> Option<String> {
+    let csrf = form_field(body, "csrf_token")?;
+    let password = form_field(body, "password")?;
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/reauth")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={csrf}&password={password}"
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    for v in resp.headers().get_all(header::SET_COOKIE) {
+        if let Ok(s) = v.to_str()
+            && s.starts_with("hearth_sudo=")
+        {
+            return Some(cookie_name_value(s));
+        }
+    }
+    None
+}
+
+/// POST a form to `path` with the given cookie + form body. For
+/// reauth-gated actions the body still carries the operator password
+/// (legacy shape); we transparently mint a `hearth_sudo` grant from it
+/// and attach the cookie, so the action's `require_sudo` check passes.
 async fn post_form(
     app: &TestApp,
     path: &str,
     cookie: &str,
     body: String,
 ) -> axum::response::Response {
+    let cookie_header = match mint_sudo_cookie(app, cookie, &body).await {
+        Some(sudo) => format!("{cookie}; {sudo}"),
+        None => cookie.to_string(),
+    };
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(path)
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, cookie_header)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(axum::body::Body::from(body))
         .unwrap();
@@ -362,7 +403,7 @@ async fn admin_cannot_change_role() {
 // ────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn deactivate_with_wrong_password_redirects_with_banner() {
+async fn deactivate_with_wrong_password_is_refused() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -372,6 +413,8 @@ async fn deactivate_with_wrong_password_redirects_with_banner() {
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    // A wrong password mints no sudo grant (`post_form`'s /me/reauth step
+    // fails), so the action is refused for lack of a fresh grant.
     let resp = post_form(
         &app,
         &format!("/members/{}/deactivate", target.id.0),
@@ -379,9 +422,7 @@ async fn deactivate_with_wrong_password_redirects_with_banner() {
         format!("csrf_token={}&password=wrong-pw", urlencoding(&csrf)),
     )
     .await;
-    // Non-HTMX path → redirect to /members?error=invalid_password.
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&resp), "/members");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // DB-side: target still active (action didn't fire).
     let lifecycle: String = sqlx::query_scalar(
@@ -395,7 +436,7 @@ async fn deactivate_with_wrong_password_redirects_with_banner() {
 }
 
 #[tokio::test]
-async fn delete_with_wrong_password_htmx_returns_modal_with_error() {
+async fn delete_without_grant_is_refused() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -405,6 +446,8 @@ async fn delete_with_wrong_password_htmx_returns_modal_with_error() {
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    // No sudo grant cookie attached → the action is refused (the reauth
+    // chain would have minted one via /me/reauth before submitting).
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/{}/delete", target.id.0))
@@ -412,20 +455,12 @@ async fn delete_with_wrong_password_htmx_returns_modal_with_error() {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password=wrong-pw",
+            "csrf_token={}",
             urlencoding(&csrf)
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_text(resp).await;
-    // Partial — no <!DOCTYPE>, contains the reauth form + error banner.
-    assert!(!body.contains("<!DOCTYPE html>"));
-    assert!(body.contains("Incorrect password"));
-    assert!(body.contains(r#"name="password""#));
-    // Action URL is preserved on the form so the operator can retry.
-    let expected_action = format!(r#"action="/members/{}/delete""#, target.id.0);
-    assert!(body.contains(&expected_action), "expected form action to be preserved");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // DB-side: not soft-deleted.
     let lifecycle: String = sqlx::query_scalar(
@@ -448,17 +483,17 @@ async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
 
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/{}/delete", target.id.0))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password={}",
+            "csrf_token={}",
             urlencoding(&csrf),
-            ADMIN_PW
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
@@ -699,17 +734,17 @@ async fn htmx_deactivate_emits_info_toast_via_hx_trigger() {
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
 
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/{}/deactivate", target.id.0))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password={}",
+            "csrf_token={}",
             urlencoding(&csrf),
-            ADMIN_PW
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
@@ -745,16 +780,16 @@ async fn htmx_reactivate_emits_success_toast() {
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/{}/reactivate", target.id.0))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password={}",
+            "csrf_token={}",
             urlencoding(&csrf),
-            ADMIN_PW
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
@@ -776,16 +811,16 @@ async fn htmx_delete_emits_error_toast() {
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/{}/delete", target.id.0))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password={}",
+            "csrf_token={}",
             urlencoding(&csrf),
-            ADMIN_PW
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
@@ -810,16 +845,16 @@ async fn htmx_failed_action_emits_error_toast() {
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/{}/deactivate", owner.id.0))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password={}",
+            "csrf_token={}",
             urlencoding(&csrf),
-            ADMIN_PW
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
@@ -1395,16 +1430,17 @@ async fn invite_submit_htmx_returns_success_partial_not_full_page() {
         .await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
 
     let body = format!(
-        "csrf_token={}&email={}&role=member&password=adminpw",
+        "csrf_token={}&email={}&role=member",
         urlencoding(&csrf),
         urlencoding("htmx@test.local"),
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/members/invite")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(body))
@@ -1435,11 +1471,12 @@ async fn invite_submit_htmx_error_returns_form_partial_with_banner() {
     let csrf = app.csrf_for(session_id);
 
     // Empty email → validation error.
-    let body = format!("csrf_token={}&email=&role=member&password=adminpw", urlencoding(&csrf));
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
+    let body = format!("csrf_token={}&email=&role=member", urlencoding(&csrf));
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri("/members/invite")
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(body))
@@ -1670,13 +1707,14 @@ async fn latest_invitation_id(app: &TestApp) -> uuid::Uuid {
 }
 
 #[tokio::test]
-async fn revoke_invite_with_wrong_password_htmx_returns_modal_with_error() {
+async fn revoke_invite_without_grant_is_refused() {
     let app = TestApp::new().await;
     let _ = seed_pending_invite(&app, "to-revoke@test.local").await;
     let invitation_id = latest_invitation_id(&app).await;
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    // No sudo grant attached → the action is refused.
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/invitations/{invitation_id}/revoke"))
@@ -1684,22 +1722,12 @@ async fn revoke_invite_with_wrong_password_htmx_returns_modal_with_error() {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password=wrong-pw",
+            "csrf_token={}",
             urlencoding(&csrf)
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_text(resp).await;
-    // Partial — reauth content with error banner, no doctype.
-    assert!(!body.contains("<!DOCTYPE html>"));
-    assert!(body.contains("Incorrect password"));
-    let expected_action =
-        format!(r#"action="/members/invitations/{invitation_id}/revoke""#);
-    assert!(
-        body.contains(&expected_action),
-        "expected form action to be preserved for retry: {body}"
-    );
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // DB-side: invitation still present (not revoked).
     let revoked_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
@@ -1723,16 +1751,16 @@ async fn revoke_invite_with_correct_password_htmx_responds_with_hx_redirect() {
     let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
     let csrf = app.csrf_for(session_id);
 
+    let sudo = app.sudo_cookie(&cookie, &csrf, ADMIN_PW).await;
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/invitations/{invitation_id}/revoke"))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password={}",
+            "csrf_token={}",
             urlencoding(&csrf),
-            ADMIN_PW
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
@@ -1873,7 +1901,7 @@ async fn reissue_writes_audit_event_and_enqueues_notification() {
 }
 
 #[tokio::test]
-async fn reissue_with_wrong_password_htmx_returns_modal_with_error() {
+async fn reissue_without_grant_is_refused() {
     let app = TestApp::new().await;
     let _ = seed_pending_invite(&app, "wrong-pw@test.local").await;
     let invitation_id = latest_invitation_id(&app).await;
@@ -1881,6 +1909,7 @@ async fn reissue_with_wrong_password_htmx_returns_modal_with_error() {
     let csrf = app.csrf_for(session_id);
     let (old_hash, _) = invitation_state(&app, invitation_id).await;
 
+    // No sudo grant → refused; the token must not rotate.
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/members/invitations/{invitation_id}/reissue"))
@@ -1888,18 +1917,12 @@ async fn reissue_with_wrong_password_htmx_returns_modal_with_error() {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password=wrong",
+            "csrf_token={}",
             urlencoding(&csrf)
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_text(resp).await;
-    assert!(!body.contains("<!DOCTYPE html>"));
-    assert!(body.contains("Incorrect password"));
-    let expected_action =
-        format!(r#"action="/members/invitations/{invitation_id}/reissue""#);
-    assert!(body.contains(&expected_action));
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // DB: nothing changed.
     let (new_hash, _) = invitation_state(&app, invitation_id).await;
@@ -2231,11 +2254,12 @@ async fn members_page_alert_hidden_for_admin_even_with_pendings() {
 }
 
 #[tokio::test]
-async fn pending_veto_with_wrong_password_htmx_returns_modal_with_error() {
+async fn pending_veto_without_grant_is_refused() {
     let app = TestApp::new().await;
     let (cookie, _target, transition_id, csrf) =
         seed_pending_owner_deactivate(&app).await;
 
+    // No sudo grant → refused; the transition stays pending.
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/pending/{transition_id}/veto"))
@@ -2243,20 +2267,12 @@ async fn pending_veto_with_wrong_password_htmx_returns_modal_with_error() {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password=wrong-pw",
+            "csrf_token={}",
             urlencoding(&csrf)
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_text(resp).await;
-    assert!(!body.contains("<!DOCTYPE html>"));
-    assert!(body.contains("Incorrect password"));
-    let expected_action = format!(r#"action="/pending/{transition_id}/veto""#);
-    assert!(
-        body.contains(&expected_action),
-        "expected form action preserved for retry"
-    );
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // DB-side: transition still pending.
     let state: String = sqlx::query_scalar(
@@ -2274,15 +2290,16 @@ async fn pending_veto_with_correct_password_htmx_responds_with_hx_redirect() {
     let app = TestApp::new().await;
     let (cookie, _target, transition_id, csrf) =
         seed_pending_owner_deactivate(&app).await;
+    let sudo = app.sudo_cookie(&cookie, &csrf, "pw").await;
 
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/pending/{transition_id}/veto"))
-        .header(header::COOKIE, cookie)
+        .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
         .body(axum::body::Body::from(format!(
-            "csrf_token={}&password=pw",
+            "csrf_token={}",
             urlencoding(&csrf)
         )))
         .unwrap();
