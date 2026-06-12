@@ -534,11 +534,13 @@ async fn active_sessions(state: &AppState, user_id: identity::UserId) -> Vec<aut
         .collect()
 }
 
-/// Re-render the Devices section (`#devices-section`) — the response for the
-/// section GET and both revoke handlers (they target it via `outerHTML`).
+/// Re-render the Devices section (`#devices-section`) in a given mode — the
+/// response for the section GET, the edit/rename, and both revoke handlers
+/// (they target it via `outerHTML`).
 async fn sessions_section_response(
     state: &AppState,
     auth: &hearth::auth_routes::AuthenticatedUser,
+    mode: views::SectionMode,
 ) -> Response {
     let sessions = active_sessions(state, auth.user.id).await;
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
@@ -549,8 +551,15 @@ async fn sessions_section_response(
         pending_count: None,
     };
     Html(
-        views::sessions_section(&ctx, &sessions, auth.session_id, chrono::Utc::now(), false)
-            .into_string(),
+        views::sessions_section(
+            &ctx,
+            &sessions,
+            auth.session_id,
+            chrono::Utc::now(),
+            mode,
+            false,
+        )
+        .into_string(),
     )
     .into_response()
 }
@@ -560,12 +569,57 @@ pub struct SessionActionForm {
     pub csrf_token: String,
 }
 
+#[derive(Deserialize)]
+pub struct SessionRenameForm {
+    pub csrf_token: String,
+    pub label: String,
+}
+
 /// `GET /me/sessions/section` — refresh the Devices island.
 pub async fn me_sessions_section(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
 ) -> Response {
-    sessions_section_response(&state, &auth).await
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `GET /me/sessions/{id}/edit` — swap one device row into its inline
+/// rename form.
+pub async fn me_session_edit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(session_id): axum::extract::Path<uuid::Uuid>,
+) -> Response {
+    sessions_section_response(&state, &auth, views::SectionMode::Renaming(session_id)).await
+}
+
+/// `POST /me/sessions/{id}/rename` — set (or clear) a device's nickname.
+/// CSRF-only + owner-scoped. An empty label clears it (reverts to the
+/// auto-detected "Browser on OS" name).
+pub async fn me_session_rename(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(session_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<SessionRenameForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let trimmed = form.label.trim();
+    let label: Option<String> = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(60).collect())
+    };
+    if let Err(err) = state
+        .sessions
+        .set_label(session_id, auth.user.id, label.as_deref())
+        .await
+    {
+        tracing::error!(?err, "session rename");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
 }
 
 /// `POST /me/sessions/{id}/revoke` — sign out one device. CSRF-only (a
@@ -612,7 +666,7 @@ pub async fn me_session_revoke(
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     }
-    sessions_section_response(&state, &auth).await
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
 }
 
 /// `POST /me/sessions/revoke-others` — sign out every device except this one.
@@ -654,7 +708,7 @@ pub async fn me_sessions_revoke_others(
         tracing::error!(?err, "sessions revoke-others");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
-    sessions_section_response(&state, &auth).await
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
 }
 
 /// `GET /modals/reauth` — render the reauth dialog as a standalone
@@ -1225,10 +1279,20 @@ pub async fn me_recovery_regenerate(
 
     match result {
         Ok(()) => {
-            // Swap the new code into the reauth modal (its form's
-            // hx-target is #reauth-modal-content). One-time display.
-            Html(views::recovery_code_modal_content(&new_code).into_string())
-                .into_response()
+            // Swap the new code into the reauth modal (its form's hx-target
+            // is #reauth-modal-content) AND refresh the Data Control "Status"
+            // line out-of-band, so it flips from "no code" to "Generated …"
+            // without the user reopening the panel.
+            let meta = auth::user_recovery_code::metadata(&state.db, auth.user.id)
+                .await
+                .ok()
+                .flatten();
+            let body = format!(
+                "{}{}",
+                views::recovery_code_modal_content(&new_code).into_string(),
+                views::recovery_status(meta.as_ref(), true).into_string(),
+            );
+            Html(body).into_response()
         }
         Err(err) => {
             tracing::error!(?err, "me_recovery_regenerate");

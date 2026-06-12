@@ -2141,7 +2141,7 @@ pub fn account_settings_modal(
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="devices" {
-                        (sessions_section(ctx, sessions, current_session_id, now, false))
+                        (sessions_section(ctx, sessions, current_session_id, now, SectionMode::Normal, false))
                     }
                     div class="settings-panel"
                         role="tabpanel"
@@ -2874,29 +2874,7 @@ fn settings_data_panel(
                     (csrf_input(ctx.csrf_token))
                     div class="settings-row-label" {
                         label { "Status" }
-                        @match recovery_meta {
-                            Some(meta) => {
-                                p class="settings-row-hint" {
-                                    "Generated "
-                                    (meta.generated_at.format("%b %-d, %Y").to_string())
-                                    ". "
-                                    @match meta.last_used_at {
-                                        Some(used) => {
-                                            "Last used "
-                                            (used.format("%b %-d, %Y").to_string())
-                                            "."
-                                        }
-                                        None => { "Never used." }
-                                    }
-                                }
-                            }
-                            None => {
-                                p class="settings-row-hint" {
-                                    "No recovery code on file. Generate one "
-                                    "now so you can recover this account later."
-                                }
-                            }
-                        }
+                        (recovery_status(recovery_meta, false))
                     }
                     div class="settings-row-control" {
                         p class="settings-row-hint" {
@@ -2911,6 +2889,44 @@ fn settings_data_panel(
                                 "Regenerate"
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The "Status" line of the Data Control recovery section, wrapped in an
+/// id'd element. `oob` makes it an `hx-swap-oob` carrier so the regenerate
+/// handler can flip it from "No recovery code on file" to "Generated …"
+/// in place — the new code shows in the reauth modal while this line
+/// updates behind it, without the user reopening the panel.
+pub fn recovery_status(
+    recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
+    oob: bool,
+) -> Markup {
+    html! {
+        div id="recovery-status" hx-swap-oob=[oob.then_some("true")] {
+            @match recovery_meta {
+                Some(meta) => {
+                    p class="settings-row-hint" {
+                        "Generated "
+                        (meta.generated_at.format("%b %-d, %Y").to_string())
+                        ". "
+                        @match meta.last_used_at {
+                            Some(used) => {
+                                "Last used "
+                                (used.format("%b %-d, %Y").to_string())
+                                "."
+                            }
+                            None => { "Never used." }
+                        }
+                    }
+                }
+                None => {
+                    p class="settings-row-hint" {
+                        "No recovery code on file. Generate one "
+                        "now so you can recover this account later."
                     }
                 }
             }
@@ -3167,6 +3183,7 @@ pub fn sessions_section(
     sessions: &[auth::Session],
     current_session_id: uuid::Uuid,
     now: chrono::DateTime<chrono::Utc>,
+    mode: SectionMode,
     oob: bool,
 ) -> Markup {
     let has_others = sessions.iter().any(|s| s.id != current_session_id);
@@ -3202,7 +3219,7 @@ pub fn sessions_section(
             div class="settings-section-body" {
                 ul class="totp-list" {
                     @for s in sessions {
-                        (session_row(ctx, s, s.id == current_session_id, now))
+                        (session_row(ctx, s, s.id == current_session_id, now, mode))
                     }
                 }
                 div class="settings-info" {
@@ -3224,14 +3241,49 @@ pub fn sessions_section(
 }
 
 /// One device row. The current session shows a "This device" badge and no
-/// sign-out button (use the normal Sign out to end this one).
+/// sign-out button (use the normal Sign out to end this one). A pencil opens
+/// an inline rename to set a custom nickname; in `Renaming` mode the row
+/// becomes that form.
 fn session_row(
     ctx: &ChromeContext,
     s: &auth::Session,
     is_current: bool,
     now: chrono::DateTime<chrono::Utc>,
+    mode: SectionMode,
 ) -> Markup {
+    let id = s.id;
     let ua = s.user_agent.as_deref().unwrap_or("");
+    let auto = device_label(ua);
+    // A blank/whitespace label counts as "no nickname".
+    let custom = s.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+
+    if let SectionMode::Renaming(target) = mode
+        && target == id
+    {
+        return html! {
+            li class="totp-row totp-row-editing" {
+                form class="totp-rename-form"
+                     hx-post=(format!("/me/sessions/{id}/rename"))
+                     hx-target="#devices-section" hx-swap="outerHTML" {
+                    (csrf_input(ctx.csrf_token))
+                    // Optional: clearing it reverts to the auto label (shown
+                    // as the placeholder). Not `required`.
+                    input type="text" name="label" value=[custom]
+                          placeholder=(auto) maxlength="60" autofocus
+                          class="totp-rename-input" aria-label="Device name";
+                    div class="totp-row-actions" {
+                        button type="submit" class="btn-secondary" { "Save" }
+                        button type="button" class="btn-secondary"
+                               hx-get="/me/sessions/section"
+                               hx-target="#devices-section" hx-swap="outerHTML" {
+                            "Cancel"
+                        }
+                    }
+                }
+            }
+        };
+    }
+
     html! {
         li class="totp-row" {
             span class="totp-row-icon" aria-hidden="true" {
@@ -3239,15 +3291,15 @@ fn session_row(
             }
             div class="totp-row-main" {
                 span class="totp-row-name" {
-                    (device_label(ua))
+                    (custom.unwrap_or(auto.as_str()))
                     @if is_current {
                         span class="device-current-badge" { "This device" }
                     }
                 }
                 span class="totp-row-meta" {
-                    @if let Some(ip) = &s.ip_address {
-                        (ip) " • "
-                    }
+                    // When a nickname is set, still surface the detected device.
+                    @if custom.is_some() { (auto) " • " }
+                    @if let Some(ip) = &s.ip_address { (ip) " • " }
                     @match s.last_seen_at {
                         Some(seen) => { "Last active " (relative_time(seen, now)) }
                         None => { "Signed in " (s.created_at.format("%b %-d, %Y").to_string()) }
@@ -3255,9 +3307,15 @@ fn session_row(
                 }
             }
             div class="totp-row-actions" {
+                button type="button" class="icon-btn"
+                       aria-label="Rename device"
+                       hx-get=(format!("/me/sessions/{id}/edit"))
+                       hx-target="#devices-section" hx-swap="outerHTML" {
+                    (pencil_icon())
+                }
                 @if !is_current {
-                    form method="post" action=(format!("/me/sessions/{}/revoke", s.id))
-                         hx-post=(format!("/me/sessions/{}/revoke", s.id))
+                    form method="post" action=(format!("/me/sessions/{id}/revoke"))
+                         hx-post=(format!("/me/sessions/{id}/revoke"))
                          hx-target="#devices-section" hx-swap="outerHTML"
                          style="display:contents" {
                         (csrf_input(ctx.csrf_token))

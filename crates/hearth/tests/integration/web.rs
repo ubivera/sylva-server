@@ -182,8 +182,9 @@ async fn devices_panel_lists_current_device_with_label() {
     assert!(body.contains("This device"));
     assert!(body.contains("198.51.100.9"));
     // The only (current) session renders no revoke form, and there's no
-    // "sign out all others" with nothing else to sign out.
-    assert!(!body.contains("/me/sessions/"), "single current session: no revoke form");
+    // "sign out all others" with nothing else to sign out. (The pencil
+    // rename endpoint is present — every row gets one.)
+    assert!(!body.contains("/revoke"), "single current session: no revoke form");
 }
 
 #[tokio::test]
@@ -298,6 +299,87 @@ async fn session_revoke_requires_csrf() {
     // Session still alive (revoke didn't go through).
     let (s, _) = get_with_cookie(&app, "/me", Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn device_edit_renders_rename_form() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid = app.session_id_for_cookie(&cookie).await;
+
+    let (status, body) =
+        get_with_cookie(&app, &format!("/me/sessions/{sid}/edit"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("totp-rename-input"), "rename input: {body}");
+    assert!(body.contains(&format!(r#"/me/sessions/{sid}/rename"#)));
+}
+
+#[tokio::test]
+async fn device_rename_sets_and_clears_custom_label() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = web_login_as_device(
+        &app,
+        "u@test.local",
+        "pw",
+        "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/120.0 Safari/537.36",
+    )
+    .await;
+    let sid = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(sid);
+
+    // Set a nickname.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid}/rename"))
+        .header(header::COOKIE, cookie.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&label={}",
+            urlencoding(&csrf),
+            urlencoding("Work laptop")
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let label: Option<String> =
+        sqlx::query_scalar("SELECT label FROM auth.sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(label.as_deref(), Some("Work laptop"));
+
+    // The panel shows the nickname AND the auto-detected device in the meta.
+    let (_, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert!(body.contains("Work laptop"));
+    assert!(body.contains("Chrome on Windows"));
+
+    // Clearing it (empty label) reverts to the auto label.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid}/rename"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}&label=", urlencoding(&csrf))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let label2: Option<String> =
+        sqlx::query_scalar("SELECT label FROM auth.sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(label2.is_none(), "empty label clears the nickname");
+    let _ = user;
 }
 
 #[tokio::test]
@@ -1873,6 +1955,11 @@ async fn me_recovery_regenerate_succeeds_and_rotates() {
     // Fragment (not a full page) with the one-time code + copy button.
     assert!(!body.contains("<html"));
     assert!(body.contains(r#"data-copy-target="recovery-code""#));
+    // Plus an out-of-band refresh of the Data Control "Status" line, so it
+    // flips from "no code on file" to "Generated …" without reopening.
+    assert!(body.contains(r#"id="recovery-status""#));
+    assert!(body.contains("hx-swap-oob"));
+    assert!(body.contains("Generated"));
 
     // Extract the displayed code from the readonly input's value.
     let anchor = r#"id="recovery-code""#;

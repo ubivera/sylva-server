@@ -29,6 +29,9 @@
 # Source
 !*.rs
 
+# Web assets — hand-written stylesheet (vendored JS is fetched, not committed)
+!*.css
+
 # Future: gRPC proto sources
 !*.proto
 

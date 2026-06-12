@@ -76,6 +76,8 @@ pub fn ui_router(state: AppState) -> Router {
             post(routes::me_sessions_revoke_others),
         )
         .route("/me/sessions/{id}/revoke", post(routes::me_session_revoke))
+        .route("/me/sessions/{id}/edit", get(routes::me_session_edit))
+        .route("/me/sessions/{id}/rename", post(routes::me_session_rename))
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in

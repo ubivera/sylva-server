@@ -250,6 +250,9 @@ pub struct Session {
     /// Last time an authenticated request used this session (throttled, see
     /// `touch_last_seen`). Drives the "last active" line in the Devices panel.
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// Optional user-set nickname, shown in place of the auto-detected
+    /// "Browser on OS" label when present.
+    pub label: Option<String>,
 }
 
 #[derive(Clone)]
@@ -281,7 +284,7 @@ impl SessionRepository {
             "INSERT INTO auth.sessions (user_id, token_hash, expires_at, user_agent, ip_address)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING id, user_id, created_at, expires_at, revoked_at,
-                       user_agent, ip_address, last_seen_at",
+                       user_agent, ip_address, last_seen_at, label",
         )
         .bind(user_id.0)
         .bind(&token_hash[..])
@@ -301,7 +304,7 @@ impl SessionRepository {
         let token_hash = hash_token(token);
         let session: Option<Session> = sqlx::query_as(
             "SELECT s.id, s.user_id, s.created_at, s.expires_at, s.revoked_at,
-                    s.user_agent, s.ip_address, s.last_seen_at
+                    s.user_agent, s.ip_address, s.last_seen_at, s.label
              FROM auth.sessions s
              JOIN identity.users u ON u.id = s.user_id
              WHERE s.token_hash = $1
@@ -394,7 +397,7 @@ impl SessionRepository {
     pub async fn list_for_user(&self, user_id: UserId) -> Result<Vec<Session>> {
         let sessions: Vec<Session> = sqlx::query_as(
             "SELECT id, user_id, created_at, expires_at, revoked_at,
-                    user_agent, ip_address, last_seen_at
+                    user_agent, ip_address, last_seen_at, label
              FROM auth.sessions
              WHERE user_id = $1
              ORDER BY created_at DESC",
@@ -410,7 +413,7 @@ impl SessionRepository {
     pub async fn list_all_active(&self) -> Result<Vec<Session>> {
         let sessions: Vec<Session> = sqlx::query_as(
             "SELECT id, user_id, created_at, expires_at, revoked_at,
-                    user_agent, ip_address, last_seen_at
+                    user_agent, ip_address, last_seen_at, label
              FROM auth.sessions
              WHERE revoked_at IS NULL AND expires_at > now()
              ORDER BY created_at DESC",
@@ -438,15 +441,35 @@ impl SessionRepository {
         Ok(())
     }
 
-    /// For each user id in `ids`, return the timestamp of their most
-    /// recent session row's `created_at` (proxy for "last sign-in" /
-    /// last activity). Users with no sessions are absent from the
-    /// returned map — callers should treat that as "never seen".
+    /// Set (or clear, with `None`) a user-chosen nickname for one of the
+    /// caller's own sessions. Owner-scoped via the `user_id` guard, so a
+    /// foreign or unknown id is a silent no-op.
+    pub async fn set_label(
+        &self,
+        session_id: Uuid,
+        user_id: UserId,
+        label: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE auth.sessions SET label = $1 WHERE id = $2 AND user_id = $3")
+            .bind(label)
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// For each user id in `ids`, return the timestamp of their most recent
+    /// activity: the latest `last_seen_at` across their sessions, falling
+    /// back to a session's `created_at` when it has never made an
+    /// authenticated request (so a brand-new session still counts).
+    /// Users with no sessions are absent from the returned map — callers
+    /// should treat that as "never seen".
     ///
     /// One round trip via `WHERE user_id = ANY($1)` with a `GROUP BY`,
-    /// rather than N+1 lookups. Includes revoked + expired sessions
-    /// because they still reflect *when* the user last engaged — we're
-    /// not gating live access on this value.
+    /// rather than N+1 lookups. Includes revoked + expired sessions because
+    /// they still reflect *when* the user last engaged — we're not gating
+    /// live access on this value.
     pub async fn last_activity_by_user(
         &self,
         ids: &[UserId],
@@ -456,7 +479,7 @@ impl SessionRepository {
         }
         let raw: Vec<uuid::Uuid> = ids.iter().map(|u| u.0).collect();
         let rows: Vec<(uuid::Uuid, chrono::DateTime<Utc>)> = sqlx::query_as(
-            "SELECT user_id, MAX(created_at)
+            "SELECT user_id, MAX(COALESCE(last_seen_at, created_at))
              FROM auth.sessions
              WHERE user_id = ANY($1)
              GROUP BY user_id",
@@ -476,7 +499,7 @@ impl SessionRepository {
     pub async fn find_by_id(&self, session_id: Uuid) -> Result<Option<Session>> {
         let session: Option<Session> = sqlx::query_as(
             "SELECT id, user_id, created_at, expires_at, revoked_at,
-                    user_agent, ip_address, last_seen_at
+                    user_agent, ip_address, last_seen_at, label
              FROM auth.sessions
              WHERE id = $1",
         )

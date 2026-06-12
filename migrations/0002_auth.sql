@@ -20,7 +20,10 @@ CREATE TABLE auth.sessions (
     -- nullable: paths that can't reach request headers leave them unset.
     user_agent   TEXT NULL,
     ip_address   TEXT NULL,
-    last_seen_at TIMESTAMPTZ NULL
+    last_seen_at TIMESTAMPTZ NULL,
+    -- Optional user-set nickname for the device, shown in place of the
+    -- auto-detected "Browser on OS" label in the Devices panel.
+    label        TEXT NULL
 );
 
 CREATE UNIQUE INDEX sessions_token_hash_uniq ON auth.sessions (token_hash);

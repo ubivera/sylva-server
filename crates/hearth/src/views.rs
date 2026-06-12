@@ -51,6 +51,8 @@ pub struct SessionView {
     pub user_agent: Option<String>,
     pub ip_address: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// User-chosen device nickname, shown in place of the auto-detected label.
+    pub label: Option<String>,
 }
 
 impl SessionView {
@@ -65,6 +67,7 @@ impl SessionView {
             user_agent: s.user_agent,
             ip_address: s.ip_address,
             last_seen_at: s.last_seen_at,
+            label: s.label,
         }
     }
 }
