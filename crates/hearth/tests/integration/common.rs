@@ -191,7 +191,9 @@ pub struct TestApp {
     /// The instance secret key used by this app's `AppState`. Held here so
     /// TOTP tests can seed encrypted secrets the same way the server does.
     pub secret_key: std::sync::Arc<[u8; 32]>,
-    #[allow(dead_code)] // retained so a future Drop impl can clean up the DB
+    /// Name of this test's database. The `Drop` impl drops it so the
+    /// shared cluster's data dir doesn't accumulate hundreds of leftover
+    /// databases across runs (which slows crash-recovery startup).
     db_name: String,
 }
 
@@ -525,6 +527,57 @@ impl TestApp {
             status,
             body: bytes.to_vec(),
         }
+    }
+}
+
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        // Drop this test's database so the shared cluster's data dir stays
+        // lean. Without this, one database per test accumulates (hundreds
+        // per run, several GB); the next run's crash-recovery startup then
+        // has to scan them all and can blow past the 120s SQL-ready timeout,
+        // failing whichever test wins the shared-postgres init race. Any DB
+        // we miss here is swept by `drop_orphan_test_dbs` at the next run.
+        //
+        // Run on a throwaway thread + runtime: this test's own runtime is
+        // already winding down as Drop fires, and a fresh current-thread
+        // runtime keeps the teardown self-contained.
+        let db_name = self.db_name.clone();
+        let handle = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                let url = format!("postgresql://{SUPERUSER}@127.0.0.1:{TEST_PG_PORT}/postgres");
+                // Bound the connect so a teardown during a postgres hiccup
+                // can't hang the test thread; the orphan sweep is the backstop.
+                let connect =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), PgConnection::connect(&url));
+                let Ok(Ok(mut conn)) = connect.await else {
+                    return;
+                };
+                // Terminate the pool's lingering backends so the DROP isn't
+                // blocked by still-open connections, then drop the database.
+                let _ = sqlx::query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname = $1 AND pid <> pg_backend_pid()",
+                )
+                .bind(&db_name)
+                .execute(&mut conn)
+                .await;
+                let safe_name = db_name.replace('"', "\"\"");
+                let _ = conn
+                    .execute(format!("DROP DATABASE IF EXISTS \"{safe_name}\"").as_str())
+                    .await;
+                let _ = conn.close().await;
+            });
+        });
+        // Wait for the drop to finish (bounded by the 5s connect timeout) so
+        // the database is gone before the run moves on.
+        let _ = handle.join();
     }
 }
 

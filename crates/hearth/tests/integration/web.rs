@@ -74,6 +74,68 @@ async fn login_post_with_valid_creds_redirects_and_sets_cookie() {
     assert!(set_cookie.contains("SameSite=Lax"));
 }
 
+/// A browser login captures the device's User-Agent + client IP onto the
+/// session row (drives the Devices panel). Tests trust the proxy header, so
+/// `X-Forwarded-For` stands in for the socket peer.
+#[tokio::test]
+async fn login_records_device_metadata() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+
+    let body = format!("email={}&password=pw", urlencoding("u@test.local"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0) TestBrowser/1.0")
+        .header("x-forwarded-for", "203.0.113.7")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let (ua, ip): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT user_agent, ip_address FROM auth.sessions WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(ua.as_deref(), Some("Mozilla/5.0 (Windows NT 10.0) TestBrowser/1.0"));
+    assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+}
+
+/// `last_seen_at` starts NULL and is bumped by the first authenticated
+/// request (the throttled touch in the `AuthenticatedUser` extractor).
+#[tokio::test]
+async fn authed_request_touches_last_seen() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+
+    let before: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_seen_at FROM auth.sessions WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(before.is_none(), "fresh session should have no last_seen_at");
+
+    let (status, _) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_seen_at FROM auth.sessions WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(after.is_some(), "an authed request should set last_seen_at");
+}
+
 #[tokio::test]
 async fn login_post_with_wrong_password_renders_error() {
     let app = TestApp::new().await;
@@ -2573,6 +2635,38 @@ async fn totp_rename_updates_label() {
     assert_eq!(creds[0].label, "New Name");
 }
 
+/// Removing an authenticator is reauth-gated: without a fresh `hearth_sudo`
+/// grant the action is refused (a stolen session can't strip 2FA), and both
+/// authenticators remain. This is the regression test for the step-up hole.
+#[tokio::test]
+async fn totp_delete_without_grant_refused() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_totp(&app, user.id, TEST_TOTP_SECRET, "Keep").await;
+    let drop = seed_totp(&app, user.id, TEST_TOTP_SECRET_2, "Drop").await;
+    let session = totp_login(&app, "u@test.local", "pw").await;
+    let session_id = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(session_id);
+
+    // No hearth_sudo cookie attached → refused.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/totp/{drop}/delete"))
+        .header(header::COOKIE, session)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Both authenticators remain.
+    let creds = auth::user_totp::list_verified(&app.pool, user.id).await.unwrap();
+    assert_eq!(creds.len(), 2);
+}
+
 #[tokio::test]
 async fn totp_delete_removes_one_of_several() {
     let app = TestApp::new().await;
@@ -2586,11 +2680,33 @@ async fn totp_delete_removes_one_of_several() {
     let session_id = app.session_id_for_cookie(&session).await;
     let csrf = app.csrf_for(session_id);
 
+    // Mint a sudo grant via the TOTP reauth path. `totp_login` already
+    // consumed the `TEST_TOTP_SECRET` code (single-use), so reauth with the
+    // second authenticator's code, which is still unused this time-step.
+    let reauth_body = format!(
+        "csrf_token={}&password=pw&code={}",
+        urlencoding(&csrf),
+        urlencoding(&code_for(TEST_TOTP_SECRET_2))
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/reauth")
+        .header(header::COOKIE, session.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(reauth_body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let sudo = format!(
+        "hearth_sudo={}",
+        set_cookie_value(resp.headers(), "hearth_sudo").expect("reauth should mint a grant")
+    );
+
     let body = format!("csrf_token={}", urlencoding(&csrf));
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/me/totp/{drop}/delete"))
-        .header(header::COOKIE, session)
+        .header(header::COOKIE, format!("{session}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -2689,6 +2805,43 @@ async fn passkey_section_renders_for_authed_user() {
     let (status, body) = get_with_cookie(&app, "/me/passkey/section", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(r#"id="passkey-section""#));
+}
+
+/// Removing a passkey is reauth-gated too. Minting a passkey grant needs
+/// the WebAuthn ceremony (browser-only), so this covers the security-
+/// critical half: without a fresh `hearth_sudo` grant the removal is
+/// refused and the passkey stays. We grab the session *before* enrolling
+/// the passkey so login doesn't defer to the 2FA challenge.
+#[tokio::test]
+async fn passkey_delete_without_grant_refused() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    seed_stub_passkey(&app, user.id).await;
+    let pk_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM auth.webauthn_credentials WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/passkey/{pk_id}/delete"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The passkey is still there.
+    assert_eq!(hearth::webauthn::count(&app.pool, user.id).await.unwrap(), 1);
 }
 
 /// Insert a placeholder passkey row. The login-gating + page-rendering

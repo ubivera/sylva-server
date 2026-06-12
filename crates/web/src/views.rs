@@ -1882,6 +1882,30 @@ pub fn password_changed_success_content() -> Markup {
     }
 }
 
+/// Confirmation shown in the (kept-open) reauth modal after a second
+/// factor (authenticator or passkey) is removed through the reauth chain.
+/// The settings section behind it is refreshed out-of-band by the handler.
+/// A neutral shield puck — removing a factor is a security downgrade, not a
+/// celebratory success.
+pub fn factor_removed_content(title: &str, message: &str) -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-icon-shield" {
+                (shield_icon())
+            }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { (title) }
+        p class="dialog-description dialog-center-text" { (message) }
+        div class="dialog-actions dialog-actions-centered" {
+            button type="button" class="btn" data-close-dialog { "Done" }
+        }
+    }
+}
+
 /// Laptop icon — leading glyph on the "Devices" tab. Reads as
 /// "a device the user signs into". Stroke uses `currentColor`.
 fn laptop_icon() -> Markup {
@@ -2432,11 +2456,18 @@ fn totp_row(
                     }
                 }
                 div class="totp-row-actions" {
-                    form hx-post=(format!("/me/totp/{id}/delete"))
-                         hx-target="#totp-section" hx-swap="outerHTML"
+                    // Removing a factor weakens the account, so it's reauth-
+                    // gated like adding one: the chain mints a sudo grant,
+                    // then the handler refreshes this section out-of-band.
+                    form id=(format!("form-totp-delete-{id}")) method="post"
+                         action=(format!("/me/totp/{id}/delete"))
                          style="display:contents" {
                         (csrf_input(ctx.csrf_token))
-                        button type="submit" class="btn-danger" { "Remove" }
+                        button type="button" class="btn-danger"
+                               data-reauth-confirm=(format!("form-totp-delete-{id}"))
+                               data-keep-source-open {
+                            "Remove"
+                        }
                     }
                     button type="button" class="btn-secondary"
                            hx-get="/me/totp/section"
@@ -2640,11 +2671,16 @@ fn passkey_row(
                     }
                 }
                 div class="totp-row-actions" {
-                    form hx-post=(format!("/me/passkey/{id}/delete"))
-                         hx-target="#passkey-section" hx-swap="outerHTML"
+                    // Reauth-gated like the authenticator removal above.
+                    form id=(format!("form-passkey-delete-{id}")) method="post"
+                         action=(format!("/me/passkey/{id}/delete"))
                          style="display:contents" {
                         (csrf_input(ctx.csrf_token))
-                        button type="submit" class="btn-danger" { "Remove" }
+                        button type="button" class="btn-danger"
+                               data-reauth-confirm=(format!("form-passkey-delete-{id}"))
+                               data-keep-source-open {
+                            "Remove"
+                        }
                     }
                     button type="button" class="btn-secondary"
                            hx-get="/me/passkey/section"

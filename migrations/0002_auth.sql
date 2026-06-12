@@ -8,12 +8,19 @@ CREATE TABLE auth.credentials (
 );
 
 CREATE TABLE auth.sessions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
-    token_hash  BYTEA NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at  TIMESTAMPTZ NOT NULL,
-    revoked_at  TIMESTAMPTZ NULL
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    token_hash   BYTEA NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    revoked_at   TIMESTAMPTZ NULL,
+    -- Device metadata for the account "Devices" panel. Captured at sign-in
+    -- (raw User-Agent + resolved client IP); `last_seen_at` is bumped at most
+    -- once every few minutes on authenticated requests (best-effort). All
+    -- nullable: paths that can't reach request headers leave them unset.
+    user_agent   TEXT NULL,
+    ip_address   TEXT NULL,
+    last_seen_at TIMESTAMPTZ NULL
 );
 
 CREATE UNIQUE INDEX sessions_token_hash_uniq ON auth.sessions (token_hash);

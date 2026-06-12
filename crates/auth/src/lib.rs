@@ -241,6 +241,15 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Raw User-Agent captured at sign-in (rendered into a friendly device
+    /// label by the web layer). `None` for sessions created on a path that
+    /// couldn't reach the request headers.
+    pub user_agent: Option<String>,
+    /// Resolved client IP captured at sign-in.
+    pub ip_address: Option<String>,
+    /// Last time an authenticated request used this session (throttled, see
+    /// `touch_last_seen`). Drives the "last active" line in the Devices panel.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -261,19 +270,24 @@ impl SessionRepository {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         user_id: UserId,
         ttl: Duration,
+        user_agent: Option<&str>,
+        ip_address: Option<&str>,
     ) -> Result<(Session, String)> {
         let token = generate_token();
         let token_hash = hash_token(&token);
         let expires_at = Utc::now() + ttl;
 
         let session: Session = sqlx::query_as(
-            "INSERT INTO auth.sessions (user_id, token_hash, expires_at)
-             VALUES ($1, $2, $3)
-             RETURNING id, user_id, created_at, expires_at, revoked_at",
+            "INSERT INTO auth.sessions (user_id, token_hash, expires_at, user_agent, ip_address)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, user_id, created_at, expires_at, revoked_at,
+                       user_agent, ip_address, last_seen_at",
         )
         .bind(user_id.0)
         .bind(&token_hash[..])
         .bind(expires_at)
+        .bind(user_agent)
+        .bind(ip_address)
         .fetch_one(&mut **tx)
         .await?;
 
@@ -286,7 +300,8 @@ impl SessionRepository {
     pub async fn find_active(&self, token: &str) -> Result<Option<Session>> {
         let token_hash = hash_token(token);
         let session: Option<Session> = sqlx::query_as(
-            "SELECT s.id, s.user_id, s.created_at, s.expires_at, s.revoked_at
+            "SELECT s.id, s.user_id, s.created_at, s.expires_at, s.revoked_at,
+                    s.user_agent, s.ip_address, s.last_seen_at
              FROM auth.sessions s
              JOIN identity.users u ON u.id = s.user_id
              WHERE s.token_hash = $1
@@ -378,7 +393,8 @@ impl SessionRepository {
     /// session was revoked" entries; the caller filters as needed.
     pub async fn list_for_user(&self, user_id: UserId) -> Result<Vec<Session>> {
         let sessions: Vec<Session> = sqlx::query_as(
-            "SELECT id, user_id, created_at, expires_at, revoked_at
+            "SELECT id, user_id, created_at, expires_at, revoked_at,
+                    user_agent, ip_address, last_seen_at
              FROM auth.sessions
              WHERE user_id = $1
              ORDER BY created_at DESC",
@@ -393,7 +409,8 @@ impl SessionRepository {
     /// Intended for `/admin/sessions`.
     pub async fn list_all_active(&self) -> Result<Vec<Session>> {
         let sessions: Vec<Session> = sqlx::query_as(
-            "SELECT id, user_id, created_at, expires_at, revoked_at
+            "SELECT id, user_id, created_at, expires_at, revoked_at,
+                    user_agent, ip_address, last_seen_at
              FROM auth.sessions
              WHERE revoked_at IS NULL AND expires_at > now()
              ORDER BY created_at DESC",
@@ -401,6 +418,24 @@ impl SessionRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(sessions)
+    }
+
+    /// Best-effort throttled bump of `last_seen_at` for an authenticated
+    /// session. The `WHERE` guard means a write only happens when the value
+    /// is missing or older than the throttle window, so the common case
+    /// (already-fresh) touches no rows. Callers ignore the result — a failed
+    /// touch must never fail the request it rode in on.
+    pub async fn touch_last_seen(&self, session_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE auth.sessions
+             SET last_seen_at = now()
+             WHERE id = $1
+               AND (last_seen_at IS NULL OR last_seen_at < now() - interval '5 minutes')",
+        )
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// For each user id in `ids`, return the timestamp of their most
@@ -440,7 +475,8 @@ impl SessionRepository {
     /// produce specific error messages.
     pub async fn find_by_id(&self, session_id: Uuid) -> Result<Option<Session>> {
         let session: Option<Session> = sqlx::query_as(
-            "SELECT id, user_id, created_at, expires_at, revoked_at
+            "SELECT id, user_id, created_at, expires_at, revoked_at,
+                    user_agent, ip_address, last_seen_at
              FROM auth.sessions
              WHERE id = $1",
         )

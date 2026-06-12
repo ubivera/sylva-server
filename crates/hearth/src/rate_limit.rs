@@ -142,6 +142,22 @@ pub fn resolve_client_ip(
         .unwrap_or_else(|| "direct".to_string())
 }
 
+/// Max stored `User-Agent` length — enough to identify a browser/OS, short
+/// enough to bound the session row.
+const MAX_USER_AGENT_LEN: usize = 400;
+
+/// Extract + bound the request's `User-Agent` for storage on the session row
+/// (the web layer renders it into a friendly device label). `None` when the
+/// header is absent, non-text, or empty.
+pub fn user_agent(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::USER_AGENT)?.to_str().ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_USER_AGENT_LEN).collect())
+}
+
 /// First `X-Forwarded-For` hop, else `X-Real-IP`. Only consulted when the
 /// operator has opted into trusting a proxy.
 fn forwarded_ip(headers: &axum::http::HeaderMap) -> Option<String> {
