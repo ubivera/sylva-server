@@ -331,6 +331,42 @@ impl TestApp {
         String::new()
     }
 
+    /// Like [`TestApp::sudo_cookie`] but mints a *critical* grant by posting
+    /// `critical=1` to `/me/reauth`, returning the `hearth_sudo_critical=<token>`
+    /// cookie pair. This is the always-on gate that irreversible account
+    /// actions (self anonymize / delete) require — an ordinary `hearth_sudo`
+    /// grant does not satisfy it.
+    pub async fn sudo_critical_cookie(
+        &self,
+        session_cookie: &str,
+        csrf: &str,
+        password: &str,
+    ) -> String {
+        let body = format!("csrf_token={csrf}&password={password}&critical=1");
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/me/reauth")
+            .header(axum::http::header::COOKIE, session_cookie)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(self.router.clone(), req)
+            .await
+            .unwrap();
+        for v in resp.headers().get_all(axum::http::header::SET_COOKIE) {
+            if let Ok(s) = v.to_str()
+                && let Some(rest) = s.strip_prefix("hearth_sudo_critical=")
+            {
+                let val = rest.split(';').next().unwrap_or("");
+                return format!("hearth_sudo_critical={val}");
+            }
+        }
+        String::new()
+    }
+
     /// Look up the `auth.sessions.id` for a session whose token lives in
     /// the given `hearth_session=<token>` cookie pair. The web login
     /// helper returns the full `Set-Cookie` header; trim it down to just

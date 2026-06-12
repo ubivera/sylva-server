@@ -30,9 +30,11 @@ pub fn genesis_hash() -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Who performed the audited action. `display_name` is captured as a
-/// snapshot at emission time so audit entries survive later renames
-/// or account deletion (which sets `actor_user_id` to NULL on cascade).
+/// Who performed the audited action. Both `display_name` and the stored
+/// `actor_user_id` are frozen snapshots (the column carries no foreign
+/// key), so audit entries survive later renames or a physical account
+/// deletion with their hashes intact — the id simply dangles once the
+/// user is gone.
 #[derive(Debug, Clone)]
 pub struct Actor {
     pub user_id: UserId,

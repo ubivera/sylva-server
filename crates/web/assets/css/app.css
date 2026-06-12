@@ -3710,6 +3710,52 @@ dialog.action-dialog.action-dialog-large[open] {
     gap: var(--space-sm);
 }
 
+/* Data Control "danger zone" — the self-service Anonymize / Delete sections.
+   A restrained red accent (tinted border + red section icon) sets them apart
+   from the neutral settings sections above without shouting. */
+.settings-section-danger {
+    border-color: rgba(197, 48, 48, 0.35);
+}
+.settings-section-danger .settings-section-icon {
+    color: var(--color-error);
+}
+/* Explainer + trigger button stacked, button left-aligned under the text. */
+.settings-danger-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    align-items: flex-start;
+}
+
+/* Ghost/outline danger button — the section trigger that opens the confirm
+   dialog. Quieter than the solid `.btn-danger` used as the final confirm
+   inside that dialog, so the panel doesn't read as a wall of red while still
+   signalling a destructive path. */
+.btn-danger-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: 0.5rem 0.875rem;
+    background: transparent;
+    color: var(--color-error);
+    border: 1px solid rgba(197, 48, 48, 0.45);
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 500;
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.btn-danger-ghost:hover {
+    background: rgba(197, 48, 48, 0.08);
+    border-color: var(--color-error);
+}
+.btn-danger-ghost:focus-visible {
+    outline: none;
+    border-color: var(--color-error);
+    box-shadow: 0 0 0 4px rgba(197, 48, 48, 0.25);
+}
+
 /* Horizontal hairline between two rows inside the same section
    body. Negative horizontal margins let it span the section's full
    internal width past the body padding. */

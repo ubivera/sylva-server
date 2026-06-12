@@ -3213,3 +3213,263 @@ async fn login_passkey_finish_rejects_bad_assertion() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
 }
+
+// ── Self-service account closure (anonymize / delete) ─────────────────────
+
+/// Raw form POST with an explicit Cookie header, returning the full response
+/// so a test can inspect status + `HX-Redirect` + `Set-Cookie`.
+async fn post_form_raw(
+    app: &TestApp,
+    uri: &str,
+    cookie: &str,
+    body: String,
+) -> axum::response::Response {
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap()
+}
+
+async fn count(app: &TestApp, sql: &str, id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar(sql).bind(id).fetch_one(&app.pool).await.unwrap()
+}
+
+/// A normal sudo grant must NOT authorize an irreversible account action —
+/// these always require a fresh *critical* re-auth. This is the server-side
+/// half of the "always re-auth, ignore the 5-minute window" guarantee.
+#[tokio::test]
+async fn account_delete_with_normal_grant_only_is_refused() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("leave@example.com", "Leaver", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    // The everyday step-up grant — fresh, but the wrong kind for this action.
+    let normal = app.sudo_cookie(&session, &csrf, "rightpw").await;
+    assert!(!normal.is_empty(), "normal sudo grant should be minted");
+    let cookie = format!("{session}; {normal}");
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM identity.users WHERE id = $1", user.id.0).await,
+        1,
+        "account must survive a refused delete",
+    );
+}
+
+/// With a fresh *critical* grant, delete physically removes the account and
+/// everything tied to it, and redirects to the public goodbye page. Also
+/// pins the audit-integrity fix: the actor id survives on past rows (no FK
+/// SET NULL), so the hash chain stays valid through a physical delete.
+#[tokio::test]
+async fn account_delete_with_critical_grant_removes_everything() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("gone@example.com", "Goner", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "rightpw").await;
+    assert!(!critical.is_empty(), "critical grant should be minted");
+    let cookie = format!("{session}; {critical}");
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/goodbye?mode=deleted"),
+    );
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM identity.users WHERE id = $1", user.id.0).await,
+        0,
+        "user row must be physically deleted",
+    );
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM auth.credentials WHERE user_id = $1", user.id.0).await,
+        0,
+        "credentials must cascade away",
+    );
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM auth.sessions WHERE user_id = $1", user.id.0).await,
+        0,
+        "sessions must cascade away",
+    );
+    // The deletion event is recorded, with the actor snapshot retained...
+    let deleted_actor: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT actor_user_id FROM audit.events WHERE event_type = 'account_self_deleted'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(deleted_actor, Some(user.id.0), "deletion event keeps the actor snapshot");
+    // ...and so do the user's *past* audit rows — proving the FK no longer
+    // SET-NULLs them (which would invalidate their hashes).
+    let seed_actor: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT actor_user_id FROM audit.events WHERE event_type = 'test_seed_user'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(seed_actor, Some(user.id.0), "past audit rows keep their actor id after delete");
+}
+
+/// Anonymize keeps the row but redacts identity and deletes the password,
+/// so the account is permanently inaccessible without losing the tombstone.
+#[tokio::test]
+async fn account_anonymize_redacts_and_locks_out() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("hide@example.com", "Hider", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "rightpw").await;
+    let cookie = format!("{session}; {critical}");
+    let resp =
+        post_form_raw(&app, "/me/account/anonymize", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/goodbye?mode=anonymized"),
+    );
+    let (email, display, lifecycle): (String, String, String) = sqlx::query_as(
+        "SELECT email, display_name, lifecycle::text FROM identity.users WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert!(email.contains("@purged.invalid"), "email redacted: {email}");
+    assert_eq!(display, "[deleted user]");
+    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM auth.credentials WHERE user_id = $1", user.id.0).await,
+        0,
+        "credentials deleted on anonymize",
+    );
+}
+
+/// Account closure is CSRF protected — a bad token is rejected before any
+/// destructive work, even with a valid critical grant attached.
+#[tokio::test]
+async fn account_delete_requires_csrf() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("csrf@example.com", "Csrf", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "rightpw").await;
+    let cookie = format!("{session}; {critical}");
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, "csrf_token=bogus".to_string()).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM identity.users WHERE id = $1", user.id.0).await,
+        1,
+    );
+}
+
+/// The public `/goodbye` page renders mode-specific copy and needs no auth.
+#[tokio::test]
+async fn goodbye_page_renders_mode_copy() {
+    let app = TestApp::new().await;
+    let deleted = app.get("/goodbye?mode=deleted", None).await;
+    deleted.assert_status(StatusCode::OK);
+    assert!(deleted.body_as_text().contains("permanently removed"));
+    let anon = app.get("/goodbye?mode=anonymized", None).await;
+    anon.assert_status(StatusCode::OK);
+    assert!(anon.body_as_text().contains("closed"));
+}
+
+/// The Data Control tab surfaces the two account-closure sections, each a
+/// button that opens the matching confirm modal on demand.
+#[tokio::test]
+async fn account_settings_shows_close_account_sections() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("dz@example.com", "Dz", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"data-open-modal="/modals/account/anonymize""#));
+    assert!(body.contains(r#"data-open-modal="/modals/account/delete""#));
+    assert!(body.contains("settings-section-danger"));
+}
+
+/// Each confirm modal carries both gates (acknowledge checkbox + type-your-
+/// email) and a confirm button that drives the *critical* re-auth.
+#[tokio::test]
+async fn account_close_modals_render_gates() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("gate@example.com", "Gate", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+
+    for (slug, action) in [
+        ("anonymize", "/me/account/anonymize"),
+        ("delete", "/me/account/delete"),
+    ] {
+        let (status, body) =
+            get_with_cookie(&app, &format!("/modals/account/{slug}"), Some(&session)).await;
+        assert_eq!(status, StatusCode::OK, "{slug}: status");
+        assert!(body.contains(&format!(r#"action="{action}""#)), "{slug}: form action");
+        assert!(body.contains("data-close-ack"), "{slug}: acknowledge gate");
+        assert!(
+            body.contains(&format!(r#"data-close-email="{}""#, user.email)),
+            "{slug}: email gate seeded with the account email",
+        );
+        assert!(body.contains("data-reauth-critical"), "{slug}: forced critical reauth");
+        assert!(
+            body.contains(r#"data-reauth-confirm="form-account-"#),
+            "{slug}: chain binding",
+        );
+    }
+
+    // An unknown action is a 404, not a silent render.
+    let (status, _) = get_with_cookie(&app, "/modals/account/wat", Some(&session)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The critical reauth modal never advertises a fresh grant — even when a
+/// fresh *normal* sudo grant is present — and threads `critical=1` into the
+/// verify form, so the chain always prompts and the verify mints the critical
+/// grant. The non-critical modal, by contrast, does report the fresh grant.
+#[tokio::test]
+async fn reauth_modal_critical_forces_prompt() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("crit@example.com", "Crit", "rightpw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &user.email, "rightpw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let normal = app.sudo_cookie(&session, &csrf, "rightpw").await;
+    assert!(!normal.is_empty());
+    let cookie = format!("{session}; {normal}");
+
+    let (_, critical) = get_with_cookie(&app, "/modals/reauth?critical=1", Some(&cookie)).await;
+    assert!(
+        !critical.contains(r#"data-sudo-fresh="1""#),
+        "critical modal must never report freshness",
+    );
+    assert!(
+        critical.contains(r#"name="critical" value="1""#),
+        "critical modal threads critical=1 into the verify form",
+    );
+
+    let (_, normal_modal) = get_with_cookie(&app, "/modals/reauth", Some(&cookie)).await;
+    assert!(
+        normal_modal.contains(r#"data-sudo-fresh="1""#),
+        "the ordinary modal still honours the fresh grant",
+    );
+}

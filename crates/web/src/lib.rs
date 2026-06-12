@@ -41,6 +41,7 @@ pub fn ui_router(state: AppState) -> Router {
             "/invite/{token}",
             get(routes::accept_invite_form).post(routes::accept_invite_submit),
         )
+        .route("/goodbye", get(routes::goodbye_page))
         .route("/me", get(routes::me_page))
         .route("/me/profile", post(routes::me_profile_submit))
         .route("/me/email", post(routes::me_email_submit))
@@ -78,11 +79,22 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/me/sessions/{id}/revoke", post(routes::me_session_revoke))
         .route("/me/sessions/{id}/edit", get(routes::me_session_edit))
         .route("/me/sessions/{id}/rename", post(routes::me_session_rename))
+        // Self-service account closure (Data Control). Both always require a
+        // fresh *critical* re-auth grant (ignores the 5-minute sudo window).
+        .route(
+            "/me/account/anonymize",
+            post(routes::me_account_anonymize_submit),
+        )
+        .route("/me/account/delete", post(routes::me_account_delete_submit))
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in
         // the page source at rest.
         .route("/modals/account-settings", get(routes::account_settings_modal))
+        .route(
+            "/modals/account/{action}",
+            get(routes::account_close_modal),
+        )
         .route("/modals/reauth", get(routes::reauth_modal))
         .route("/me/reauth", post(routes::me_reauth_submit))
         .route(

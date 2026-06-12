@@ -1,6 +1,6 @@
 use axum::{
     Form,
-    extract::{FromRequestParts, OptionalFromRequestParts, Query, State},
+    extract::{FromRequestParts, OptionalFromRequestParts, Path, Query, State},
     http::{StatusCode, request::Parts},
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -721,10 +721,15 @@ pub async fn reauth_modal(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
     headers: axum::http::HeaderMap,
+    Query(q): Query<ReauthModalQuery>,
 ) -> Response {
     // Always return the modal shell, but flag whether a fresh sudo grant
     // already covers this user — the chain reads `data-sudo-fresh` to skip
     // the factor step (and still has the shell to host an enrollment QR).
+    // A `?critical=1` fetch (irreversible account actions) forces the prompt:
+    // the view drops the fresh flag and threads `critical` into the verify
+    // form so it mints the separate, always-required critical grant.
+    let critical = matches!(q.critical.as_deref(), Some("1"));
     let fresh = require_fresh_sudo(&state, &headers, auth.user.id);
     let (has_totp, has_passkey) = enrolled_factors(&state, auth.user.id).await;
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
@@ -734,7 +739,16 @@ pub async fn reauth_modal(
         csrf_token: &csrf_token,
         pending_count: None,
     };
-    Html(views::reauth_modal(&ctx, has_totp, has_passkey, fresh).into_string()).into_response()
+    Html(views::reauth_modal(&ctx, has_totp, has_passkey, fresh, critical).into_string())
+        .into_response()
+}
+
+/// Query for `GET /modals/reauth`.
+#[derive(Deserialize)]
+pub struct ReauthModalQuery {
+    /// `1` when fetched for an irreversible account action — forces the
+    /// factor prompt and mints the critical grant on verify.
+    pub critical: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -744,6 +758,11 @@ pub struct MeReauthForm {
     pub code: Option<String>,
     pub challenge_id: Option<uuid::Uuid>,
     pub passkey: Option<String>,
+    /// Set to `"1"` by the forced-reauth modal (`/modals/reauth?critical=1`)
+    /// for irreversible account actions. When present, a successful re-auth
+    /// additionally mints the short-lived `hearth_sudo_critical` grant those
+    /// actions require — so they always re-prompt, ignoring the sudo window.
+    pub critical: Option<String>,
 }
 
 /// `POST /me/reauth` — step-up reauthentication. Verifies the factors the
@@ -761,6 +780,7 @@ pub async fn me_reauth_submit(
         return resp;
     }
     let user_id = auth.user.id;
+    let want_critical = matches!(form.critical.as_deref(), Some("1"));
     let rl_key = format!("reauth:{}", user_id.0);
     let (has_totp, has_passkey) = enrolled_factors(&state, user_id).await;
 
@@ -770,6 +790,7 @@ pub async fn me_reauth_submit(
             &auth,
             has_totp,
             has_passkey,
+            want_critical,
             "Too many attempts. Wait a moment and try again.",
         );
     }
@@ -777,14 +798,14 @@ pub async fn me_reauth_submit(
     // Passkey path (one-tap, AAL2 by itself).
     if let Some(assertion) = form.passkey.as_deref().filter(|s| !s.is_empty()) {
         let Some(challenge_id) = form.challenge_id else {
-            return reauth_modal_error(&state, &auth, has_totp, has_passkey, "Passkey verification failed. Try again.");
+            return reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "Passkey verification failed. Try again.");
         };
         return match hearth::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await {
-            Ok(true) => grant_and_proceed(&state, &auth, "passkey").await,
+            Ok(true) => grant_and_proceed(&state, &auth, "passkey", want_critical).await,
             Ok(false) => {
                 state.rate_limiter.record_failure(&rl_key);
                 audit_reauth(&state, &auth, "passkey", false).await;
-                reauth_modal_error(&state, &auth, has_totp, has_passkey, "That passkey didn't work. Try again.")
+                reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "That passkey didn't work. Try again.")
             }
             Err(err) => {
                 tracing::error!(?err, "reauth: passkey finish");
@@ -796,11 +817,11 @@ pub async fn me_reauth_submit(
     // Password (+ TOTP) path. A passkey-but-no-TOTP account has no
     // password fallback — that would drop below the account's AAL.
     if has_passkey && !has_totp {
-        return reauth_modal_error(&state, &auth, has_totp, has_passkey, "Verify with your passkey to continue.");
+        return reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "Verify with your passkey to continue.");
     }
     let password = form.password.as_deref().unwrap_or("");
     if password.is_empty() {
-        return reauth_modal_error(&state, &auth, has_totp, has_passkey, "Enter your password to continue.");
+        return reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "Enter your password to continue.");
     }
     let password_ok = match auth::verify_user_password(&state.db, user_id, password).await {
         Ok(ok) => ok,
@@ -812,7 +833,7 @@ pub async fn me_reauth_submit(
     if !password_ok {
         state.rate_limiter.record_failure(&rl_key);
         audit_reauth(&state, &auth, "password", false).await;
-        return reauth_modal_error(&state, &auth, has_totp, has_passkey, "That password is incorrect.");
+        return reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "That password is incorrect.");
     }
     if has_totp {
         let code = form.code.as_deref().map(str::trim).unwrap_or("");
@@ -822,7 +843,7 @@ pub async fn me_reauth_submit(
             Ok(None) => {
                 state.rate_limiter.record_failure(&rl_key);
                 audit_reauth(&state, &auth, "password+totp", false).await;
-                return reauth_modal_error(&state, &auth, has_totp, has_passkey, "That authenticator code didn't match.");
+                return reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "That authenticator code didn't match.");
             }
             Err(err) => {
                 tracing::error!(?err, "reauth: totp verify");
@@ -831,7 +852,7 @@ pub async fn me_reauth_submit(
         }
     }
     let factor = if has_totp { "password+totp" } else { "password" };
-    grant_and_proceed(&state, &auth, factor).await
+    grant_and_proceed(&state, &auth, factor, want_critical).await
 }
 
 /// `POST /me/reauth/passkey/start` — begin a passkey assertion for the
@@ -862,6 +883,7 @@ async fn grant_and_proceed(
     state: &AppState,
     auth: &hearth::auth_routes::AuthenticatedUser,
     factor: &str,
+    critical: bool,
 ) -> Response {
     audit_reauth(state, auth, factor, true).await;
     let mut resp = StatusCode::NO_CONTENT.into_response();
@@ -870,6 +892,12 @@ async fn grant_and_proceed(
         axum::http::HeaderValue::from_static("reauth-ok"),
     );
     set_cookie_header(&mut resp, &sudo_grant_cookie(state, auth.user.id));
+    if critical {
+        // A forced re-auth (an irreversible account action). Mint the
+        // short-lived critical grant alongside the normal one; the action
+        // handler requires it and clears it on use.
+        append_cookie_header(&mut resp, &sudo_critical_grant_cookie(state, auth.user.id));
+    }
     resp
 }
 
@@ -880,6 +908,7 @@ fn reauth_modal_error(
     auth: &hearth::auth_routes::AuthenticatedUser,
     has_totp: bool,
     has_passkey: bool,
+    critical: bool,
     msg: &str,
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
@@ -889,7 +918,9 @@ fn reauth_modal_error(
         csrf_token: &csrf_token,
         pending_count: None,
     };
-    Html(views::reauth_modal_content(&ctx, has_totp, has_passkey, Some(msg)).into_string())
+    // Keep `critical` on the retry render so a failed attempt still mints the
+    // critical grant when the user re-submits.
+    Html(views::reauth_modal_content(&ctx, has_totp, has_passkey, Some(msg), critical).into_string())
         .into_response()
 }
 
@@ -2357,6 +2388,113 @@ pub(crate) fn require_admin(
     }
 }
 
+// ── Self-service account closure (anonymize / delete) ──────────────────────
+
+/// Form posted to the account-closure endpoints. CSRF only — the "I
+/// understand" + type-your-email gating is client-side, and the action is
+/// authorized server-side by a fresh *critical* re-auth grant.
+#[derive(Deserialize)]
+pub struct AccountCloseForm {
+    pub csrf_token: String,
+}
+
+/// Query for the public `/goodbye` page: `mode=deleted` or `mode=anonymized`.
+#[derive(Deserialize)]
+pub struct GoodbyeQuery {
+    pub mode: Option<String>,
+}
+
+/// Build the response that ends a just-closed account's session: tell htmx to
+/// navigate to the public `/goodbye` page, and clear the session, sudo, and
+/// critical-sudo cookies. `location` is a fixed same-origin path.
+fn account_closed_response(state: &AppState, location: &'static str) -> Response {
+    let mut resp = StatusCode::OK.into_response();
+    resp.headers_mut()
+        .insert("HX-Redirect", axum::http::HeaderValue::from_static(location));
+    let secure = cookie_secure(state);
+    set_cookie_header(&mut resp, &cookie_value(SESSION_COOKIE_NAME, "", true, secure));
+    append_cookie_header(&mut resp, &sudo_cookie_value("", true, secure));
+    append_cookie_header(&mut resp, &sudo_critical_clear_cookie(state));
+    resp
+}
+
+/// `POST /me/account/anonymize` — the user closes their own account, keeping
+/// the (now redacted) tombstone so anything attributed to it survives under a
+/// `[deleted user]`. Always gated by a fresh **critical** grant, which
+/// re-prompts for a factor regardless of the ordinary 5-minute sudo window.
+pub async fn me_account_anonymize_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<AccountCloseForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    if let Err(resp) = require_critical_sudo(&state, &headers, auth.user.id) {
+        return resp;
+    }
+    if let Err(err) = hearth::account_logic::perform_self_anonymize(&state, &auth).await {
+        tracing::error!(?err, "self anonymize");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    account_closed_response(&state, "/goodbye?mode=anonymized")
+}
+
+/// `POST /me/account/delete` — the user permanently deletes their own
+/// account and everything tied to it (true row delete; all `auth.*` rows and
+/// invitations they created cascade away). Always gated by a fresh
+/// **critical** grant.
+pub async fn me_account_delete_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<AccountCloseForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    if let Err(resp) = require_critical_sudo(&state, &headers, auth.user.id) {
+        return resp;
+    }
+    if let Err(err) = hearth::account_logic::perform_self_delete(&state, &auth).await {
+        tracing::error!(?err, "self delete");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    account_closed_response(&state, "/goodbye?mode=deleted")
+}
+
+/// `GET /goodbye` — public confirmation after a user closes their own
+/// account. No auth: the session is already gone by the time the browser
+/// lands here.
+pub async fn goodbye_page(Query(q): Query<GoodbyeQuery>) -> Response {
+    Html(views::goodbye_page(q.mode.as_deref().unwrap_or("")).into_string()).into_response()
+}
+
+/// `GET /modals/account/{action}` — fetch the Anonymize / Delete confirm
+/// dialog on demand (mirrors the admin per-row action modals). The dialog
+/// carries the caller's own email for the type-to-confirm gate; the action it
+/// posts to is gated server-side by a fresh critical grant.
+pub async fn account_close_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Path(action): Path<String>,
+) -> Response {
+    let delete_mode = match action.as_str() {
+        "delete" => true,
+        "anonymize" => false,
+        _ => return error_response(StatusCode::NOT_FOUND, "Unknown action."),
+    };
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::account_close_modal(&ctx, delete_mode).into_string()).into_response()
+}
+
 /// `POST /logout` — revoke the current session, clear the cookie, and
 /// bounce to `/login` by default. An optional `next` form field
 /// overrides the destination when it's a same-origin relative path
@@ -2616,6 +2754,16 @@ const SUDO_COOKIE_NAME: &str = "hearth_sudo";
 /// that a walked-up-to session can't act indefinitely.
 const SUDO_TTL_SECS: i64 = 300;
 
+/// Cookie carrying a *critical* reauth grant, minted only by a forced
+/// re-auth and required by irreversible account actions (self anonymize /
+/// delete). Separate from `hearth_sudo` precisely so an ordinary fresh sudo
+/// grant can never satisfy these — they must always re-prove a factor.
+const SUDO_CRITICAL_COOKIE_NAME: &str = "hearth_sudo_critical";
+/// Very short window for the critical grant: just long enough to carry the
+/// user from the re-auth submit to the immediately-following action POST.
+/// The action handler also clears it on use, so it is effectively one-shot.
+const SUDO_CRITICAL_TTL_SECS: i64 = 120;
+
 fn sudo_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
     let sec = if secure { "; Secure" } else { "" };
     if clearing {
@@ -2676,6 +2824,74 @@ pub(crate) fn require_sudo(
     user_id: identity::UserId,
 ) -> Result<(), Response> {
     if require_fresh_sudo(state, headers, user_id) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Please confirm it's you and try again.",
+        )
+            .into_response())
+    }
+}
+
+// ── Critical reauth grant (always-on, for irreversible account actions) ────
+
+fn sudo_critical_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
+    if clearing {
+        format!("{SUDO_CRITICAL_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
+    } else {
+        format!(
+            "{SUDO_CRITICAL_COOKIE_NAME}={token}; Path=/; Max-Age={SUDO_CRITICAL_TTL_SECS}; HttpOnly; SameSite=Lax{sec}"
+        )
+    }
+}
+
+/// Mint the `hearth_sudo_critical` grant for a user who just passed a
+/// *forced* step-up reauth (one that ignored any existing sudo window).
+fn sudo_critical_grant_cookie(state: &AppState, user_id: identity::UserId) -> String {
+    let expires_at = chrono::Utc::now().timestamp() + SUDO_CRITICAL_TTL_SECS;
+    let token = hearth::signed_token::sign(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_REAUTH_CRITICAL,
+        user_id.0,
+        expires_at,
+    );
+    sudo_critical_cookie_value(&token, /* clearing = */ false, cookie_secure(state))
+}
+
+/// Clear the critical grant — handlers call this on use so a single forced
+/// reauth authorizes exactly one irreversible action.
+fn sudo_critical_clear_cookie(state: &AppState) -> String {
+    sudo_critical_cookie_value("", /* clearing = */ true, cookie_secure(state))
+}
+
+fn sudo_critical_user_id(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<identity::UserId> {
+    let token = read_cookie(headers, SUDO_CRITICAL_COOKIE_NAME)?;
+    let now = chrono::Utc::now().timestamp();
+    hearth::signed_token::verify(
+        &state.csrf_secret,
+        hearth::signed_token::PURPOSE_REAUTH_CRITICAL,
+        &token,
+        now,
+    )
+    .map(identity::UserId::new)
+}
+
+/// Gate an irreversible account action on a fresh *critical* grant for this
+/// exact user. A normal `hearth_sudo` grant — however fresh — does not count
+/// (different token purpose + cookie), which is what makes these actions
+/// always re-prompt regardless of the 5-minute sudo window.
+#[allow(clippy::result_large_err)]
+pub(crate) fn require_critical_sudo(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    user_id: identity::UserId,
+) -> Result<(), Response> {
+    if sudo_critical_user_id(state, headers) == Some(user_id) {
         Ok(())
     } else {
         Err((

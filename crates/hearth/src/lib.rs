@@ -1,3 +1,4 @@
+pub mod account_logic;
 pub mod account_routes;
 pub mod admin_logic;
 pub mod admin_routes;

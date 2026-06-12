@@ -442,6 +442,28 @@ impl UserRepository {
     ) -> Result<(User, String)> {
         redact_and_terminate(tx, id, UserLifecycle::HardDeleted).await
     }
+
+    /// Physically remove the user row — the genuine "leave no trace"
+    /// delete, as opposed to `soft_delete`/`hard_delete` which redact PII
+    /// but keep a tombstone row. Every foreign key to `identity.users(id)`
+    /// is either `ON DELETE CASCADE` (all of `auth.*`, plus invitations
+    /// this user *created*) or `ON DELETE SET NULL` (the audit actor link,
+    /// `pending.transitions`, invitations they *accepted*), so this single
+    /// `DELETE` takes the account and every credential/session/factor with
+    /// it. The append-only `audit.events` log is the one exception: rows
+    /// keep their denormalised actor name as an immutable security record
+    /// (only the id link nulls). The caller owns the authz check and must
+    /// append the audit event *before* this in the same transaction.
+    pub async fn hard_remove(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: UserId,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM identity.users WHERE id = $1")
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Shared implementation for the two terminal transitions. Redacts PII

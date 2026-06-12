@@ -419,6 +419,12 @@ fn shell_app_inner(
                 script {
                     (maud::PreEscaped(CHANGE_PASSWORD_GATE_JS))
                 }
+                // Data Control → Anonymize / Delete confirm gate (checkbox +
+                // type-your-email). Delegated on document, dormant until a
+                // close-account dialog appears.
+                script {
+                    (maud::PreEscaped(ACCOUNT_CLOSE_GATE_JS))
+                }
                 // Copy-to-clipboard for the recovery-code display that
                 // can surface in the reauth modal after a regenerate
                 // (Data Control tab). Delegated on document, so it's a
@@ -1435,6 +1441,40 @@ pub fn login_page(error: Option<&str>, prefill_email: Option<&str>) -> Markup {
     shell_public("Sign in", content)
 }
 
+/// `GET /goodbye` — public confirmation shown after a user closes their own
+/// account from Data Control. `mode == "deleted"` means the account and all
+/// its data were permanently removed; anything else is the anonymize close
+/// (the account is shut and the personal info scrubbed, data left in place).
+/// Public: the session is gone by the time the browser lands here.
+pub fn goodbye_page(mode: &str) -> Markup {
+    let deleted = mode == "deleted";
+    let (title, body) = if deleted {
+        (
+            "Your account has been deleted",
+            "Everything tied to your account has been permanently removed from \
+             this server, including anything you created or shared. There's \
+             nothing left to recover. Thank you for having been here.",
+        )
+    } else {
+        (
+            "Your account has been closed",
+            "Your account is closed and your personal information has been \
+             removed from it. Anything you took part in stays in place, no \
+             longer linked to you. Thank you for having been here.",
+        )
+    };
+    let content = html! {
+        h1 { (title) }
+        div class="card" {
+            p class="muted" { (body) }
+            p class="login-recover-link" {
+                a href="/login" { "Back to sign in" }
+            }
+        }
+    };
+    shell_public(title, content)
+}
+
 /// `GET /recover` — public start of the offline account-recovery flow.
 /// The operator enters their email + the recovery code they saved at
 /// invite acceptance (or last regeneration). `error` renders a generic
@@ -1706,12 +1746,21 @@ fn invite_form_fields(
 /// The form's `action` attribute is empty at render time; the JS
 /// chain in `REAUTH_CHAIN_JS` sets both `action` and `hx-post` to
 /// whichever per-row action URL the operator initiated.
-pub fn reauth_modal(ctx: &ChromeContext, has_totp: bool, has_passkey: bool, fresh: bool) -> Markup {
+pub fn reauth_modal(
+    ctx: &ChromeContext,
+    has_totp: bool,
+    has_passkey: bool,
+    fresh: bool,
+    critical: bool,
+) -> Markup {
     html! {
+        // A `critical` modal never advertises freshness, so the chain always
+        // shows the factor prompt — irreversible account actions re-prove a
+        // factor regardless of the ordinary 5-minute sudo window.
         dialog id="dlg-reauth" class="action-dialog reauth-dialog"
-               data-sudo-fresh=[fresh.then_some("1")] {
+               data-sudo-fresh=[(fresh && !critical).then_some("1")] {
             div id="reauth-modal-content" {
-                (reauth_modal_content(ctx, has_totp, has_passkey, None))
+                (reauth_modal_content(ctx, has_totp, has_passkey, None, critical))
             }
         }
     }
@@ -1734,6 +1783,7 @@ pub fn reauth_modal_content(
     has_totp: bool,
     has_passkey: bool,
     error: Option<&str>,
+    critical: bool,
 ) -> Markup {
     // Password path is offered when there's no passkey, or as the
     // fallback when a passkey user also has TOTP (still AAL2).
@@ -1767,6 +1817,7 @@ pub fn reauth_modal_content(
                 form id="form-reauth-passkey" hx-post="/me/reauth"
                      hx-target="#reauth-modal-content" hx-swap="innerHTML" {
                     (csrf_input(ctx.csrf_token))
+                    @if critical { input type="hidden" name="critical" value="1"; }
                     input type="hidden" name="challenge_id";
                     input type="hidden" name="passkey";
                 }
@@ -1820,6 +1871,7 @@ pub fn reauth_modal_content(
                 form id="form-reauth" hx-post="/me/reauth"
                      hx-target="#reauth-modal-content" hx-swap="innerHTML" {
                     (csrf_input(ctx.csrf_token))
+                    @if critical { input type="hidden" name="critical" value="1"; }
                     div class="field" {
                         label for="reauth-password" { "Password" }
                         input type="password" id="reauth-password" name="password"
@@ -2893,6 +2945,11 @@ fn settings_data_panel(
                 }
             }
         }
+        // Danger zone — close your own account. Anonymize keeps the data
+        // under a closed account; Delete erases everything. Both gate on a
+        // forced critical re-auth.
+        (account_close_section(false))
+        (account_close_section(true))
     }
 }
 
@@ -2927,6 +2984,141 @@ pub fn recovery_status(
                     p class="settings-row-hint" {
                         "No recovery code on file. Generate one "
                         "now so you can recover this account later."
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One Data Control "danger zone" section — Anonymize (`delete_mode =
+/// false`) or Delete (`delete_mode = true`). Each is a short explainer plus
+/// a button that opens the matching confirm dialog on demand
+/// (`/modals/account/{anonymize|delete}`). The real gating (acknowledge +
+/// type-email + forced re-auth) lives in that dialog.
+fn account_close_section(delete_mode: bool) -> Markup {
+    let (title, tagline, hint, label, modal) = if delete_mode {
+        (
+            "Delete my account",
+            "Permanently erase your account and everything you created \
+             across the ecosystem.",
+            "Everything tied to your account is removed from the server, \
+             even data shared with others. This cannot be undone.",
+            "Delete my account",
+            "/modals/account/delete",
+        )
+    } else {
+        (
+            "Anonymize my account",
+            "Close your account and strip your personal information, leaving \
+             anything you took part in under a closed account.",
+            "Your sign-in is removed and the account can't be reopened; your \
+             data stays in place, no longer linked to you. This cannot be undone.",
+            "Anonymize my account",
+            "/modals/account/anonymize",
+        )
+    };
+    html! {
+        section class="settings-section settings-section-danger" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" {
+                    @if delete_mode { (trash_icon()) } @else { (incognito_icon()) }
+                }
+                div {
+                    h3 { (title) }
+                    p class="settings-section-tagline" { (tagline) }
+                }
+            }
+            div class="settings-section-body" {
+                div class="settings-danger-row" {
+                    p class="settings-row-hint" { (hint) }
+                    div class="settings-row-actions" {
+                        button type="button" class="btn-danger-ghost"
+                               data-open-modal=(modal) {
+                            (label)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Confirm dialog for closing your own account — fetched on demand into
+/// `#modal-host` from `/modals/account/{anonymize|delete}`. Mirrors the admin
+/// destructive dialogs (centered danger chrome + alert + type-to-confirm) but
+/// stacks two gates before the action button enables: an "I understand"
+/// checkbox (`data-close-ack`) *and* typing your own email
+/// (`data-close-email`), wired by `ACCOUNT_CLOSE_GATE_JS`. The confirm button
+/// then drives the **critical** re-auth (`data-reauth-critical`), which always
+/// re-prompts regardless of the sudo window.
+pub fn account_close_modal(ctx: &ChromeContext, delete_mode: bool) -> Markup {
+    let (slug, action, title, lead, alert, button) = if delete_mode {
+        (
+            "delete",
+            "/me/account/delete",
+            "Delete your account",
+            "Everything you created across the ecosystem is permanently \
+             removed, even data shared with others, leaving no trace of your \
+             footprint. Your account becomes inaccessible right away.",
+            "This permanently deletes your account and all of its data. It \
+             cannot be undone.",
+            "Delete my account",
+        )
+    } else {
+        (
+            "anonymize",
+            "/me/account/anonymize",
+            "Anonymize your account",
+            "Your account is closed and your personal information is removed \
+             from it. Anything you took part in stays in place under a closed \
+             account, no longer linked to you. Your account becomes \
+             inaccessible right away.",
+            "This permanently closes your account. It cannot be undone.",
+            "Anonymize my account",
+        )
+    };
+    let form_id = format!("form-account-{slug}");
+    let input_id = format!("confirm-email-{slug}");
+    let email = &ctx.user.email;
+    html! {
+        dialog id=(format!("dlg-account-{slug}"))
+               class="action-dialog action-dialog-centered" {
+            form id=(form_id) method="post" action=(action) {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-danger" {
+                        @if delete_mode { (trash_icon()) } @else { (incognito_icon()) }
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 class="dialog-center-title" { (title) }
+                p class="dialog-description dialog-center-text" { (lead) }
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { (alert) }
+                }
+                (csrf_input(ctx.csrf_token))
+                label class="confirm-checkbox-field" {
+                    input type="checkbox" class="member-checkbox" data-close-ack;
+                    span { "I understand this is permanent and that I won't be able to sign in again." }
+                }
+                div class="field confirm-name-field" {
+                    label for=(input_id) {
+                        "Type your email " strong { "\"" (email) "\"" } " to confirm"
+                    }
+                    input type="text" id=(input_id) data-close-email=(email)
+                          autocomplete="off" spellcheck="false" autocapitalize="off";
+                }
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn-danger"
+                           data-reauth-confirm=(form_id)
+                           data-reauth-critical
+                           disabled {
+                        (button)
                     }
                 }
             }
@@ -4694,6 +4886,48 @@ const CONFIRM_CHECKBOX_JS: &str = r#"
 })();
 "#;
 
+// Account-close confirm dialogs (Data Control → Anonymize / Delete): the
+// danger button enables only when BOTH gates pass — the "I understand"
+// checkbox (data-close-ack) is ticked AND the typed value matches the account
+// email (data-close-email, case-insensitive + trimmed). Deliberately distinct
+// attribute names from CONFIRM_NAME_JS / CONFIRM_CHECKBOX_JS so the gates never
+// fight when both scripts are present (the settings modal can be opened from
+// /members, which loads those). Reset on dialog close.
+const ACCOUNT_CLOSE_GATE_JS: &str = r#"
+(function() {
+    function refresh(dialog) {
+        if (!dialog) return;
+        var email = dialog.querySelector('[data-close-email]');
+        var ack = dialog.querySelector('[data-close-ack]');
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (!btn) return;
+        var want = ((email && email.getAttribute('data-close-email')) || '').trim().toLowerCase();
+        var got = ((email && email.value) || '').trim().toLowerCase();
+        var emailOk = want.length > 0 && got === want;
+        var ackOk = !!(ack && ack.checked);
+        btn.disabled = !(emailOk && ackOk);
+    }
+    document.addEventListener('input', function(e) {
+        var el = e.target.closest('[data-close-email]');
+        if (el) refresh(el.closest('dialog'));
+    });
+    document.addEventListener('change', function(e) {
+        var el = e.target.closest('[data-close-ack]');
+        if (el) refresh(el.closest('dialog'));
+    });
+    document.addEventListener('close', function(e) {
+        var dialog = e.target;
+        if (!(dialog instanceof HTMLDialogElement)) return;
+        var email = dialog.querySelector('[data-close-email]');
+        if (email) email.value = '';
+        var ack = dialog.querySelector('[data-close-ack]');
+        if (ack) ack.checked = false;
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (btn && (email || ack)) btn.disabled = true;
+    }, true);
+})();
+"#;
+
 // Chains action dialog → reauth modal. Any button with
 // `data-reauth-confirm="<form-id>"` does:
 //   1. Read the named form's action URL + payload (skipping the form's
@@ -4786,13 +5020,19 @@ const REAUTH_CHAIN_JS: &str = r#"
         var sourceDialog = btn.closest('dialog');
         var keepSource = btn.hasAttribute('data-keep-source');
         var keepSourceOpen = btn.hasAttribute('data-keep-source-open');
+        // Irreversible account actions (self anonymize / delete) demand a
+        // *critical* re-auth: the modal then never reports a fresh grant, so
+        // the factor prompt always shows, and the verify mints the separate
+        // short-lived grant those handlers require.
+        var critical = btn.hasAttribute('data-reauth-critical');
+        var reauthUrl = critical ? '/modals/reauth?critical=1' : '/modals/reauth';
 
         // (Re)fetch the reauth modal — it carries data-sudo-fresh telling us
         // whether a recent step-up still covers this action. Drop a stale
         // one first so the flag is current.
         var stale = document.getElementById('dlg-reauth');
         if (stale) stale.remove();
-        window.hearthOpenModal('/modals/reauth').then(function(dlg) {
+        window.hearthOpenModal(reauthUrl).then(function(dlg) {
             if (!dlg) return;
             var fresh = dlg.dataset.sudoFresh === '1';
 
