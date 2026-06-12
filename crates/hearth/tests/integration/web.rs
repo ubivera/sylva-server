@@ -74,6 +74,314 @@ async fn login_post_with_valid_creds_redirects_and_sets_cookie() {
     assert!(set_cookie.contains("SameSite=Lax"));
 }
 
+/// A browser login captures the device's User-Agent + client IP onto the
+/// session row (drives the Devices panel). Tests trust the proxy header, so
+/// `X-Forwarded-For` stands in for the socket peer.
+#[tokio::test]
+async fn login_records_device_metadata() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+
+    let body = format!("email={}&password=pw", urlencoding("u@test.local"));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0) TestBrowser/1.0")
+        .header("x-forwarded-for", "203.0.113.7")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let (ua, ip): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT user_agent, ip_address FROM auth.sessions WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(ua.as_deref(), Some("Mozilla/5.0 (Windows NT 10.0) TestBrowser/1.0"));
+    assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+}
+
+/// `last_seen_at` starts NULL and is bumped by the first authenticated
+/// request (the throttled touch in the `AuthenticatedUser` extractor).
+#[tokio::test]
+async fn authed_request_touches_last_seen() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+
+    let before: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_seen_at FROM auth.sessions WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(before.is_none(), "fresh session should have no last_seen_at");
+
+    let (status, _) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_seen_at FROM auth.sessions WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(after.is_some(), "an authed request should set last_seen_at");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Devices panel — session list + sign-out (CP2)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Log in carrying a `User-Agent` + `X-Forwarded-For`, returning the
+/// session cookie. Lets device-panel tests get labelled rows.
+async fn web_login_as_device(app: &TestApp, email: &str, password: &str, ua: &str) -> String {
+    let body = format!("email={}&password={}", urlencoding(email), urlencoding(password));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::USER_AGENT, ua)
+        .header("x-forwarded-for", "198.51.100.9")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    cookie_name_value(
+        resp.headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn devices_panel_lists_current_device_with_label() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = web_login_as_device(
+        &app,
+        "u@test.local",
+        "pw",
+        "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/120.0 Safari/537.36",
+    )
+    .await;
+
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"id="devices-section""#));
+    assert!(body.contains("Chrome on Windows"), "device label: {body}");
+    assert!(body.contains("This device"));
+    assert!(body.contains("198.51.100.9"));
+    // The only (current) session renders no revoke form, and there's no
+    // "sign out all others" with nothing else to sign out. (The pencil
+    // rename endpoint is present — every row gets one.)
+    assert!(!body.contains("/revoke"), "single current session: no revoke form");
+}
+
+#[tokio::test]
+async fn session_revoke_signs_out_other_device() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let c1 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let c2 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid1 = app.session_id_for_cookie(&c1).await;
+    let sid2 = app.session_id_for_cookie(&c2).await;
+    let csrf1 = app.csrf_for(sid1);
+
+    // From session 1, sign out session 2.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid2}/revoke"))
+        .header(header::COOKIE, c1.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf1))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Session 2 is dead (redirected to login); session 1 still works.
+    let (s2, _) = get_with_cookie(&app, "/me", Some(&c2)).await;
+    assert_eq!(s2, StatusCode::SEE_OTHER);
+    let (s1, _) = get_with_cookie(&app, "/me", Some(&c1)).await;
+    assert_eq!(s1, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sessions_revoke_others_keeps_current() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let c1 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let c2 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let c3 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid1 = app.session_id_for_cookie(&c1).await;
+    let csrf1 = app.csrf_for(sid1);
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/sessions/revoke-others")
+        .header(header::COOKIE, c1.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf1))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (s1, _) = get_with_cookie(&app, "/me", Some(&c1)).await;
+    assert_eq!(s1, StatusCode::OK, "current session survives");
+    for other in [&c2, &c3] {
+        let (s, _) = get_with_cookie(&app, "/me", Some(other)).await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "other sessions revoked");
+    }
+}
+
+#[tokio::test]
+async fn session_revoke_cross_user_is_noop() {
+    let app = TestApp::new().await;
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::Member)
+        .await;
+    let ca = cookie_name_value(&web_login(&app, "alice@test.local", "pw").await.unwrap());
+    let cb = cookie_name_value(&web_login(&app, "bob@test.local", "pw").await.unwrap());
+    let sid_a = app.session_id_for_cookie(&ca).await;
+    let sid_b = app.session_id_for_cookie(&cb).await;
+    let csrf_a = app.csrf_for(sid_a);
+
+    // Alice tries to revoke Bob's session — must be a no-op (not owned).
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid_b}/revoke"))
+        .header(header::COOKIE, ca)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf_a))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Bob's session is untouched.
+    let (sb, _) = get_with_cookie(&app, "/me", Some(&cb)).await;
+    assert_eq!(sb, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_revoke_requires_csrf() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid = app.session_id_for_cookie(&cookie).await;
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid}/revoke"))
+        .header(header::COOKIE, cookie.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from("csrf_token=00000000000000000000000000000000"))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Session still alive (revoke didn't go through).
+    let (s, _) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn device_edit_renders_rename_form() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid = app.session_id_for_cookie(&cookie).await;
+
+    let (status, body) =
+        get_with_cookie(&app, &format!("/me/sessions/{sid}/edit"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("totp-rename-input"), "rename input: {body}");
+    assert!(body.contains(&format!(r#"/me/sessions/{sid}/rename"#)));
+}
+
+#[tokio::test]
+async fn device_rename_sets_and_clears_custom_label() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = web_login_as_device(
+        &app,
+        "u@test.local",
+        "pw",
+        "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/120.0 Safari/537.36",
+    )
+    .await;
+    let sid = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(sid);
+
+    // Set a nickname.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid}/rename"))
+        .header(header::COOKIE, cookie.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!(
+            "csrf_token={}&label={}",
+            urlencoding(&csrf),
+            urlencoding("Work laptop")
+        )))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let label: Option<String> =
+        sqlx::query_scalar("SELECT label FROM auth.sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(label.as_deref(), Some("Work laptop"));
+
+    // The panel shows the nickname AND the auto-detected device in the meta.
+    let (_, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert!(body.contains("Work laptop"));
+    assert!(body.contains("Chrome on Windows"));
+
+    // Clearing it (empty label) reverts to the auto label.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid}/rename"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}&label=", urlencoding(&csrf))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let label2: Option<String> =
+        sqlx::query_scalar("SELECT label FROM auth.sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(label2.is_none(), "empty label clears the nickname");
+    let _ = user;
+}
+
 #[tokio::test]
 async fn login_post_with_wrong_password_renders_error() {
     let app = TestApp::new().await;
@@ -1647,6 +1955,11 @@ async fn me_recovery_regenerate_succeeds_and_rotates() {
     // Fragment (not a full page) with the one-time code + copy button.
     assert!(!body.contains("<html"));
     assert!(body.contains(r#"data-copy-target="recovery-code""#));
+    // Plus an out-of-band refresh of the Data Control "Status" line, so it
+    // flips from "no code on file" to "Generated …" without reopening.
+    assert!(body.contains(r#"id="recovery-status""#));
+    assert!(body.contains("hx-swap-oob"));
+    assert!(body.contains("Generated"));
 
     // Extract the displayed code from the readonly input's value.
     let anchor = r#"id="recovery-code""#;
@@ -2573,6 +2886,38 @@ async fn totp_rename_updates_label() {
     assert_eq!(creds[0].label, "New Name");
 }
 
+/// Removing an authenticator is reauth-gated: without a fresh `hearth_sudo`
+/// grant the action is refused (a stolen session can't strip 2FA), and both
+/// authenticators remain. This is the regression test for the step-up hole.
+#[tokio::test]
+async fn totp_delete_without_grant_refused() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    seed_totp(&app, user.id, TEST_TOTP_SECRET, "Keep").await;
+    let drop = seed_totp(&app, user.id, TEST_TOTP_SECRET_2, "Drop").await;
+    let session = totp_login(&app, "u@test.local", "pw").await;
+    let session_id = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(session_id);
+
+    // No hearth_sudo cookie attached → refused.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/totp/{drop}/delete"))
+        .header(header::COOKIE, session)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Both authenticators remain.
+    let creds = auth::user_totp::list_verified(&app.pool, user.id).await.unwrap();
+    assert_eq!(creds.len(), 2);
+}
+
 #[tokio::test]
 async fn totp_delete_removes_one_of_several() {
     let app = TestApp::new().await;
@@ -2586,11 +2931,33 @@ async fn totp_delete_removes_one_of_several() {
     let session_id = app.session_id_for_cookie(&session).await;
     let csrf = app.csrf_for(session_id);
 
+    // Mint a sudo grant via the TOTP reauth path. `totp_login` already
+    // consumed the `TEST_TOTP_SECRET` code (single-use), so reauth with the
+    // second authenticator's code, which is still unused this time-step.
+    let reauth_body = format!(
+        "csrf_token={}&password=pw&code={}",
+        urlencoding(&csrf),
+        urlencoding(&code_for(TEST_TOTP_SECRET_2))
+    );
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/reauth")
+        .header(header::COOKIE, session.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(reauth_body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    let sudo = format!(
+        "hearth_sudo={}",
+        set_cookie_value(resp.headers(), "hearth_sudo").expect("reauth should mint a grant")
+    );
+
     let body = format!("csrf_token={}", urlencoding(&csrf));
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/me/totp/{drop}/delete"))
-        .header(header::COOKIE, session)
+        .header(header::COOKIE, format!("{session}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("hx-request", "true")
         .body(axum::body::Body::from(body))
@@ -2689,6 +3056,43 @@ async fn passkey_section_renders_for_authed_user() {
     let (status, body) = get_with_cookie(&app, "/me/passkey/section", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(r#"id="passkey-section""#));
+}
+
+/// Removing a passkey is reauth-gated too. Minting a passkey grant needs
+/// the WebAuthn ceremony (browser-only), so this covers the security-
+/// critical half: without a fresh `hearth_sudo` grant the removal is
+/// refused and the passkey stays. We grab the session *before* enrolling
+/// the passkey so login doesn't defer to the 2FA challenge.
+#[tokio::test]
+async fn passkey_delete_without_grant_refused() {
+    let app = TestApp::new().await;
+    let user = app
+        .seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    seed_stub_passkey(&app, user.id).await;
+    let pk_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM auth.webauthn_credentials WHERE user_id = $1")
+            .bind(user.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let session_id = app.session_id_for_cookie(&cookie).await;
+    let csrf = app.csrf_for(session_id);
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/passkey/{pk_id}/delete"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The passkey is still there.
+    assert_eq!(hearth::webauthn::count(&app.pool, user.id).await.unwrap(), 1);
 }
 
 /// Insert a placeholder passkey row. The login-gating + page-rendering

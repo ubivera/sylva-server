@@ -264,8 +264,11 @@ async fn issue_session_with_mfa(
     totp_cred: Option<Uuid>,
 ) -> anyhow::Result<LoginResponse> {
     let mut tx = state.db.begin().await?;
+    // JSON API logins are Bearer-client surfaces; we don't capture a device
+    // label here (the browser login paths do). Such sessions show "Unknown
+    // device" in the Devices panel.
     let (session, token) =
-        SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
+        SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL, None, None).await?;
 
     if let Some(cred_id) = totp_cred {
         auth::user_totp::stamp_used(&mut tx, cred_id).await?;
@@ -413,6 +416,18 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
                 internal_error()
             })?
             .ok_or_else(|| unauthorized("user_not_found"))?;
+
+        // Throttled "last active" bump for the Devices panel. Check the
+        // cached value first so fresh requests issue no extra query; the SQL
+        // also guards on the same window. Best-effort — a failed touch must
+        // never fail the request it rode in on.
+        let stale = match session.last_seen_at {
+            Some(seen) => chrono::Utc::now() - seen > chrono::Duration::minutes(5),
+            None => true,
+        };
+        if stale && let Err(err) = state.sessions.touch_last_seen(session.id).await {
+            tracing::warn!(?err, "touch_last_seen failed");
+        }
 
         Ok(AuthenticatedUser {
             session_id: session.id,
@@ -589,6 +604,8 @@ pub async fn perform_accept_invite(
     raw_invite_token: &str,
     display_name: &str,
     password: &str,
+    user_agent: Option<&str>,
+    ip_address: Option<&str>,
 ) -> Result<AcceptInviteOutcome, AcceptInviteError> {
     let trimmed_name = display_name.trim();
     if trimmed_name.is_empty() {
@@ -649,6 +666,8 @@ pub async fn perform_accept_invite(
             &mut tx,
             UserId::new(new_user_id),
             auth::DEFAULT_SESSION_TTL,
+            user_agent,
+            ip_address,
         )
         .await?;
 
@@ -723,7 +742,9 @@ pub async fn accept_invite(
     State(state): State<AppState>,
     Json(req): Json<AcceptInviteRequest>,
 ) -> Response {
-    match perform_accept_invite(&state, &req.token, &req.display_name, &req.password).await {
+    match perform_accept_invite(&state, &req.token, &req.display_name, &req.password, None, None)
+        .await
+    {
         Ok(outcome) => {
             // Distinct shape from `LoginResponse` so the recovery code
             // surfaces exactly here and nowhere else — sign-in via

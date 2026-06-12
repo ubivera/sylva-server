@@ -45,6 +45,14 @@ pub struct SessionView {
     /// True when this session is the one making the current request — lets
     /// the client highlight "this device" in a sessions list.
     pub is_current: bool,
+    /// Device metadata captured at sign-in (raw User-Agent + resolved client
+    /// IP), and the throttled last-active timestamp. Any may be `null` for a
+    /// session created on a path that didn't record them (e.g. the JSON API).
+    pub user_agent: Option<String>,
+    pub ip_address: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    /// User-chosen device nickname, shown in place of the auto-detected label.
+    pub label: Option<String>,
 }
 
 impl SessionView {
@@ -56,6 +64,10 @@ impl SessionView {
             expires_at: s.expires_at,
             revoked_at: s.revoked_at,
             is_current: s.id == current_session_id,
+            user_agent: s.user_agent,
+            ip_address: s.ip_address,
+            last_seen_at: s.last_seen_at,
+            label: s.label,
         }
     }
 }

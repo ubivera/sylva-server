@@ -96,6 +96,7 @@ pub struct LoginForm {
 pub async fn login_submit(
     State(state): State<AppState>,
     hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
     let rl_key = format!("login:{client_ip}");
@@ -157,12 +158,15 @@ pub async fn login_submit(
         user_id: user.id,
         display_name: user.display_name.clone(),
     };
+    let user_agent = hearth::rate_limit::user_agent(&headers);
     let result: anyhow::Result<String> = async {
         let mut tx = state.db.begin().await?;
         let (session, token) = auth::SessionRepository::create(
             &mut tx,
             user.id,
             auth::DEFAULT_SESSION_TTL,
+            user_agent.as_deref(),
+            Some(client_ip.as_str()),
         )
         .await?;
         audit::append(
@@ -236,6 +240,7 @@ pub struct LoginPasskeyFinishForm {
 pub async fn login_passkey_finish(
     State(state): State<AppState>,
     hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginPasskeyFinishForm>,
 ) -> Response {
     let rl_key = format!("login:{client_ip}");
@@ -289,7 +294,15 @@ pub async fn login_passkey_finish(
         }
     };
 
-    issue_session_after_mfa(&state, &user, MfaFactor::Passkey).await
+    let user_agent = hearth::rate_limit::user_agent(&headers);
+    issue_session_after_mfa(
+        &state,
+        &user,
+        MfaFactor::Passkey,
+        user_agent.as_deref(),
+        Some(client_ip.as_str()),
+    )
+    .await
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -342,12 +355,24 @@ pub async fn accept_invite_form(
 /// concurrent acceptance), renders the "unavailable" page.
 pub async fn accept_invite_submit(
     State(state): State<AppState>,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(token): axum::extract::Path<String>,
     Form(form): Form<AcceptInviteForm>,
 ) -> Response {
     use hearth::auth_routes::{AcceptInviteError, perform_accept_invite};
 
-    match perform_accept_invite(&state, &token, &form.display_name, &form.password).await {
+    let user_agent = hearth::rate_limit::user_agent(&headers);
+    match perform_accept_invite(
+        &state,
+        &token,
+        &form.display_name,
+        &form.password,
+        user_agent.as_deref(),
+        Some(client_ip.as_str()),
+    )
+    .await
+    {
         Ok(outcome) => {
             // Render the recovery-code interstitial as the POST
             // response body — no redirect. Lets the code ride one HTTP
@@ -468,6 +493,8 @@ pub async fn account_settings_modal(
             Vec::new()
         });
     let passkey_available = hearth::webauthn::available(&state);
+    // Active sessions drive the Devices tab. Degrade to empty on error.
+    let sessions = active_sessions(&state, auth.user.id).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -481,10 +508,207 @@ pub async fn account_settings_modal(
             &totp_creds,
             &passkey_creds,
             passkey_available,
+            &sessions,
+            auth.session_id,
+            chrono::Utc::now(),
         )
         .into_string(),
     )
     .into_response()
+}
+
+/// A user's active (non-revoked, non-expired) sessions, newest first — the
+/// rows shown in the Devices panel. Degrades to empty on a DB error.
+async fn active_sessions(state: &AppState, user_id: identity::UserId) -> Vec<auth::Session> {
+    let now = chrono::Utc::now();
+    state
+        .sessions
+        .list_for_user(user_id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "loading sessions for devices panel");
+            Vec::new()
+        })
+        .into_iter()
+        .filter(|s| s.revoked_at.is_none() && s.expires_at > now)
+        .collect()
+}
+
+/// Re-render the Devices section (`#devices-section`) in a given mode — the
+/// response for the section GET, the edit/rename, and both revoke handlers
+/// (they target it via `outerHTML`).
+async fn sessions_section_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+    mode: views::SectionMode,
+) -> Response {
+    let sessions = active_sessions(state, auth.user.id).await;
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(
+        views::sessions_section(
+            &ctx,
+            &sessions,
+            auth.session_id,
+            chrono::Utc::now(),
+            mode,
+            false,
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SessionActionForm {
+    pub csrf_token: String,
+}
+
+#[derive(Deserialize)]
+pub struct SessionRenameForm {
+    pub csrf_token: String,
+    pub label: String,
+}
+
+/// `GET /me/sessions/section` — refresh the Devices island.
+pub async fn me_sessions_section(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `GET /me/sessions/{id}/edit` — swap one device row into its inline
+/// rename form.
+pub async fn me_session_edit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(session_id): axum::extract::Path<uuid::Uuid>,
+) -> Response {
+    sessions_section_response(&state, &auth, views::SectionMode::Renaming(session_id)).await
+}
+
+/// `POST /me/sessions/{id}/rename` — set (or clear) a device's nickname.
+/// CSRF-only + owner-scoped. An empty label clears it (reverts to the
+/// auto-detected "Browser on OS" name).
+pub async fn me_session_rename(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(session_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<SessionRenameForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let trimmed = form.label.trim();
+    let label: Option<String> = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(60).collect())
+    };
+    if let Err(err) = state
+        .sessions
+        .set_label(session_id, auth.user.id, label.as_deref())
+        .await
+    {
+        tracing::error!(?err, "session rename");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `POST /me/sessions/{id}/revoke` — sign out one device. CSRF-only (a
+/// protective action, not reauth-gated). Only the caller's own sessions can
+/// be revoked; an unknown/foreign id is a silent no-op (re-renders the list).
+pub async fn me_session_revoke(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(session_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<SessionActionForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let owned = matches!(
+        state.sessions.find_by_id(session_id).await,
+        Ok(Some(s)) if s.user_id == auth.user.id.0
+    );
+    if owned {
+        let actor = audit::Actor {
+            user_id: auth.user.id,
+            display_name: auth.user.display_name.clone(),
+        };
+        let result: anyhow::Result<()> = async {
+            let mut tx = state.db.begin().await?;
+            auth::SessionRepository::revoke(&mut tx, session_id).await?;
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "session_revoked_by_user",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "was_current": session_id == auth.session_id,
+                }),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::error!(?err, "session revoke");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    }
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
+}
+
+/// `POST /me/sessions/revoke-others` — sign out every device except this one.
+pub async fn me_sessions_revoke_others(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<SessionActionForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        let count = auth::SessionRepository::revoke_all_for_user_except(
+            &mut tx,
+            auth.user.id,
+            auth.session_id,
+        )
+        .await?;
+        if count > 0 {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "sessions_revoked_by_user",
+                serde_json::json!({ "count": count }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        tracing::error!(?err, "sessions revoke-others");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    sessions_section_response(&state, &auth, views::SectionMode::Normal).await
 }
 
 /// `GET /modals/reauth` — render the reauth dialog as a standalone
@@ -1055,10 +1279,20 @@ pub async fn me_recovery_regenerate(
 
     match result {
         Ok(()) => {
-            // Swap the new code into the reauth modal (its form's
-            // hx-target is #reauth-modal-content). One-time display.
-            Html(views::recovery_code_modal_content(&new_code).into_string())
-                .into_response()
+            // Swap the new code into the reauth modal (its form's hx-target
+            // is #reauth-modal-content) AND refresh the Data Control "Status"
+            // line out-of-band, so it flips from "no code" to "Generated …"
+            // without the user reopening the panel.
+            let meta = auth::user_recovery_code::metadata(&state.db, auth.user.id)
+                .await
+                .ok()
+                .flatten();
+            let body = format!(
+                "{}{}",
+                views::recovery_code_modal_content(&new_code).into_string(),
+                views::recovery_status(meta.as_ref(), true).into_string(),
+            );
+            Html(body).into_response()
         }
         Err(err) => {
             tracing::error!(?err, "me_recovery_regenerate");
@@ -1369,10 +1603,16 @@ pub struct MeTotpDeleteForm {
 pub async fn me_totp_delete(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
     Form(form): Form<MeTotpDeleteForm>,
 ) -> Response {
     if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    // Removing a second factor is reauth-gated: it weakens the account, and
+    // dropping a passkey can lower the bar for every other sudo-gated action.
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
         return resp;
     }
     let actor = audit::Actor {
@@ -1400,7 +1640,43 @@ pub async fn me_totp_delete(
         tracing::error!(?err, "totp_delete");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
-    totp_section_response(&state, &auth, views::SectionMode::Normal).await
+    totp_removed_response(&state, &auth).await
+}
+
+/// Reauth-modal confirmation ("Authenticator removed") plus an out-of-band
+/// refresh of `#totp-section`, returned by the reauth-gated delete handler:
+/// the chain swaps the confirmation into the open reauth modal while the
+/// OOB section updates the list behind it.
+async fn totp_removed_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+) -> Response {
+    let creds = match auth::user_totp::list_verified(&state.db, auth.user.id).await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(?err, "totp removed: list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    let message = if creds.is_empty() {
+        "That was your last authenticator app."
+    } else {
+        "The authenticator has been removed."
+    };
+    let body = format!(
+        "{}{}",
+        views::factor_removed_content("Authenticator removed", message).into_string(),
+        views::totp_authenticators_section(&ctx, &creds, views::SectionMode::Normal, true)
+            .into_string(),
+    );
+    Html(body).into_response()
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1616,14 +1892,19 @@ pub async fn me_passkey_confirm_delete(
     passkey_section_response(&state, &auth, views::SectionMode::ConfirmDelete(cred_id)).await
 }
 
-/// `POST /me/passkey/{id}/delete` — remove one passkey.
+/// `POST /me/passkey/{id}/delete` — remove one passkey. Reauth-gated, for
+/// the same reason as authenticator removal (see [`me_totp_delete`]).
 pub async fn me_passkey_delete(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(cred_id): axum::extract::Path<uuid::Uuid>,
     Form(form): Form<MeTotpDeleteForm>,
 ) -> Response {
     if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    if let Err(resp) = require_sudo(&state, &headers, auth.user.id) {
         return resp;
     }
     let actor = audit::Actor {
@@ -1651,7 +1932,42 @@ pub async fn me_passkey_delete(
         tracing::error!(?err, "passkey_delete");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
-    passkey_section_response(&state, &auth, views::SectionMode::Normal).await
+    passkey_removed_response(&state, &auth).await
+}
+
+/// Reauth-modal confirmation ("Passkey removed") plus an out-of-band
+/// refresh of `#passkey-section`. Mirror of [`totp_removed_response`].
+async fn passkey_removed_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+) -> Response {
+    let creds = match hearth::webauthn::list(&state.db, auth.user.id).await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(?err, "passkey removed: list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    };
+    let available = hearth::webauthn::available(state);
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    let message = if creds.is_empty() {
+        "That was your last passkey."
+    } else {
+        "The passkey has been removed."
+    };
+    let body = format!(
+        "{}{}",
+        views::factor_removed_content("Passkey removed", message).into_string(),
+        views::passkey_credentials_section(&ctx, &creds, views::SectionMode::Normal, available, true)
+            .into_string(),
+    );
+    Html(body).into_response()
 }
 
 
@@ -2401,9 +2717,11 @@ pub struct LoginVerifyForm {
 /// lands `/me`. Rate-limited per user (`mfa:{id}`).
 pub async fn login_verify_submit(
     State(state): State<AppState>,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginVerifyForm>,
 ) -> Response {
+    let user_agent = hearth::rate_limit::user_agent(&headers);
     let user_id = match mfa_pending_user_id(&state, &headers) {
         Some(id) => id,
         None => return Redirect::to("/login").into_response(),
@@ -2444,7 +2762,14 @@ pub async fn login_verify_submit(
         match hearth::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await
         {
             Ok(true) => {
-                return issue_session_after_mfa(&state, &user, MfaFactor::Passkey).await;
+                return issue_session_after_mfa(
+                    &state,
+                    &user,
+                    MfaFactor::Passkey,
+                    user_agent.as_deref(),
+                    Some(client_ip.as_str()),
+                )
+                .await;
             }
             Ok(false) => {
                 state.rate_limiter.record_failure(&rl_key);
@@ -2475,7 +2800,14 @@ pub async fn login_verify_submit(
             .await
         {
             Ok(Some(cred_id)) => {
-                return issue_session_after_mfa(&state, &user, MfaFactor::Totp(cred_id)).await;
+                return issue_session_after_mfa(
+                    &state,
+                    &user,
+                    MfaFactor::Totp(cred_id),
+                    user_agent.as_deref(),
+                    Some(client_ip.as_str()),
+                )
+                .await;
             }
             Ok(None) => {
                 state.rate_limiter.record_failure(&rl_key);
@@ -2512,7 +2844,14 @@ pub async fn login_verify_submit(
             }
         };
         if ok {
-            return issue_session_after_mfa(&state, &user, MfaFactor::RecoveryCode).await;
+            return issue_session_after_mfa(
+                &state,
+                &user,
+                MfaFactor::RecoveryCode,
+                user_agent.as_deref(),
+                Some(client_ip.as_str()),
+            )
+            .await;
         }
         state.rate_limiter.record_failure(&rl_key);
         audit_mfa_failed(&state, &user, "recovery_code").await;
@@ -2606,6 +2945,8 @@ async fn issue_session_after_mfa(
     state: &AppState,
     user: &identity::User,
     factor: MfaFactor,
+    user_agent: Option<&str>,
+    ip_address: Option<&str>,
 ) -> Response {
     let actor = audit::Actor {
         user_id: user.id,
@@ -2613,8 +2954,14 @@ async fn issue_session_after_mfa(
     };
     let result: anyhow::Result<String> = async {
         let mut tx = state.db.begin().await?;
-        let (session, token) =
-            auth::SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
+        let (session, token) = auth::SessionRepository::create(
+            &mut tx,
+            user.id,
+            auth::DEFAULT_SESSION_TTL,
+            user_agent,
+            ip_address,
+        )
+        .await?;
         if let MfaFactor::Totp(cred_id) = factor {
             auth::user_totp::stamp_used(&mut tx, cred_id).await?;
         }
@@ -2831,6 +3178,7 @@ pub async fn recover_reset_page(
 /// Audits `recovery_succeeded`.
 pub async fn recover_reset_submit(
     State(state): State<AppState>,
+    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<RecoverResetForm>,
 ) -> Response {
@@ -2875,13 +3223,20 @@ pub async fn recover_reset_submit(
         display_name: user.display_name.clone(),
     };
 
+    let user_agent = hearth::rate_limit::user_agent(&headers);
     let result: anyhow::Result<String> = async {
         let mut tx = state.db.begin().await?;
         auth::update_password_hash(&mut tx, user.id, &new_phc).await?;
         auth::user_recovery_code::rotate(&mut tx, user.id, &new_code).await?;
         let revoked = auth::SessionRepository::revoke_all_for_user(&mut tx, user.id).await?;
-        let (session, token) =
-            auth::SessionRepository::create(&mut tx, user.id, auth::DEFAULT_SESSION_TTL).await?;
+        let (session, token) = auth::SessionRepository::create(
+            &mut tx,
+            user.id,
+            auth::DEFAULT_SESSION_TTL,
+            user_agent.as_deref(),
+            Some(client_ip.as_str()),
+        )
+        .await?;
         audit::append(
             &mut tx,
             Some(&actor),
