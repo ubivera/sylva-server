@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use auth::SessionRepository;
@@ -43,6 +44,11 @@ pub struct AppState {
     /// client-IP keying (set behind a reverse proxy). Off → key on the
     /// socket peer. See [`crate::rate_limit`].
     pub trust_proxy: bool,
+    /// Cached "instance has been closed" flag (the last user closed their
+    /// account). Seeded from `hearth_meta.instance.closed_at` at startup and
+    /// flipped when a close empties the instance, so the closed-page
+    /// middleware never hits the DB on the hot path. See [`crate::instance`].
+    pub instance_closed: Arc<AtomicBool>,
 }
 
 /// Convenience used by the integration test harness. Constructs the
@@ -74,6 +80,7 @@ pub fn router(
         // Test convenience constructor: trust forwarding headers so tests
         // can simulate distinct clients via `X-Forwarded-For`.
         trust_proxy: true,
+        instance_closed: Arc::new(AtomicBool::new(false)),
     };
 
     let health = Router::new()

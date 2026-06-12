@@ -8,6 +8,7 @@ pub mod config;
 pub mod csrf;
 pub mod db;
 pub mod health;
+pub mod instance;
 #[cfg(windows)]
 pub mod job_object;
 pub mod mfa;
@@ -122,6 +123,12 @@ async fn serve(
     );
     tracing::info!("pending-transition worker started");
 
+    // Seed the cached closed flag from the persistent singleton so a restart
+    // of an already-closed instance keeps serving the closed page.
+    let instance_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        instance::load_closed(&pool).await.unwrap_or(false),
+    ));
+
     let state = app::AppState {
         started_at,
         db: pool.clone(),
@@ -134,6 +141,7 @@ async fn serve(
         rate_limiter: std::sync::Arc::new(rate_limit::RateLimiter::auth_default()),
         secret_key: std::sync::Arc::new(config.load_secret_key()?),
         trust_proxy: config.trust_proxy,
+        instance_closed,
     };
 
     let health = axum::Router::new()

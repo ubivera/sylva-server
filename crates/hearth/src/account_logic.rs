@@ -21,10 +21,27 @@
 //! last-owner guard: closing your own account is always your call.
 
 use auth::SessionRepository;
-use identity::UserRepository;
+use identity::{InstanceRole, UserRepository};
 
 use crate::app::AppState;
 use crate::auth_routes::AuthenticatedUser;
+
+/// Whether `user` is blocked from closing their own account because they are
+/// the **last active Owner while other active users remain** — they must hand
+/// ownership to a successor first so the instance isn't orphaned. A solo owner
+/// (the only active user) is *not* blocked: that's the empty-instance teardown
+/// path. Non-owners are never blocked.
+pub async fn last_owner_blocked(
+    state: &AppState,
+    user: &identity::User,
+) -> anyhow::Result<bool> {
+    if user.instance_role != InstanceRole::Owner {
+        return Ok(false);
+    }
+    let owners = state.users.count_active_owners().await?;
+    let users = state.users.count_active_users().await?;
+    Ok(owners == 1 && users > 1)
+}
 
 /// Anonymize the caller's own account: redact PII (lifecycle `SoftDeleted`),
 /// revoke every session, and delete the password credential, leaving the

@@ -267,6 +267,9 @@ impl TestApp {
             // carry no socket peer, so rate-limit tests simulate distinct
             // clients through `X-Forwarded-For`.
             trust_proxy: true,
+            // Fresh per-test DB is never closed at construction; the close
+            // handler flips this when a test empties the instance.
+            instance_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let health = axum::Router::new()
             .route(

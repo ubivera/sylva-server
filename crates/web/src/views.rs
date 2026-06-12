@@ -1475,6 +1475,23 @@ pub fn goodbye_page(mode: &str) -> Markup {
     shell_public(title, content)
 }
 
+/// Terminal page served on **every** web route once the instance has been
+/// closed (the last user left). No auth, no actions — there's nothing left to
+/// do but read it. Styled via `/assets`, which the closed-page middleware
+/// exempts. Reachable again only after a `clean` + re-`provision`.
+pub fn instance_closed_page() -> Markup {
+    let content = html! {
+        h1 { "This server has been closed" }
+        div class="card" {
+            p class="muted" {
+                "The last account on this server has been closed, and the server "
+                "is no longer in use. There's nothing here anymore."
+            }
+        }
+    };
+    shell_public("Server closed", content)
+}
+
 /// `GET /recover` — public start of the offline account-recovery flow.
 /// The operator enters their email + the recovery code they saved at
 /// invite acceptance (or last regeneration). `error` renders a generic
@@ -2113,6 +2130,7 @@ pub fn account_settings_modal(
     sessions: &[auth::Session],
     current_session_id: uuid::Uuid,
     now: chrono::DateTime<chrono::Utc>,
+    last_owner_blocked: bool,
 ) -> Markup {
     html! {
         dialog id="dlg-account-settings"
@@ -2198,7 +2216,7 @@ pub fn account_settings_modal(
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="data" {
-                        (settings_data_panel(ctx, recovery_meta))
+                        (settings_data_panel(ctx, recovery_meta, last_owner_blocked))
                     }
                 }
             }
@@ -2903,6 +2921,7 @@ pub fn passkey_limit_reached_content() -> Markup {
 fn settings_data_panel(
     ctx: &ChromeContext,
     recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
+    last_owner_blocked: bool,
 ) -> Markup {
     html! {
         section class="settings-section" {
@@ -2947,9 +2966,10 @@ fn settings_data_panel(
         }
         // Danger zone — close your own account. Anonymize keeps the data
         // under a closed account; Delete erases everything. Both gate on a
-        // forced critical re-auth.
-        (account_close_section(false))
-        (account_close_section(true))
+        // forced critical re-auth, and are disabled (with a transfer-first
+        // note) while the caller is the last owner with other users present.
+        (account_close_section(false, last_owner_blocked))
+        (account_close_section(true, last_owner_blocked))
     }
 }
 
@@ -2996,7 +3016,7 @@ pub fn recovery_status(
 /// a button that opens the matching confirm dialog on demand
 /// (`/modals/account/{anonymize|delete}`). The real gating (acknowledge +
 /// type-email + forced re-auth) lives in that dialog.
-fn account_close_section(delete_mode: bool) -> Markup {
+fn account_close_section(delete_mode: bool, blocked: bool) -> Markup {
     let (title, tagline, hint, label, modal) = if delete_mode {
         (
             "Delete my account",
@@ -3032,14 +3052,54 @@ fn account_close_section(delete_mode: bool) -> Markup {
             div class="settings-section-body" {
                 div class="settings-danger-row" {
                     p class="settings-row-hint" { (hint) }
-                    div class="settings-row-actions" {
-                        button type="button" class="btn-danger-ghost"
-                               data-open-modal=(modal) {
-                            (label)
+                    @if blocked {
+                        p class="settings-row-note" {
+                            "You're the last owner. Transfer ownership to someone "
+                            "first (Members \u{2192} \u{22ef} \u{2192} Change role "
+                            "\u{2192} Owner), then you can close your account."
+                        }
+                        div class="settings-row-actions" {
+                            button type="button" class="btn-danger-ghost" disabled {
+                                (label)
+                            }
+                        }
+                    } @else {
+                        div class="settings-row-actions" {
+                            button type="button" class="btn-danger-ghost"
+                                   data-open-modal=(modal) {
+                                (label)
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// Inner content shown when a close is blocked because the caller is the last
+/// owner with other users still present. Rendered both inside the confirm
+/// dialog (`account_close_modal`, `blocked = true`) and as the server-side
+/// backstop swapped into `#reauth-modal-content` if the action is reached
+/// anyway.
+pub fn account_close_blocked_content() -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-alert" { (alert_circle_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Transfer ownership first" }
+        p class="dialog-description dialog-center-text" {
+            "You're the last owner of this server. Make someone else an owner "
+            "(Members \u{2192} \u{22ef} \u{2192} Change role \u{2192} Owner) before "
+            "you close your account, so the instance isn't left without an "
+            "administrator."
+        }
+        div class="dialog-actions dialog-actions-centered" {
+            button type="button" class="btn" data-close-dialog { "Got it" }
         }
     }
 }
@@ -3051,8 +3111,18 @@ fn account_close_section(delete_mode: bool) -> Markup {
 /// checkbox (`data-close-ack`) *and* typing your own email
 /// (`data-close-email`), wired by `ACCOUNT_CLOSE_GATE_JS`. The confirm button
 /// then drives the **critical** re-auth (`data-reauth-critical`), which always
-/// re-prompts regardless of the sudo window.
-pub fn account_close_modal(ctx: &ChromeContext, delete_mode: bool) -> Markup {
+/// re-prompts regardless of the sudo window. When `blocked` (last owner with
+/// others present), the dangerous form is replaced by a "transfer first" note.
+pub fn account_close_modal(ctx: &ChromeContext, delete_mode: bool, blocked: bool) -> Markup {
+    if blocked {
+        let slug = if delete_mode { "delete" } else { "anonymize" };
+        return html! {
+            dialog id=(format!("dlg-account-{slug}"))
+                   class="action-dialog action-dialog-centered" {
+                (account_close_blocked_content())
+            }
+        };
+    }
     let (slug, action, title, lead, alert, button) = if delete_mode {
         (
             "delete",

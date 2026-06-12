@@ -131,6 +131,30 @@ impl UserRepository {
         Ok(count)
     }
 
+    /// Number of active human Owners. Drives the "last owner can't close while
+    /// others remain" guard and the empty-instance detection.
+    pub async fn count_active_owners(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM identity.users \
+             WHERE instance_role = 'owner' AND lifecycle = 'active' AND kind = 'member'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Number of active human users (any role). `0` means the instance has been
+    /// emptied — nobody can ever sign in again.
+    pub async fn count_active_users(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM identity.users \
+             WHERE lifecycle = 'active' AND kind = 'member'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     /// Look up a "live" user (Active, Deactivated, or PendingInvite).
     /// Soft-deleted and hard-deleted users are treated as not-found here —
     /// they're invisible to normal application code. Admin lifecycle

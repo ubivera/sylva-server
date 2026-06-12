@@ -5,10 +5,30 @@ pub mod views;
 
 use axum::{
     Router,
+    response::IntoResponse,
     routing::{get, post},
 };
 use hearth::app::AppState;
 use tower_http::services::ServeDir;
+
+/// Once the instance has been closed (the last user left), short-circuit every
+/// UI route to the terminal closed page. Reads the cached `instance_closed`
+/// flag — no DB hit on the hot path. `/assets` is exempt so the page renders
+/// styled; `/health` + `/api` live in separate routers and are unaffected.
+async fn instance_closed_check(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !req.uri().path().starts_with("/assets")
+        && state
+            .instance_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return axum::response::Html(views::instance_closed_page().into_string()).into_response();
+    }
+    next.run(req).await
+}
 
 /// Filesystem path to the static asset directory, relative to the crate
 /// root. Resolved at request time via [`tower_http::services::ServeDir`].
@@ -140,5 +160,11 @@ pub fn ui_router(state: AppState) -> Router {
         )
         .route("/logout", post(routes::logout_submit))
         .nest_service("/assets", ServeDir::new(assets_dir()))
+        // Closed-instance gate wraps every UI route (it exempts `/assets`
+        // itself so the closed page stays styled).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            instance_closed_check,
+        ))
         .with_state(state)
 }

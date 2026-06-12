@@ -495,6 +495,11 @@ pub async fn account_settings_modal(
     let passkey_available = hearth::webauthn::available(&state);
     // Active sessions drive the Devices tab. Degrade to empty on error.
     let sessions = active_sessions(&state, auth.user.id).await;
+    // Whether the Data Control close-account sections must show the
+    // "transfer ownership first" block (last owner with other users present).
+    let last_owner_blocked = hearth::account_logic::last_owner_blocked(&state, &auth.user)
+        .await
+        .unwrap_or(false);
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -511,6 +516,7 @@ pub async fn account_settings_modal(
             &sessions,
             auth.session_id,
             chrono::Utc::now(),
+            last_owner_blocked,
         )
         .into_string(),
     )
@@ -2418,6 +2424,27 @@ fn account_closed_response(state: &AppState, location: &'static str) -> Response
     resp
 }
 
+/// If the just-completed close left **no active users**, the last person has
+/// left: mark the instance closed (scorching every data table when `scorch` —
+/// a Delete), flip the cached flag so the closed-page middleware engages, and
+/// return the closed-page redirect. `None` means users remain → the caller
+/// proceeds with the normal goodbye.
+async fn maybe_close_instance(state: &AppState, scorch: bool) -> Option<Response> {
+    let active = state.users.count_active_users().await.unwrap_or(1);
+    if active != 0 {
+        return None;
+    }
+    if let Err(err) = hearth::instance::close(&state.db, scorch).await {
+        // Best-effort: there are no users left regardless, so the closed page
+        // is still the right thing to serve.
+        tracing::error!(?err, "closing emptied instance");
+    }
+    state
+        .instance_closed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(account_closed_response(state, "/"))
+}
+
 /// `POST /me/account/anonymize` — the user closes their own account, keeping
 /// the (now redacted) tombstone so anything attributed to it survives under a
 /// `[deleted user]`. Always gated by a fresh **critical** grant, which
@@ -2434,9 +2461,19 @@ pub async fn me_account_anonymize_submit(
     if let Err(resp) = require_critical_sudo(&state, &headers, auth.user.id) {
         return resp;
     }
+    // Backstop the last-owner guard (the modal already blocks; this catches a
+    // race where ownership changed between opening the modal and submitting).
+    if hearth::account_logic::last_owner_blocked(&state, &auth.user).await.unwrap_or(false) {
+        return Html(views::account_close_blocked_content().into_string()).into_response();
+    }
     if let Err(err) = hearth::account_logic::perform_self_anonymize(&state, &auth).await {
         tracing::error!(?err, "self anonymize");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    // Anonymize-solo closes the instance but keeps the tombstone the user
+    // chose to leave behind (scorch = false).
+    if let Some(resp) = maybe_close_instance(&state, false).await {
+        return resp;
     }
     account_closed_response(&state, "/goodbye?mode=anonymized")
 }
@@ -2457,9 +2494,18 @@ pub async fn me_account_delete_submit(
     if let Err(resp) = require_critical_sudo(&state, &headers, auth.user.id) {
         return resp;
     }
+    // Backstop the last-owner guard (the modal already blocks; this catches a
+    // race where ownership changed between opening the modal and submitting).
+    if hearth::account_logic::last_owner_blocked(&state, &auth.user).await.unwrap_or(false) {
+        return Html(views::account_close_blocked_content().into_string()).into_response();
+    }
     if let Err(err) = hearth::account_logic::perform_self_delete(&state, &auth).await {
         tracing::error!(?err, "self delete");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    // Delete-solo is a full teardown: scorch every data table (audit included).
+    if let Some(resp) = maybe_close_instance(&state, true).await {
+        return resp;
     }
     account_closed_response(&state, "/goodbye?mode=deleted")
 }
@@ -2485,6 +2531,9 @@ pub async fn account_close_modal(
         "anonymize" => false,
         _ => return error_response(StatusCode::NOT_FOUND, "Unknown action."),
     };
+    let blocked = hearth::account_logic::last_owner_blocked(&state, &auth.user)
+        .await
+        .unwrap_or(false);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
@@ -2492,7 +2541,7 @@ pub async fn account_close_modal(
         csrf_token: &csrf_token,
         pending_count: None,
     };
-    Html(views::account_close_modal(&ctx, delete_mode).into_string()).into_response()
+    Html(views::account_close_modal(&ctx, delete_mode, blocked).into_string()).into_response()
 }
 
 /// `POST /logout` — revoke the current session, clear the cookie, and

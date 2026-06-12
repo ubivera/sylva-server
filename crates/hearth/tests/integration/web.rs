@@ -3270,6 +3270,11 @@ async fn account_delete_with_normal_grant_only_is_refused() {
 #[tokio::test]
 async fn account_delete_with_critical_grant_removes_everything() {
     let app = TestApp::new().await;
+    // A co-owner keeps the instance non-empty, so deleting `user` exercises the
+    // individual-delete mechanics without tripping the empty-instance teardown.
+    let _owner = app
+        .seed_user("keeper@example.com", "Keeper", "keeppw1", InstanceRole::Owner)
+        .await;
     let user = app
         .seed_user("gone@example.com", "Goner", "rightpw", InstanceRole::Member)
         .await;
@@ -3311,8 +3316,10 @@ async fn account_delete_with_critical_grant_removes_everything() {
     // ...and so do the user's *past* audit rows — proving the FK no longer
     // SET-NULLs them (which would invalidate their hashes).
     let seed_actor: Option<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT actor_user_id FROM audit.events WHERE event_type = 'test_seed_user'",
+        "SELECT actor_user_id FROM audit.events \
+         WHERE event_type = 'test_seed_user' AND actor_user_id = $1",
     )
+    .bind(user.id.0)
     .fetch_one(&app.pool)
     .await
     .unwrap();
@@ -3324,6 +3331,11 @@ async fn account_delete_with_critical_grant_removes_everything() {
 #[tokio::test]
 async fn account_anonymize_redacts_and_locks_out() {
     let app = TestApp::new().await;
+    // Co-owner keeps the instance non-empty (isolates the anonymize mechanics
+    // from the empty-instance teardown).
+    let _owner = app
+        .seed_user("keeper2@example.com", "Keeper2", "keeppw2", InstanceRole::Owner)
+        .await;
     let user = app
         .seed_user("hide@example.com", "Hider", "rightpw", InstanceRole::Member)
         .await;
@@ -3472,4 +3484,207 @@ async fn reauth_modal_critical_forces_prompt() {
         normal_modal.contains(r#"data-sudo-fresh="1""#),
         "the ordinary modal still honours the fresh grant",
     );
+}
+
+// ── Last-owner guard (can't close while others remain) ────────────────────
+
+/// The last active Owner, with other users present, is blocked from closing:
+/// the Data Control sections show the transfer-first note (no live trigger),
+/// the confirm modal refuses the dangerous form, and the POST is a no-op even
+/// with a valid critical grant.
+#[tokio::test]
+async fn last_owner_with_others_is_blocked_from_closing() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("owner@example.com", "Owner", "ownerpw", InstanceRole::Owner)
+        .await;
+    let _member = app
+        .seed_user("m@example.com", "Mem", "mempw1", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner.email, "ownerpw").await.unwrap());
+
+    let (status, settings) = get_with_cookie(&app, "/modals/account-settings", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(settings.contains("settings-row-note"), "transfer-first note shown");
+    assert!(settings.contains("Transfer ownership to someone"), "note copy");
+    assert!(
+        !settings.contains(r#"data-open-modal="/modals/account/delete""#),
+        "the delete trigger is disabled (no open-modal handle)",
+    );
+
+    let (status, modal) = get_with_cookie(&app, "/modals/account/delete", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(modal.contains("Transfer ownership first"), "blocked content");
+    assert!(!modal.contains("data-reauth-critical"), "no critical confirm button");
+
+    // POST backstop: even with a fresh critical grant, the close is refused
+    // (no HX-Redirect) and the account survives.
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "ownerpw").await;
+    let cookie = format!("{session}; {critical}");
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("HX-Redirect").is_none(),
+        "blocked close must not redirect (it refused, not performed)",
+    );
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM identity.users WHERE id = $1", owner.id.0).await,
+        1,
+        "owner account survives a refused close",
+    );
+}
+
+/// A non-last owner (2+ active owners) can close normally — the confirm form
+/// renders and the section trigger is live.
+#[tokio::test]
+async fn non_last_owner_can_close() {
+    let app = TestApp::new().await;
+    let owner1 = app
+        .seed_user("o1@example.com", "O1", "pw1pw1", InstanceRole::Owner)
+        .await;
+    let _owner2 = app
+        .seed_user("o2@example.com", "O2", "pw2pw2", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner1.email, "pw1pw1").await.unwrap());
+
+    let (status, modal) = get_with_cookie(&app, "/modals/account/delete", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(modal.contains("data-reauth-critical"), "real confirm form (not blocked)");
+    assert!(!modal.contains("Transfer ownership first"));
+
+    let (_, settings) = get_with_cookie(&app, "/modals/account-settings", Some(&session)).await;
+    assert!(settings.contains(r#"data-open-modal="/modals/account/delete""#));
+    assert!(!settings.contains("settings-row-note"));
+}
+
+/// A solo owner (the only active user) is NOT blocked — that's the
+/// empty-instance teardown path, handled in CP2.
+#[tokio::test]
+async fn solo_owner_can_close() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("solo@example.com", "Solo", "solopw", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner.email, "solopw").await.unwrap());
+    let (status, modal) = get_with_cookie(&app, "/modals/account/delete", Some(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(modal.contains("data-reauth-critical"), "solo owner can close");
+    assert!(!modal.contains("Transfer ownership first"));
+}
+
+// ── Empty instance: closed page + scorch ──────────────────────────────────
+
+async fn scalar_i64(app: &TestApp, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(&app.pool).await.unwrap()
+}
+
+async fn instance_closed_at(app: &TestApp) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT closed_at FROM hearth_meta.instance WHERE id = TRUE")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// A solo Delete is a full teardown: the instance is marked closed, every data
+/// table is scorched (audit included), and every web route then serves the
+/// terminal closed page — while `/assets` keeps serving so it renders styled.
+#[tokio::test]
+async fn solo_delete_closes_and_scorches_the_instance() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("last@example.com", "Last", "lastpw1", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner.email, "lastpw1").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "lastpw1").await;
+    let cookie = format!("{session}; {critical}");
+
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Closed-page redirect (root), not the transient goodbye.
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/"),
+    );
+    // Every data table is empty — audit included.
+    assert_eq!(scalar_i64(&app, "SELECT count(*) FROM identity.users").await, 0, "users");
+    assert_eq!(scalar_i64(&app, "SELECT count(*) FROM auth.credentials").await, 0, "credentials");
+    assert_eq!(scalar_i64(&app, "SELECT count(*) FROM audit.events").await, 0, "audit scorched");
+    // The closed flag is set and survived the scorch (it's in hearth_meta).
+    assert!(instance_closed_at(&app).await.is_some(), "instance marked closed");
+    // Any subsequent web route serves the closed page; assets still serve.
+    let (status, body) = get_with_cookie(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("This server has been closed"), "closed page served: {body}");
+    let (assets_status, _) = get_with_cookie(&app, "/assets/css/app.css", None).await;
+    assert_eq!(assets_status, StatusCode::OK, "assets still served when closed");
+}
+
+/// A solo Anonymize closes the instance but keeps the tombstone the user chose
+/// to leave — no scorch.
+#[tokio::test]
+async fn solo_anonymize_closes_but_keeps_the_tombstone() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("hide-last@example.com", "HideLast", "hidepw1", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner.email, "hidepw1").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "hidepw1").await;
+    let cookie = format!("{session}; {critical}");
+
+    let resp =
+        post_form_raw(&app, "/me/account/anonymize", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/"),
+    );
+    assert!(instance_closed_at(&app).await.is_some(), "closed on solo anonymize");
+    // The tombstone row is kept (redacted), not scorched.
+    let (email, lifecycle): (String, String) =
+        sqlx::query_as("SELECT email, lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(owner.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(email.contains("@purged.invalid"), "tombstone redacted: {email}");
+    assert_eq!(lifecycle, "soft_deleted");
+    let (status, body) = get_with_cookie(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("This server has been closed"));
+}
+
+/// A non-last user leaving (an owner remains) does NOT close the instance — it
+/// gets the normal goodbye, and the login page still works.
+#[tokio::test]
+async fn member_close_with_owner_remaining_keeps_instance_open() {
+    let app = TestApp::new().await;
+    let _owner = app
+        .seed_user("keep@example.com", "Keep", "keeppw1", InstanceRole::Owner)
+        .await;
+    let member = app
+        .seed_user("leaver@example.com", "Leaver", "leavepw", InstanceRole::Member)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &member.email, "leavepw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "leavepw").await;
+    let cookie = format!("{session}; {critical}");
+
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/goodbye?mode=deleted"),
+        "owner remains → normal goodbye, not the closed page",
+    );
+    assert!(instance_closed_at(&app).await.is_none(), "instance stays open");
+    let (status, body) = get_with_cookie(&app, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Sign in"), "login page still served");
 }
