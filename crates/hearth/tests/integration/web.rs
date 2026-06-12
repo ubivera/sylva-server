@@ -136,6 +136,170 @@ async fn authed_request_touches_last_seen() {
     assert!(after.is_some(), "an authed request should set last_seen_at");
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Devices panel — session list + sign-out (CP2)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Log in carrying a `User-Agent` + `X-Forwarded-For`, returning the
+/// session cookie. Lets device-panel tests get labelled rows.
+async fn web_login_as_device(app: &TestApp, email: &str, password: &str, ua: &str) -> String {
+    let body = format!("email={}&password={}", urlencoding(email), urlencoding(password));
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::USER_AGENT, ua)
+        .header("x-forwarded-for", "198.51.100.9")
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    cookie_name_value(
+        resp.headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn devices_panel_lists_current_device_with_label() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = web_login_as_device(
+        &app,
+        "u@test.local",
+        "pw",
+        "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/120.0 Safari/537.36",
+    )
+    .await;
+
+    let (status, body) = get_with_cookie(&app, "/modals/account-settings", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"id="devices-section""#));
+    assert!(body.contains("Chrome on Windows"), "device label: {body}");
+    assert!(body.contains("This device"));
+    assert!(body.contains("198.51.100.9"));
+    // The only (current) session renders no revoke form, and there's no
+    // "sign out all others" with nothing else to sign out.
+    assert!(!body.contains("/me/sessions/"), "single current session: no revoke form");
+}
+
+#[tokio::test]
+async fn session_revoke_signs_out_other_device() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let c1 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let c2 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid1 = app.session_id_for_cookie(&c1).await;
+    let sid2 = app.session_id_for_cookie(&c2).await;
+    let csrf1 = app.csrf_for(sid1);
+
+    // From session 1, sign out session 2.
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid2}/revoke"))
+        .header(header::COOKIE, c1.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf1))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Session 2 is dead (redirected to login); session 1 still works.
+    let (s2, _) = get_with_cookie(&app, "/me", Some(&c2)).await;
+    assert_eq!(s2, StatusCode::SEE_OTHER);
+    let (s1, _) = get_with_cookie(&app, "/me", Some(&c1)).await;
+    assert_eq!(s1, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sessions_revoke_others_keeps_current() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let c1 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let c2 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let c3 = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid1 = app.session_id_for_cookie(&c1).await;
+    let csrf1 = app.csrf_for(sid1);
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/me/sessions/revoke-others")
+        .header(header::COOKIE, c1.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf1))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (s1, _) = get_with_cookie(&app, "/me", Some(&c1)).await;
+    assert_eq!(s1, StatusCode::OK, "current session survives");
+    for other in [&c2, &c3] {
+        let (s, _) = get_with_cookie(&app, "/me", Some(other)).await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "other sessions revoked");
+    }
+}
+
+#[tokio::test]
+async fn session_revoke_cross_user_is_noop() {
+    let app = TestApp::new().await;
+    app.seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    app.seed_user("bob@test.local", "Bob", "pw", InstanceRole::Member)
+        .await;
+    let ca = cookie_name_value(&web_login(&app, "alice@test.local", "pw").await.unwrap());
+    let cb = cookie_name_value(&web_login(&app, "bob@test.local", "pw").await.unwrap());
+    let sid_a = app.session_id_for_cookie(&ca).await;
+    let sid_b = app.session_id_for_cookie(&cb).await;
+    let csrf_a = app.csrf_for(sid_a);
+
+    // Alice tries to revoke Bob's session — must be a no-op (not owned).
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid_b}/revoke"))
+        .header(header::COOKIE, ca)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from(format!("csrf_token={}", urlencoding(&csrf_a))))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Bob's session is untouched.
+    let (sb, _) = get_with_cookie(&app, "/me", Some(&cb)).await;
+    assert_eq!(sb, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_revoke_requires_csrf() {
+    let app = TestApp::new().await;
+    app.seed_user("u@test.local", "U", "pw", InstanceRole::Member)
+        .await;
+    let cookie = cookie_name_value(&web_login(&app, "u@test.local", "pw").await.unwrap());
+    let sid = app.session_id_for_cookie(&cookie).await;
+
+    let req = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/me/sessions/{sid}/revoke"))
+        .header(header::COOKIE, cookie.clone())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("hx-request", "true")
+        .body(axum::body::Body::from("csrf_token=00000000000000000000000000000000"))
+        .unwrap();
+    let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Session still alive (revoke didn't go through).
+    let (s, _) = get_with_cookie(&app, "/me", Some(&cookie)).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn login_post_with_wrong_password_renders_error() {
     let app = TestApp::new().await;

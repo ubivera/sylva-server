@@ -493,6 +493,8 @@ pub async fn account_settings_modal(
             Vec::new()
         });
     let passkey_available = hearth::webauthn::available(&state);
+    // Active sessions drive the Devices tab. Degrade to empty on error.
+    let sessions = active_sessions(&state, auth.user.id).await;
     let ctx = views::ChromeContext {
         instance_name: &state.instance_name,
         user: &auth.user,
@@ -506,10 +508,153 @@ pub async fn account_settings_modal(
             &totp_creds,
             &passkey_creds,
             passkey_available,
+            &sessions,
+            auth.session_id,
+            chrono::Utc::now(),
         )
         .into_string(),
     )
     .into_response()
+}
+
+/// A user's active (non-revoked, non-expired) sessions, newest first — the
+/// rows shown in the Devices panel. Degrades to empty on a DB error.
+async fn active_sessions(state: &AppState, user_id: identity::UserId) -> Vec<auth::Session> {
+    let now = chrono::Utc::now();
+    state
+        .sessions
+        .list_for_user(user_id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "loading sessions for devices panel");
+            Vec::new()
+        })
+        .into_iter()
+        .filter(|s| s.revoked_at.is_none() && s.expires_at > now)
+        .collect()
+}
+
+/// Re-render the Devices section (`#devices-section`) — the response for the
+/// section GET and both revoke handlers (they target it via `outerHTML`).
+async fn sessions_section_response(
+    state: &AppState,
+    auth: &hearth::auth_routes::AuthenticatedUser,
+) -> Response {
+    let sessions = active_sessions(state, auth.user.id).await;
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: &state.instance_name,
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(
+        views::sessions_section(&ctx, &sessions, auth.session_id, chrono::Utc::now(), false)
+            .into_string(),
+    )
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SessionActionForm {
+    pub csrf_token: String,
+}
+
+/// `GET /me/sessions/section` — refresh the Devices island.
+pub async fn me_sessions_section(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    sessions_section_response(&state, &auth).await
+}
+
+/// `POST /me/sessions/{id}/revoke` — sign out one device. CSRF-only (a
+/// protective action, not reauth-gated). Only the caller's own sessions can
+/// be revoked; an unknown/foreign id is a silent no-op (re-renders the list).
+pub async fn me_session_revoke(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    axum::extract::Path(session_id): axum::extract::Path<uuid::Uuid>,
+    Form(form): Form<SessionActionForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let owned = matches!(
+        state.sessions.find_by_id(session_id).await,
+        Ok(Some(s)) if s.user_id == auth.user.id.0
+    );
+    if owned {
+        let actor = audit::Actor {
+            user_id: auth.user.id,
+            display_name: auth.user.display_name.clone(),
+        };
+        let result: anyhow::Result<()> = async {
+            let mut tx = state.db.begin().await?;
+            auth::SessionRepository::revoke(&mut tx, session_id).await?;
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "session_revoked_by_user",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "was_current": session_id == auth.session_id,
+                }),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::error!(?err, "session revoke");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+        }
+    }
+    sessions_section_response(&state, &auth).await
+}
+
+/// `POST /me/sessions/revoke-others` — sign out every device except this one.
+pub async fn me_sessions_revoke_others(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<SessionActionForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.db.begin().await?;
+        let count = auth::SessionRepository::revoke_all_for_user_except(
+            &mut tx,
+            auth.user.id,
+            auth.session_id,
+        )
+        .await?;
+        if count > 0 {
+            audit::append(
+                &mut tx,
+                Some(&actor),
+                None,
+                "sessions_revoked_by_user",
+                serde_json::json!({ "count": count }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        tracing::error!(?err, "sessions revoke-others");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
+    }
+    sessions_section_response(&state, &auth).await
 }
 
 /// `GET /modals/reauth` — render the reauth dialog as a standalone

@@ -2051,12 +2051,16 @@ pub(crate) fn invite_modal(ctx: &ChromeContext) -> Markup {
 /// container; `SETTINGS_TABS_JS` swaps `.settings-panel-active` +
 /// `.settings-tab-active` on click. No URL state — operator's choice
 /// is per-open, not persisted.
+#[allow(clippy::too_many_arguments)]
 pub fn account_settings_modal(
     ctx: &ChromeContext,
     recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
     totp_creds: &[auth::user_totp::TotpCredential],
     passkey_creds: &[hearth::webauthn::WebauthnCredentialRow],
     passkey_available: bool,
+    sessions: &[auth::Session],
+    current_session_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Markup {
     html! {
         dialog id="dlg-account-settings"
@@ -2137,13 +2141,7 @@ pub fn account_settings_modal(
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="devices" {
-                        (settings_placeholder_panel(
-                            "Devices",
-                            "Browsers and phones you're currently signed \
-                             into will be listed here, with the option \
-                             to sign each one out remotely. Coming in a \
-                             follow-up checkpoint.",
-                        ))
+                        (sessions_section(ctx, sessions, current_session_id, now, false))
                     }
                     div class="settings-panel"
                         role="tabpanel"
@@ -3088,12 +3086,185 @@ pub fn totp_limit_reached_content() -> Markup {
     }
 }
 
-/// Stand-in for the sections that aren't built yet (Devices).
-fn settings_placeholder_panel(title: &str, body: &str) -> Markup {
+/// Turn a raw `User-Agent` into a friendly "Browser on OS" label for the
+/// Devices panel. Hand-rolled heuristics (no UA-parser dependency) — good
+/// enough to tell a Chrome-on-Windows session from a Safari-on-iPhone one.
+/// Order matters: Edge/Opera UAs also contain "Chrome", and Chrome UAs also
+/// contain "Safari", so the more specific tokens are checked first.
+pub fn device_label(user_agent: &str) -> String {
+    if user_agent.trim().is_empty() {
+        return "Unknown device".to_string();
+    }
+    let browser = if user_agent.contains("Edg/") || user_agent.contains("Edge") {
+        Some("Edge")
+    } else if user_agent.contains("OPR/") || user_agent.contains("Opera") {
+        Some("Opera")
+    } else if user_agent.contains("Chrome/") || user_agent.contains("Chromium") {
+        Some("Chrome")
+    } else if user_agent.contains("Firefox/") {
+        Some("Firefox")
+    } else if user_agent.contains("Safari/") {
+        Some("Safari")
+    } else {
+        None
+    };
+    let os = if user_agent.contains("Windows") {
+        Some("Windows")
+    } else if user_agent.contains("iPhone") || user_agent.contains("iPad") {
+        Some("iOS")
+    } else if user_agent.contains("Mac OS X") || user_agent.contains("Macintosh") {
+        Some("macOS")
+    } else if user_agent.contains("Android") {
+        Some("Android")
+    } else if user_agent.contains("Linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    match (browser, os) {
+        (Some(b), Some(o)) => format!("{b} on {o}"),
+        (Some(b), None) => b.to_string(),
+        (None, Some(o)) => o.to_string(),
+        (None, None) => "Unknown device".to_string(),
+    }
+}
+
+/// True when the User-Agent looks like a phone/tablet (picks the row icon).
+fn device_is_mobile(user_agent: &str) -> bool {
+    user_agent.contains("Android")
+        || user_agent.contains("iPhone")
+        || user_agent.contains("iPad")
+}
+
+/// Coarse "x ago" for the last-active line. Past the week mark it falls back
+/// to an absolute date. `now` is passed in so the function stays pure.
+fn relative_time(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = (now - then).num_seconds().max(0);
+    let plural = |n: i64| if n == 1 { "" } else { "s" };
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        let m = secs / 60;
+        format!("{m} minute{} ago", plural(m))
+    } else if secs < 86_400 {
+        let h = secs / 3600;
+        format!("{h} hour{} ago", plural(h))
+    } else if secs < 7 * 86_400 {
+        let d = secs / 86_400;
+        format!("{d} day{} ago", plural(d))
+    } else {
+        then.format("%b %-d, %Y").to_string()
+    }
+}
+
+/// The Devices panel island (`#devices-section`): one row per active session
+/// with a "Sign out" action, the current session flagged "This device", and
+/// a "Sign out all other devices" header action. `oob` makes it an
+/// `hx-swap-oob` carrier so the revoke handlers can refresh it in place.
+/// Sign-out is direct HTMX (CSRF-only, no reauth — it's a protective action).
+pub fn sessions_section(
+    ctx: &ChromeContext,
+    sessions: &[auth::Session],
+    current_session_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+    oob: bool,
+) -> Markup {
+    let has_others = sessions.iter().any(|s| s.id != current_session_id);
+    let oob_attr = oob.then_some("true");
     html! {
-        div class="settings-placeholder" {
-            h3 { (title) }
-            p { (body) }
+        section id="devices-section" class="settings-section" hx-swap-oob=[oob_attr] {
+            div class="settings-section-header settings-section-header-actions" {
+                div class="settings-section-heading" {
+                    span class="settings-section-icon" aria-hidden="true" {
+                        (laptop_icon())
+                    }
+                    div {
+                        h3 { "Devices" }
+                        p class="settings-section-tagline" {
+                            "Browsers and devices signed in to your account."
+                        }
+                    }
+                }
+                // No `id` on the form → the reauth Enter-handler skips it and
+                // htmx posts it directly (CSRF rides along from the input).
+                @if has_others {
+                    form method="post" action="/me/sessions/revoke-others"
+                         hx-post="/me/sessions/revoke-others"
+                         hx-target="#devices-section" hx-swap="outerHTML"
+                         style="display:contents" {
+                        (csrf_input(ctx.csrf_token))
+                        button type="submit" class="btn-secondary" {
+                            "Sign out all other devices"
+                        }
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                ul class="totp-list" {
+                    @for s in sessions {
+                        (session_row(ctx, s, s.id == current_session_id, now))
+                    }
+                }
+                div class="settings-info" {
+                    span class="settings-info-icon" aria-hidden="true" {
+                        (info_icon())
+                    }
+                    div {
+                        h4 { "Don't recognise a device?" }
+                        p {
+                            "Sign it out, then change your password. Signing a "
+                            "device out ends its session immediately — it has to "
+                            "sign in again with your password and any second factor."
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One device row. The current session shows a "This device" badge and no
+/// sign-out button (use the normal Sign out to end this one).
+fn session_row(
+    ctx: &ChromeContext,
+    s: &auth::Session,
+    is_current: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let ua = s.user_agent.as_deref().unwrap_or("");
+    html! {
+        li class="totp-row" {
+            span class="totp-row-icon" aria-hidden="true" {
+                @if device_is_mobile(ua) { (device_mobile_icon()) } @else { (laptop_icon()) }
+            }
+            div class="totp-row-main" {
+                span class="totp-row-name" {
+                    (device_label(ua))
+                    @if is_current {
+                        span class="device-current-badge" { "This device" }
+                    }
+                }
+                span class="totp-row-meta" {
+                    @if let Some(ip) = &s.ip_address {
+                        (ip) " • "
+                    }
+                    @match s.last_seen_at {
+                        Some(seen) => { "Last active " (relative_time(seen, now)) }
+                        None => { "Signed in " (s.created_at.format("%b %-d, %Y").to_string()) }
+                    }
+                }
+            }
+            div class="totp-row-actions" {
+                @if !is_current {
+                    form method="post" action=(format!("/me/sessions/{}/revoke", s.id))
+                         hx-post=(format!("/me/sessions/{}/revoke", s.id))
+                         hx-target="#devices-section" hx-swap="outerHTML"
+                         style="display:contents" {
+                        (csrf_input(ctx.csrf_token))
+                        button type="submit" class="btn-secondary" { "Sign out" }
+                    }
+                }
+            }
         }
     }
 }
@@ -6435,7 +6606,39 @@ pub fn error_page(status: u16, message: &str) -> Markup {
 
 #[cfg(test)]
 mod tests {
-    use super::{PageItem, page_items};
+    use super::{PageItem, device_label, page_items};
+
+    #[test]
+    fn device_label_parses_common_user_agents() {
+        // Edge/Opera UAs also contain "Chrome"; Chrome UAs also contain
+        // "Safari" — the ordering in `device_label` must disambiguate.
+        assert_eq!(
+            device_label("Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/120.0 Safari/537.36"),
+            "Chrome on Windows"
+        );
+        assert_eq!(
+            device_label(
+                "Mozilla/5.0 (Windows NT 10.0) AppleWebKit Chrome/120 Safari Edg/120.0"
+            ),
+            "Edge on Windows"
+        );
+        assert_eq!(
+            device_label(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Version/17.0 Safari/604.1"
+            ),
+            "Safari on iOS"
+        );
+        assert_eq!(
+            device_label("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) Firefox/121.0"),
+            "Firefox on macOS"
+        );
+        assert_eq!(
+            device_label("Mozilla/5.0 (Linux; Android 14) Chrome/120 Mobile"),
+            "Chrome on Android"
+        );
+        assert_eq!(device_label(""), "Unknown device");
+        assert_eq!(device_label("curl/8.4.0"), "Unknown device");
+    }
 
     fn nums(v: Vec<PageItem>) -> Vec<Option<u32>> {
         v.into_iter()

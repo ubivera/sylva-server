@@ -69,6 +69,13 @@ pub fn ui_router(state: AppState) -> Router {
             get(routes::me_passkey_confirm_delete),
         )
         .route("/me/passkey/{id}/delete", post(routes::me_passkey_delete))
+        // Devices tab: active-session list + sign-out actions (CSRF-only).
+        .route("/me/sessions/section", get(routes::me_sessions_section))
+        .route(
+            "/me/sessions/revoke-others",
+            post(routes::me_sessions_revoke_others),
+        )
+        .route("/me/sessions/{id}/revoke", post(routes::me_session_revoke))
         // On-demand modal fragments. The shell ships an empty
         // `#modal-host`; the client fetches these when a modal is
         // opened and removes the markup on close, so no modal lives in
