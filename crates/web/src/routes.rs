@@ -2157,8 +2157,7 @@ fn sort_users(users: &mut [identity::User], sort: views::SortState) {
             identity::UserLifecycle::Active => 0,
             identity::UserLifecycle::PendingInvite => 1,
             identity::UserLifecycle::Deactivated => 2,
-            identity::UserLifecycle::SoftDeleted => 3,
-            identity::UserLifecycle::HardDeleted => 4,
+            identity::UserLifecycle::Anonymized => 3,
         }
     }
 

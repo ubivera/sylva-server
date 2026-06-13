@@ -286,6 +286,37 @@ async fn admin_reactivates_deactivated_user() {
 }
 
 #[tokio::test]
+async fn admin_anonymizes_user() {
+    let app = TestApp::new().await;
+    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
+        .await;
+    let target = app
+        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
+    let csrf = app.csrf_for(session_id);
+
+    let resp = post_form(
+        &app,
+        &format!("/members/{}/anonymize", target.id.0),
+        &cookie,
+        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&resp), "/members");
+
+    let lifecycle: String = sqlx::query_scalar(
+        "SELECT lifecycle::text FROM identity.users WHERE id = $1",
+    )
+    .bind(target.id.0)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, "anonymized");
+}
+
+#[tokio::test]
 async fn admin_deletes_user() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
@@ -306,36 +337,13 @@ async fn admin_deletes_user() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&resp), "/members");
 
-    let lifecycle: String = sqlx::query_scalar(
-        "SELECT lifecycle::text FROM identity.users WHERE id = $1",
-    )
-    .bind(target.id.0)
-    .fetch_one(&app.pool)
-    .await
-    .unwrap();
-    assert_eq!(lifecycle, "soft_deleted");
-}
-
-#[tokio::test]
-async fn admin_purges_user() {
-    let app = TestApp::new().await;
-    app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
-        .await;
-    let target = app
-        .seed_user("alice@test.local", "Alice", "pw", InstanceRole::Member)
-        .await;
-    let (cookie, session_id) = web_login_session(&app, ADMIN_EMAIL, ADMIN_PW).await;
-    let csrf = app.csrf_for(session_id);
-
-    let resp = post_form(
-        &app,
-        &format!("/members/{}/purge", target.id.0),
-        &cookie,
-        format!("csrf_token={}&password={}", urlencoding(&csrf), ADMIN_PW),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&resp), "/members");
+    // Delete is a true removal — the row is physically gone.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.users WHERE id = $1")
+        .bind(target.id.0)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]
@@ -462,7 +470,7 @@ async fn delete_without_grant_is_refused() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // DB-side: not soft-deleted.
+    // DB-side: unchanged (the action never ran).
     let lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle::text FROM identity.users WHERE id = $1",
     )
@@ -474,7 +482,7 @@ async fn delete_without_grant_is_refused() {
 }
 
 #[tokio::test]
-async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
+async fn anonymize_with_grant_htmx_responds_with_hx_redirect() {
     let app = TestApp::new().await;
     app.seed_user(ADMIN_EMAIL, "Adm", ADMIN_PW, InstanceRole::Admin)
         .await;
@@ -487,7 +495,7 @@ async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
 
     let req = axum::http::Request::builder()
         .method(Method::POST)
-        .uri(format!("/members/{}/delete", target.id.0))
+        .uri(format!("/members/{}/anonymize", target.id.0))
         .header(header::COOKIE, format!("{cookie}; {sudo}"))
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("HX-Request", "true")
@@ -503,10 +511,9 @@ async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
     assert_eq!(hx_redirect(&resp), "/members");
     let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
     assert_eq!(toast["kind"], "error");
-    // UI calls the soft-delete action "Anonymize".
     assert_eq!(toast["title"], "Account anonymized");
 
-    // DB-side: soft-deleted.
+    // DB-side: anonymized.
     let lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle::text FROM identity.users WHERE id = $1",
     )
@@ -514,7 +521,7 @@ async fn delete_with_correct_password_htmx_responds_with_hx_redirect() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(lifecycle, "anonymized");
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -648,7 +655,7 @@ async fn self_row_kebab_renders_locked_items_only() {
     // so we narrow the negative assertion to the self user's per-row
     // action URLs: those must not appear.
     let self_id = admin.id.0;
-    for verb in ["deactivate", "reactivate", "delete", "purge", "role"] {
+    for verb in ["deactivate", "reactivate", "anonymize", "delete", "role"] {
         let url = format!(r#"action="/members/{self_id}/{verb}""#);
         assert!(
             !body.contains(&url),
@@ -687,8 +694,8 @@ async fn kebab_omitted_for_admin_viewing_owner() {
         !body.contains(&format!("/members/{owner_id}/deactivate")),
         "found owner deactivate action in admin view: {body}"
     );
+    assert!(!body.contains(&format!("/members/{owner_id}/anonymize")));
     assert!(!body.contains(&format!("/members/{owner_id}/delete")));
-    assert!(!body.contains(&format!("/members/{owner_id}/purge")));
 }
 
 #[tokio::test]
@@ -826,8 +833,7 @@ async fn htmx_delete_emits_error_toast() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
     assert_eq!(toast["kind"], "error");
-    // UI calls the soft-delete action "Anonymize"; backend route stays /delete.
-    assert_eq!(toast["title"], "Account anonymized");
+    assert_eq!(toast["title"], "Account deleted");
 }
 
 #[tokio::test]

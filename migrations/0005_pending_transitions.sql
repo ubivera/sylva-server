@@ -3,8 +3,8 @@ CREATE SCHEMA IF NOT EXISTS pending;
 CREATE TYPE pending.transition_kind AS ENUM (
     'role_change',
     'deactivate',
-    'soft_delete',
-    'hard_delete'
+    'anonymize',
+    'delete'
 );
 
 CREATE TYPE pending.transition_state AS ENUM (
@@ -17,8 +17,11 @@ CREATE TYPE pending.transition_state AS ENUM (
 CREATE TABLE pending.transitions (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     kind                pending.transition_kind NOT NULL,
-    initiator_user_id   UUID NOT NULL REFERENCES identity.users(id) ON DELETE SET NULL,
-    target_user_id      UUID NOT NULL REFERENCES identity.users(id) ON DELETE SET NULL,
+    -- Nullable because the FK is `ON DELETE SET NULL`: a physical user delete
+    -- (the true Delete action) nulls these on any transition that referenced
+    -- the gone user. The Rust `TransitionRow` already reads them as `Option`.
+    initiator_user_id   UUID REFERENCES identity.users(id) ON DELETE SET NULL,
+    target_user_id      UUID REFERENCES identity.users(id) ON DELETE SET NULL,
     payload             JSONB NOT NULL,
     state               pending.transition_state NOT NULL DEFAULT 'pending',
     effective_at        TIMESTAMPTZ NOT NULL,

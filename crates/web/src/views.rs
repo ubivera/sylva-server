@@ -200,8 +200,8 @@ pub enum MemberRow<'a> {
 /// in the toolbar and round-trips via the `?filter=...` query param.
 ///
 /// `All` is the default — same data set as the unfiltered listing
-/// (`list_all`: Active + PendingInvite + Deactivated). `Status(Deleted)`
-/// is the one filter that *expands* visibility (surfaces SoftDeleted
+/// (`list_all`: Active + PendingInvite + Deactivated). `Status(Anonymized)`
+/// is the one filter that *expands* visibility (surfaces `Anonymized`
 /// rows that `list_all` hides), via `list_with_lifecycle`.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemberFilter {
@@ -222,9 +222,7 @@ impl MemberFilter {
             MemberFilter::Status(UserLifecycle::Active) => "status:active",
             MemberFilter::Status(UserLifecycle::PendingInvite) => "status:pending",
             MemberFilter::Status(UserLifecycle::Deactivated) => "status:deactivated",
-            MemberFilter::Status(UserLifecycle::SoftDeleted) => "status:deleted",
-            // HardDeleted is not surfaced in the UI — treat as "all".
-            MemberFilter::Status(UserLifecycle::HardDeleted) => "all",
+            MemberFilter::Status(UserLifecycle::Anonymized) => "status:anonymized",
         }
     }
 
@@ -240,7 +238,7 @@ impl MemberFilter {
             "status:active" => MemberFilter::Status(UserLifecycle::Active),
             "status:pending" => MemberFilter::Status(UserLifecycle::PendingInvite),
             "status:deactivated" => MemberFilter::Status(UserLifecycle::Deactivated),
-            "status:deleted" => MemberFilter::Status(UserLifecycle::SoftDeleted),
+            "status:anonymized" => MemberFilter::Status(UserLifecycle::Anonymized),
             _ => MemberFilter::All,
         }
     }
@@ -255,8 +253,7 @@ impl MemberFilter {
             MemberFilter::Status(UserLifecycle::Active) => "Active",
             MemberFilter::Status(UserLifecycle::PendingInvite) => "Pending invite",
             MemberFilter::Status(UserLifecycle::Deactivated) => "Deactivated",
-            MemberFilter::Status(UserLifecycle::SoftDeleted) => "Deleted",
-            MemberFilter::Status(UserLifecycle::HardDeleted) => "View all",
+            MemberFilter::Status(UserLifecycle::Anonymized) => "Anonymized",
         }
     }
 }
@@ -1481,11 +1478,15 @@ pub fn goodbye_page(mode: &str) -> Markup {
 /// exempts. Reachable again only after a `clean` + re-`provision`.
 pub fn instance_closed_page() -> Markup {
     let content = html! {
-        h1 { "This server has been closed" }
+        h1 { "This server has been closed. Goodbye." }
         div class="card" {
             p class="muted" {
-                "The last account on this server has been closed, and the server "
-                "is no longer in use. There's nothing here anymore."
+                "An owner has deleted this instance and all its data. This instance "
+                "is no longer in use and there's nothing here anymore. For users, "
+                "feel free to close this tab and move on. Desktop and mobile apps will "
+                "no longer sync any of your data, and will switch to offline mode on "
+                "next use. For owners, please shut down server application one last  "
+                "time and uninstall the software from the host."
             }
         }
     };
@@ -1502,7 +1503,7 @@ pub fn recover_page(error: Option<&str>) -> Markup {
         div class="card" {
             p class="muted recover-intro" {
                 "Enter your email and the recovery code you saved. We'll "
-                "let you set a new password. Sylva is offline-first — "
+                "let you set a new password. Sylva is offline-first - "
                 "there's no reset email, so the recovery code is the only "
                 "way back in."
             }
@@ -1649,8 +1650,7 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
         UserLifecycle::Active => "Active",
         UserLifecycle::Deactivated => "Deactivated",
         UserLifecycle::PendingInvite => "Pending invitation",
-        UserLifecycle::SoftDeleted => "Deleted",
-        UserLifecycle::HardDeleted => "Purged",
+        UserLifecycle::Anonymized => "Anonymized",
     };
     let content = html! {
         div class="card me-card" {
@@ -3994,7 +3994,7 @@ fn alert_circle_icon() -> Markup {
 }
 
 /// 22px trash-can icon used as the centered feature icon on the
-/// Purge modal (terminal hard-delete). Stroke uses `currentColor`
+/// Delete modal (terminal full removal). Stroke uses `currentColor`
 /// so the icon inherits the `.dialog-icon-danger` red tint without
 /// needing a dedicated fill rule.
 fn trash_icon() -> Markup {
@@ -4055,7 +4055,7 @@ fn search_glyph_icon() -> Markup {
 /// icon on the Anonymize modal. The classic browser-incognito
 /// imagery telegraphs "identity is scrubbed; the row stays" more
 /// accurately than a trash can, which reads as terminal delete and
-/// blurs the distinction with the Purge modal. Stroke + fill both
+/// blurs the distinction with the Delete modal. Stroke + fill both
 /// use `currentColor` so the icon inherits the
 /// `.dialog-icon-danger` red tint; the sunglass lenses fill solid
 /// for the iconic dark-lens silhouette.
@@ -4341,8 +4341,8 @@ pub struct MembersBanner<'a> {
     pub error: Option<&'a str>,
 }
 
-/// `GET /members` page — admin-only directory of every non-purged Member.
-/// Renders as a table; soft/hard-deleted accounts and Guests are filtered
+/// `GET /members` page — admin-only directory of live Members.
+/// Renders as a table; anonymized accounts and Guests are filtered
 /// out by [`identity::UserRepository::list_all`]. Each row carries a
 /// kebab (`<details>`) menu whose contents depend on the viewer's role
 /// and the target's lifecycle (see [`available_actions`]).
@@ -5217,7 +5217,7 @@ fn filter_menu(current: MemberFilter, sort: SortState) -> Markup {
                 (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::Active)))
                 (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::PendingInvite)))
                 (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::Deactivated)))
-                (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::SoftDeleted)))
+                (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::Anonymized)))
             }
         }
     }
@@ -5581,8 +5581,8 @@ pub(crate) enum RowAction {
     Deactivate,
     Reactivate,
     ChangeRole,
+    Anonymize,
     Delete,
-    Purge,
 }
 
 /// Map a member-action modal path segment to the `RowAction` it gates
@@ -5595,8 +5595,8 @@ pub(crate) fn row_action_for_segment(seg: &str) -> Option<RowAction> {
         "deactivate" => Some(RowAction::Deactivate),
         "reactivate" => Some(RowAction::Reactivate),
         "role" | "role-owner-confirm" => Some(RowAction::ChangeRole),
+        "anonymize" => Some(RowAction::Anonymize),
         "delete" => Some(RowAction::Delete),
-        "purge" => Some(RowAction::Purge),
         _ => None,
     }
 }
@@ -5620,8 +5620,8 @@ pub(crate) fn member_action_modal(
         "role-owner-confirm" => {
             Some(role_owner_confirm_dialog(id, &target.display_name, csrf_token))
         }
+        "anonymize" => Some(render_action_dialog(RowAction::Anonymize, target, csrf_token, id)),
         "delete" => Some(render_action_dialog(RowAction::Delete, target, csrf_token, id)),
-        "purge" => Some(render_action_dialog(RowAction::Purge, target, csrf_token, id)),
         _ => None,
     }
 }
@@ -5668,8 +5668,8 @@ pub(crate) fn available_actions(
     if matches!(viewer, InstanceRole::Owner) {
         actions.push(RowAction::ChangeRole);
     }
+    actions.push(RowAction::Anonymize);
     actions.push(RowAction::Delete);
-    actions.push(RowAction::Purge);
     actions
 }
 
@@ -5690,8 +5690,8 @@ fn self_row_actions(viewer: InstanceRole, lifecycle: UserLifecycle) -> Vec<RowAc
     if matches!(viewer, InstanceRole::Owner) {
         actions.push(RowAction::ChangeRole);
     }
+    actions.push(RowAction::Anonymize);
     actions.push(RowAction::Delete);
-    actions.push(RowAction::Purge);
     actions
 }
 
@@ -5750,22 +5750,18 @@ fn render_action_item(
                 "Change role…"
             }
         },
-        // RowAction::Delete = soft delete (anonymize). The kebab
-        // label calls it "Anonymize…" so operators understand it
-        // keeps shared content under an anonymized account. The
-        // internal `Delete` enum + `/delete` URL keep their names;
-        // only the visible label differs.
-        RowAction::Delete => html! {
+        // Anonymize — keeps shared content under an anonymized (redacted)
+        // account.
+        RowAction::Anonymize => html! {
             button type="button" class="row-action-item row-action-danger"
-                   data-open-modal=(format!("/members/{id}/modal/delete")) {
+                   data-open-modal=(format!("/members/{id}/modal/anonymize")) {
                 "Anonymize…"
             }
         },
-        // RowAction::Purge = hard delete (full removal). The kebab
-        // label calls it "Delete…" — the terminal, total action.
-        RowAction::Purge => html! {
+        // Delete — the terminal, total action: physically removes the row.
+        RowAction::Delete => html! {
             button type="button" class="row-action-item row-action-danger"
-                   data-open-modal=(format!("/members/{id}/modal/purge")) {
+                   data-open-modal=(format!("/members/{id}/modal/delete")) {
                 "Delete…"
             }
         },
@@ -5781,8 +5777,8 @@ fn render_locked_item(action: RowAction) -> Markup {
         RowAction::Deactivate => ("Deactivate", false),
         RowAction::Reactivate => ("Reactivate", false),
         RowAction::ChangeRole => ("Change role…", false),
-        RowAction::Delete => ("Anonymize…", true),
-        RowAction::Purge => ("Delete…", true),
+        RowAction::Anonymize => ("Anonymize…", true),
+        RowAction::Delete => ("Delete…", true),
     };
     let class = if danger {
         "row-action-item row-action-locked row-action-danger"
@@ -6096,22 +6092,21 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
             // separately once the operator picks Owner. See
             // REAUTH_CHAIN_JS.
         },
-        // RowAction::Delete = soft delete, surfaced as "Anonymize".
-        // Account row stays so any non-orphaned content (comments on
-        // shared docs, shared list ownership, etc.) keeps its byline;
-        // just the person's identity is scrubbed. Centered chrome +
-        // danger-red feature icon so the destructive nature is
+        // RowAction::Anonymize — the account row stays so any non-orphaned
+        // content (comments on shared docs, shared list ownership, etc.)
+        // keeps its byline; just the person's identity is scrubbed. Centered
+        // chrome + danger-red feature icon so the destructive nature is
         // immediately visible.
-        RowAction::Delete => html! {
-            dialog id=(format!("dlg-delete-{id}"))
+        RowAction::Anonymize => html! {
+            dialog id=(format!("dlg-anonymize-{id}"))
                    class="action-dialog action-dialog-centered" {
-                form id=(format!("form-delete-{id}"))
-                     method="post" action=(format!("/members/{id}/delete")) {
+                form id=(format!("form-anonymize-{id}"))
+                     method="post" action=(format!("/members/{id}/anonymize")) {
                     div class="dialog-header" {
                         div class="dialog-icon dialog-icon-danger" {
                             // Incognito glyph (not trash) — the row is
                             // *anonymized*, not deleted. Trash is reserved
-                            // for the Purge modal below.
+                            // for the Delete modal below.
                             (incognito_icon())
                         }
                         button type="button" class="dialog-close" data-close-dialog
@@ -6130,12 +6125,12 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                         (alert_circle_icon())
                         span { "This action is permanent and cannot be undone." }
                     }
-                    (confirm_name_field(id, name, "delete"))
+                    (confirm_name_field(id, name, "anonymize"))
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
                         button type="button" class="btn-danger"
-                               data-reauth-confirm=(format!("form-delete-{id}"))
+                               data-reauth-confirm=(format!("form-anonymize-{id}"))
                                disabled {
                             "Anonymize"
                         }
@@ -6143,16 +6138,15 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                 }
             }
         },
-        // RowAction::Purge = hard delete, surfaced as "Delete". The
-        // account and every piece of content it created is dropped,
-        // even if other members were collaborating on that content.
-        // Heavier hammer than Anonymize; same chrome so the two read
-        // as a pair, same alert because both are terminal.
-        RowAction::Purge => html! {
-            dialog id=(format!("dlg-purge-{id}"))
+        // RowAction::Delete = full removal. The account and every piece of
+        // content it created is dropped, even if other members were
+        // collaborating on that content. Heavier hammer than Anonymize; same
+        // chrome so the two read as a pair, same alert because both are terminal.
+        RowAction::Delete => html! {
+            dialog id=(format!("dlg-delete-{id}"))
                    class="action-dialog action-dialog-centered" {
-                form id=(format!("form-purge-{id}"))
-                     method="post" action=(format!("/members/{id}/purge")) {
+                form id=(format!("form-delete-{id}"))
+                     method="post" action=(format!("/members/{id}/delete")) {
                     div class="dialog-header" {
                         div class="dialog-icon dialog-icon-danger" {
                             (trash_icon())
@@ -6174,12 +6168,12 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                         (alert_circle_icon())
                         span { "This action is permanent and cannot be undone." }
                     }
-                    (confirm_name_field(id, name, "purge"))
+                    (confirm_name_field(id, name, "delete"))
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
                         button type="button" class="btn-danger"
-                               data-reauth-confirm=(format!("form-purge-{id}"))
+                               data-reauth-confirm=(format!("form-delete-{id}"))
                                disabled {
                             "Delete"
                         }
@@ -6312,10 +6306,9 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
         // the 72h window if no one vetoes) is destructive — the
         // operator should still feel the weight of having queued it.
         //
-        // Token names match the UI vocabulary: "anonymized" = the
-        // soft-delete (which keeps shared content), "deleted" = the
-        // hard-delete (full removal). Backend routes + audit events
-        // keep their original names.
+        // "anonymized" keeps shared content under a redacted tombstone;
+        // "deleted" is the full physical removal. The vocabulary is now
+        // consistent end-to-end (routes, audit events, enums all match).
         "anonymized" => (
             ToastKind::Error,
             "Account anonymized",
@@ -6548,8 +6541,8 @@ fn pending_empty_state() -> Markup {
             }
             h2 { "Nothing pending" }
             p {
-                "Owner-on-Owner deactivations, deletes, purges, and role "
-                "changes wait here for 72 hours so any Owner can veto. "
+                "Owner-on-Owner deactivations, anonymizations, deletes, and "
+                "role changes wait here for 72 hours so any Owner can veto. "
                 "When something gets queued, it shows up on this page."
             }
         }
@@ -6762,11 +6755,8 @@ pub(crate) fn pending_action_label(row: &pending::TransitionRow) -> String {
     use pending::TransitionKind;
     match row.kind {
         TransitionKind::Deactivate => "Deactivate".to_string(),
-        // Soft-delete is surfaced as "Anonymize" in the UI; the
-        // internal `TransitionKind::SoftDelete` enum keeps its name.
-        // Hard-delete is surfaced as "Delete".
-        TransitionKind::SoftDelete => "Anonymize".to_string(),
-        TransitionKind::HardDelete => "Delete".to_string(),
+        TransitionKind::Anonymize => "Anonymize".to_string(),
+        TransitionKind::Delete => "Delete".to_string(),
         TransitionKind::RoleChange => match row.role_payload() {
             Ok(payload) => match payload.to_role {
                 InstanceRole::Owner => "Promote to Owner".to_string(),

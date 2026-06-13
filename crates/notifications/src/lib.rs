@@ -56,26 +56,26 @@ pub enum OutboxKind {
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
     Deactivate,
-    SoftDelete,
-    HardDelete,
+    Anonymize,
+    Delete,
 }
 
 impl LifecycleAction {
-    /// Verb-form used in templates: "deactivation", "account deletion",
-    /// "account purge".
+    /// Verb-form used in templates: "deactivation", "account anonymization",
+    /// "account deletion".
     pub fn noun(self) -> &'static str {
         match self {
             LifecycleAction::Deactivate => "deactivation",
-            LifecycleAction::SoftDelete => "account deletion",
-            LifecycleAction::HardDelete => "account purge",
+            LifecycleAction::Anonymize => "account anonymization",
+            LifecycleAction::Delete => "account deletion",
         }
     }
 
     pub fn past_tense(self) -> &'static str {
         match self {
             LifecycleAction::Deactivate => "deactivated",
-            LifecycleAction::SoftDelete => "deleted",
-            LifecycleAction::HardDelete => "purged",
+            LifecycleAction::Anonymize => "anonymized",
+            LifecycleAction::Delete => "deleted",
         }
     }
 }

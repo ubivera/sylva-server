@@ -121,8 +121,8 @@ pub fn api_router(state: AppState) -> Router {
             "/admin/members/{id}/reactivate",
             post(admin_routes::reactivate_member),
         )
+        .route("/admin/members/{id}/anonymize", post(admin_routes::anonymize_member))
         .route("/admin/members/{id}/delete", post(admin_routes::delete_member))
-        .route("/admin/members/{id}/purge", post(admin_routes::purge_member))
         .route(
             "/admin/members/{id}/role",
             post(admin_routes::change_member_role),

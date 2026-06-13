@@ -3360,7 +3360,7 @@ async fn account_anonymize_redacts_and_locks_out() {
     .unwrap();
     assert!(email.contains("@purged.invalid"), "email redacted: {email}");
     assert_eq!(display, "[deleted user]");
-    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(lifecycle, "anonymized");
     assert_eq!(
         count(&app, "SELECT count(*) FROM auth.credentials WHERE user_id = $1", user.id.0).await,
         0,
@@ -3574,6 +3574,144 @@ async fn solo_owner_can_close() {
     assert!(!modal.contains("Transfer ownership first"));
 }
 
+// ── Empty-instance teardown (closed page + scorch) ────────────────────────
+
+async fn table_count(app: &TestApp, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+async fn instance_closed(app: &TestApp) -> bool {
+    sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM hearth_meta.instance WHERE id = TRUE")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// The last user **deleting** scorches every data table (audit log included),
+/// closes the instance, and serves the terminal closed page on every route
+/// thereafter — while `/assets` keeps serving so the page renders styled.
+#[tokio::test]
+async fn solo_delete_scorches_and_closes_instance() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("last@example.com", "Last", "lastpw", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner.email, "lastpw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "lastpw").await;
+    let cookie = format!("{session}; {critical}");
+
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/"),
+        "closing the last account redirects to the closed page, not /goodbye",
+    );
+
+    assert!(instance_closed(&app).await, "instance marked closed");
+    for table in [
+        "identity.users",
+        "auth.credentials",
+        "auth.sessions",
+        "audit.events",
+        "pending.transitions",
+        "notifications.outbox",
+    ] {
+        assert_eq!(table_count(&app, table).await, 0, "{table} scorched");
+    }
+
+    // The closed page is served on any route now (no auth needed)...
+    let (status, body) = get_with_cookie(&app, "/me", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("This server has been closed"), "closed page served");
+    // ...and /assets is exempt so that page can load its stylesheet.
+    let (asset_status, _) = get_with_cookie(&app, "/assets/css/app.css", None).await;
+    assert_eq!(asset_status, StatusCode::OK, "assets stay served when closed");
+}
+
+/// The last user **anonymizing** closes the instance too — but keeps the
+/// tombstone (and the audit log); it is *not* a scorch.
+#[tokio::test]
+async fn solo_anonymize_closes_but_keeps_tombstone() {
+    let app = TestApp::new().await;
+    let owner = app
+        .seed_user("solo2@example.com", "Solo2", "solo2pw", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner.email, "solo2pw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "solo2pw").await;
+    let cookie = format!("{session}; {critical}");
+
+    let resp =
+        post_form_raw(&app, "/me/account/anonymize", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/"),
+    );
+
+    assert!(instance_closed(&app).await, "instance closed");
+    assert_eq!(
+        table_count(&app, "identity.users").await,
+        1,
+        "anonymize keeps the tombstone row",
+    );
+    let lifecycle: String =
+        sqlx::query_scalar("SELECT lifecycle::text FROM identity.users WHERE id = $1")
+            .bind(owner.id.0)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(lifecycle, "anonymized");
+    assert!(
+        table_count(&app, "audit.events").await > 0,
+        "anonymize does not scorch the audit log",
+    );
+
+    let (_, body) = get_with_cookie(&app, "/login", None).await;
+    assert!(body.contains("This server has been closed"));
+}
+
+/// A close that leaves other users behind does NOT close the instance — the
+/// web keeps working normally.
+#[tokio::test]
+async fn close_with_remaining_users_keeps_instance_open() {
+    let app = TestApp::new().await;
+    let owner1 = app
+        .seed_user("a@example.com", "A", "apwapw", InstanceRole::Owner)
+        .await;
+    let _owner2 = app
+        .seed_user("b@example.com", "B", "bpwbpw", InstanceRole::Owner)
+        .await;
+    let session = cookie_name_value(&web_login(&app, &owner1.email, "apwapw").await.unwrap());
+    let sid = app.session_id_for_cookie(&session).await;
+    let csrf = app.csrf_for(sid);
+    let critical = app.sudo_critical_cookie(&session, &csrf, "apwapw").await;
+    let cookie = format!("{session}; {critical}");
+
+    let resp = post_form_raw(&app, "/me/account/delete", &cookie, format!("csrf_token={csrf}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("HX-Redirect").and_then(|v| v.to_str().ok()),
+        Some("/goodbye?mode=deleted"),
+        "with users remaining, it's the normal goodbye — not the closed page",
+    );
+    assert!(!instance_closed(&app).await, "instance stays open while users remain");
+    assert_eq!(
+        table_count(&app, "identity.users").await,
+        1,
+        "the other owner survives",
+    );
+    let (_, body) = get_with_cookie(&app, "/login", None).await;
+    assert!(!body.contains("This server has been closed"), "web still open");
+}
+
 // ── Empty instance: closed page + scorch ──────────────────────────────────
 
 async fn scalar_i64(app: &TestApp, sql: &str) -> i64 {
@@ -3653,7 +3791,7 @@ async fn solo_anonymize_closes_but_keeps_the_tombstone() {
             .await
             .unwrap();
     assert!(email.contains("@purged.invalid"), "tombstone redacted: {email}");
-    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(lifecycle, "anonymized");
     let (status, body) = get_with_cookie(&app, "/login", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("This server has been closed"));

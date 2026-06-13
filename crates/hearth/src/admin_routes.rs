@@ -417,19 +417,18 @@ pub async fn reactivate_member(
     }
 }
 
-/// `POST /admin/users/{id}/delete` — terminal "account removed" state.
-/// Active/Deactivated → SoftDeleted. Revokes sessions, deletes the
-/// credentials row, redacts PII. Content the user authored that other
-/// users have access to is preserved (future content-cleanup hook drops
-/// orphans once the apps platform lands).
-pub async fn delete_member(
+/// `POST /admin/members/{id}/anonymize` — terminal "account closed" state.
+/// Active/Deactivated → Anonymized. Revokes sessions, deletes the
+/// credentials row, redacts PII; the tombstone row stays so anything
+/// attributed to the account survives under `[deleted user]`.
+pub async fn anonymize_member(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     body: Option<Json<LifecycleActionRequest>>,
 ) -> Response {
     let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
-    match admin_logic::perform_soft_delete(&state, &admin, target_id, bypass_code.as_deref()).await {
+    match admin_logic::perform_anonymize(&state, &admin, target_id, bypass_code.as_deref()).await {
         Ok(Outcome::Applied { .. }) => StatusCode::NO_CONTENT.into_response(),
         Ok(Outcome::Pending(row)) => {
             (StatusCode::ACCEPTED, Json(PendingTransitionView::from(row))).into_response()
@@ -438,19 +437,17 @@ pub async fn delete_member(
     }
 }
 
-/// `POST /admin/users/{id}/purge` — terminal "full purge" state.
-/// Active/Deactivated/SoftDeleted → HardDeleted. Today the row-level
-/// effect matches `delete_user`; once content lives in the apps
-/// platform, the content-cleanup hook here drops *all* their content
-/// regardless of collaborators.
-pub async fn purge_member(
+/// `POST /admin/members/{id}/delete` — full removal. Physically deletes the
+/// user row; every `auth.*` row + any invitations they created cascade away.
+/// Only the append-only audit log retains a record that the account existed.
+pub async fn delete_member(
     State(state): State<AppState>,
     admin: AdminUser,
     Path(target_id): Path<Uuid>,
     body: Option<Json<LifecycleActionRequest>>,
 ) -> Response {
     let bypass_code = body.and_then(|Json(r)| r.bypass_recovery_code);
-    match admin_logic::perform_hard_delete(&state, &admin, target_id, bypass_code.as_deref()).await {
+    match admin_logic::perform_delete(&state, &admin, target_id, bypass_code.as_deref()).await {
         Ok(Outcome::Applied { .. }) => StatusCode::NO_CONTENT.into_response(),
         Ok(Outcome::Pending(row)) => {
             (StatusCode::ACCEPTED, Json(PendingTransitionView::from(row))).into_response()

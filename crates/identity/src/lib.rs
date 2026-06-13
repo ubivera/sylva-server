@@ -48,13 +48,13 @@ impl std::fmt::Display for UserId {
 /// - `Active` — normal user.
 /// - `Deactivated` — recoverable suspension. Sessions revoked, login blocked,
 ///   credentials preserved. Reactivatable to `Active`.
-/// - `SoftDeleted` — terminal. The account is "gone": sessions revoked,
-///   credentials deleted, PII redacted in the row. Content the user created
-///   that other users have access to remains; orphaned content is dropped
-///   when the apps platform lands.
-/// - `HardDeleted` — terminal. Full purge: same row-level effect as
-///   `SoftDeleted` today, but the future content-cleanup hook drops *all*
-///   their content regardless of collaborators.
+/// - `Anonymized` — terminal. The account is closed: sessions revoked,
+///   credentials deleted, PII redacted in the row. The tombstone row stays so
+///   anything attributed to it survives under `[deleted user]`.
+///
+/// There is deliberately **no** state for a full *Delete* — that physically
+/// removes the row (see `UserRepository::hard_remove`), so a deleted account
+/// simply no longer exists rather than being marked.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize,
 )]
@@ -64,8 +64,7 @@ pub enum UserLifecycle {
     PendingInvite,
     Active,
     Deactivated,
-    SoftDeleted,
-    HardDeleted,
+    Anonymized,
 }
 
 /// Server-level role. Mirrors `identity.instance_role` in SQL. Owner/Admin
@@ -231,7 +230,7 @@ impl UserRepository {
     /// (every Owner except the initiator + target) for an
     /// Owner-on-Owner pending action.
     ///
-    /// Filters out `Deactivated`, `SoftDeleted`, and `HardDeleted` —
+    /// Filters out `Deactivated` and `Anonymized` —
     /// those Owners can't sign in to veto, so emailing them would
     /// just bounce. Also filters `kind = 'member'` so future Guest-
     /// kind Owners (if that ever exists) don't accidentally surface.
@@ -283,12 +282,10 @@ impl UserRepository {
     }
 
     /// Members in a specific lifecycle state, oldest first. Used by the
-    /// Members page's "Deleted" filter, which surfaces SoftDeleted rows
+    /// Members page's "Anonymized" filter, which surfaces `Anonymized` rows
     /// that [`list_all`] intentionally hides. Always filters to
-    /// `kind = 'member'`; hard-deleted accounts are never returned (we
-    /// expose them via this method only to round-trip the lifecycle
-    /// filter UX, and `HardDeleted` is the one terminal state with no
-    /// useful directory representation).
+    /// `kind = 'member'`. (Deleted accounts have no row at all, so there is
+    /// no terminal state left to surface here besides `Anonymized`.)
     pub async fn list_with_lifecycle(
         &self,
         lifecycle: UserLifecycle,
@@ -443,33 +440,23 @@ impl UserRepository {
         Ok(user)
     }
 
-    /// Transition to `SoftDeleted`: terminal "account removed" state.
-    /// Redacts PII in the row so the user is no longer identifiable from
+    /// Transition to `Anonymized`: terminal "account closed" state. Redacts
+    /// PII in the row so the user is no longer identifiable from
     /// `identity.users`. Returns the original email (pre-redaction) so the
-    /// audit caller can record what was wiped. The caller is responsible
-    /// for revoking sessions, deleting credentials, and running future
-    /// content-cleanup hooks (collaborator-aware) in the same transaction.
-    pub async fn soft_delete(
+    /// audit caller can record what was wiped. The caller is responsible for
+    /// revoking sessions and deleting credentials in the same transaction.
+    /// (A full *Delete* uses [`UserRepository::hard_remove`] instead, which
+    /// drops the row rather than keeping a redacted tombstone.)
+    pub async fn anonymize(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         id: UserId,
     ) -> Result<(User, String)> {
-        redact_and_terminate(tx, id, UserLifecycle::SoftDeleted).await
-    }
-
-    /// Transition to `HardDeleted`: terminal "full purge" state. Same
-    /// row-level effect as `soft_delete` today; once apps exist, the
-    /// content-cleanup hook drops *all* their data regardless of
-    /// collaborators. Returns the original email.
-    pub async fn hard_delete(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        id: UserId,
-    ) -> Result<(User, String)> {
-        redact_and_terminate(tx, id, UserLifecycle::HardDeleted).await
+        redact_and_terminate(tx, id).await
     }
 
     /// Physically remove the user row — the genuine "leave no trace"
-    /// delete, as opposed to `soft_delete`/`hard_delete` which redact PII
-    /// but keep a tombstone row. Every foreign key to `identity.users(id)`
+    /// delete, as opposed to `anonymize` which redacts PII but keeps a
+    /// tombstone row. Every foreign key to `identity.users(id)`
     /// is either `ON DELETE CASCADE` (all of `auth.*`, plus invitations
     /// this user *created*) or `ON DELETE SET NULL` (the audit actor link,
     /// `pending.transitions`, invitations they *accepted*), so this single
@@ -490,14 +477,13 @@ impl UserRepository {
     }
 }
 
-/// Shared implementation for the two terminal transitions. Redacts PII
-/// (email + display_name + locale) in place and sets the requested
-/// terminal lifecycle. Returns the row in its post-update form alongside
-/// the *original* email so the caller can record it in the audit event.
+/// Backs [`UserRepository::anonymize`]. Redacts PII (email + display_name +
+/// locale) in place and sets the terminal `Anonymized` lifecycle. Returns the
+/// row in its post-update form alongside the *original* email so the caller
+/// can record it in the audit event.
 async fn redact_and_terminate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: UserId,
-    new_lifecycle: UserLifecycle,
 ) -> Result<(User, String)> {
     let original_email: String =
         sqlx::query_scalar("SELECT email FROM identity.users WHERE id = $1 FOR UPDATE")
@@ -510,14 +496,13 @@ async fn redact_and_terminate(
          SET email = 'deleted+' || id || '@purged.invalid',
              display_name = '[deleted user]',
              locale = NULL,
-             lifecycle = $2,
+             lifecycle = 'anonymized',
              updated_at = now()
          WHERE id = $1
          RETURNING id, email, display_name, lifecycle, instance_role, kind,
                    locale, created_at, updated_at",
     )
     .bind(id)
-    .bind(new_lifecycle)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -825,8 +810,8 @@ mod tests {
         let json = serde_json::to_string(&UserLifecycle::PendingInvite).unwrap();
         assert_eq!(json, "\"pending_invite\"");
 
-        let json = serde_json::to_string(&UserLifecycle::SoftDeleted).unwrap();
-        assert_eq!(json, "\"soft_deleted\"");
+        let json = serde_json::to_string(&UserLifecycle::Anonymized).unwrap();
+        assert_eq!(json, "\"anonymized\"");
     }
 
     #[test]
@@ -834,8 +819,8 @@ mod tests {
         for value in [
             UserLifecycle::PendingInvite,
             UserLifecycle::Active,
-            UserLifecycle::SoftDeleted,
-            UserLifecycle::HardDeleted,
+            UserLifecycle::Deactivated,
+            UserLifecycle::Anonymized,
         ] {
             let json = serde_json::to_string(&value).unwrap();
             let back: UserLifecycle = serde_json::from_str(&json).unwrap();

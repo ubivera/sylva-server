@@ -533,7 +533,7 @@ async fn notifications_disabled_does_not_block_pending_flow() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Lifecycle actions (deactivate / delete / purge) on Owner targets
+// Lifecycle actions (deactivate / anonymize / delete) on Owner targets
 // ────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -563,6 +563,17 @@ async fn owner_on_owner_deactivate_goes_pending() {
 }
 
 #[tokio::test]
+async fn owner_on_owner_anonymize_goes_pending() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    let resp = app
+        .post(&format!("/api/admin/members/{b_id}/anonymize"), Some(&a_tok), None)
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let body: PendingTransitionView = resp.json();
+    assert_eq!(body.kind, "anonymize");
+}
+
+#[tokio::test]
 async fn owner_on_owner_delete_goes_pending() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     let resp = app
@@ -570,18 +581,7 @@ async fn owner_on_owner_delete_goes_pending() {
         .await;
     resp.assert_status(StatusCode::ACCEPTED);
     let body: PendingTransitionView = resp.json();
-    assert_eq!(body.kind, "soft_delete");
-}
-
-#[tokio::test]
-async fn owner_on_owner_purge_goes_pending() {
-    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
-    let resp = app
-        .post(&format!("/api/admin/members/{b_id}/purge"), Some(&a_tok), None)
-        .await;
-    resp.assert_status(StatusCode::ACCEPTED);
-    let body: PendingTransitionView = resp.json();
-    assert_eq!(body.kind, "hard_delete");
+    assert_eq!(body.kind, "delete");
 }
 
 #[tokio::test]
@@ -626,13 +626,13 @@ async fn bypass_lifecycle_deactivate_applies_immediately() {
 }
 
 #[tokio::test]
-async fn bypass_lifecycle_delete_applies_immediately_and_redacts() {
+async fn bypass_lifecycle_anonymize_applies_immediately_and_redacts() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
     let recovery = app.seed_recovery_code().await;
 
     let resp = app
         .post(
-            &format!("/api/admin/members/{b_id}/delete"),
+            &format!("/api/admin/members/{b_id}/anonymize"),
             Some(&a_tok),
             Some(json!({ "bypass_recovery_code": recovery })),
         )
@@ -646,7 +646,7 @@ async fn bypass_lifecycle_delete_applies_immediately_and_redacts() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(lifecycle, "anonymized");
     assert!(email.starts_with("deleted+") && email.ends_with("@purged.invalid"));
 }
 
@@ -746,9 +746,9 @@ async fn worker_applies_due_lifecycle_deactivate() {
 }
 
 #[tokio::test]
-async fn worker_applies_due_lifecycle_delete_with_redaction() {
+async fn worker_applies_due_anonymize_with_redaction() {
     let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
-    app.post(&format!("/api/admin/members/{b_id}/delete"), Some(&a_tok), None)
+    app.post(&format!("/api/admin/members/{b_id}/anonymize"), Some(&a_tok), None)
         .await
         .assert_status(StatusCode::ACCEPTED);
 
@@ -766,7 +766,7 @@ async fn worker_applies_due_lifecycle_delete_with_redaction() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(lifecycle, "anonymized");
     assert!(email.starts_with("deleted+") && email.ends_with("@purged.invalid"));
 
     // Credentials row gone.
@@ -777,6 +777,35 @@ async fn worker_applies_due_lifecycle_delete_with_redaction() {
             .await
             .unwrap();
     assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn worker_applies_due_delete_removes_row() {
+    let (app, _a_id, a_tok, b_id, _b_tok) = app_with_two_owners().await;
+    app.post(&format!("/api/admin/members/{b_id}/delete"), Some(&a_tok), None)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+
+    sqlx::query("UPDATE pending.transitions SET effective_at = now() - interval '1 minute'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let applied = app.run_pending_transitions_once().await;
+    assert_eq!(applied, 1);
+
+    // A pending Delete, once applied, physically removes the row (+ cascade).
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.users WHERE id = $1")
+        .bind(b_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "worker-applied delete removes the row");
+    let creds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth.credentials WHERE user_id = $1")
+        .bind(b_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(creds, 0);
 }
 
 #[tokio::test]

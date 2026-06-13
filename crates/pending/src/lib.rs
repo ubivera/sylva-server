@@ -52,8 +52,8 @@ pub const VETO_WINDOW: Duration = Duration::hours(72);
 pub enum TransitionKind {
     RoleChange,
     Deactivate,
-    SoftDelete,
-    HardDelete,
+    Anonymize,
+    Delete,
 }
 
 /// Convenience: which kinds correspond to lifecycle actions (everything
@@ -64,16 +64,16 @@ pub use notifications::LifecycleAction;
 pub fn lifecycle_to_kind(action: LifecycleAction) -> TransitionKind {
     match action {
         LifecycleAction::Deactivate => TransitionKind::Deactivate,
-        LifecycleAction::SoftDelete => TransitionKind::SoftDelete,
-        LifecycleAction::HardDelete => TransitionKind::HardDelete,
+        LifecycleAction::Anonymize => TransitionKind::Anonymize,
+        LifecycleAction::Delete => TransitionKind::Delete,
     }
 }
 
 pub fn lifecycle_from_kind(kind: TransitionKind) -> Option<LifecycleAction> {
     match kind {
         TransitionKind::Deactivate => Some(LifecycleAction::Deactivate),
-        TransitionKind::SoftDelete => Some(LifecycleAction::SoftDelete),
-        TransitionKind::HardDelete => Some(LifecycleAction::HardDelete),
+        TransitionKind::Anonymize => Some(LifecycleAction::Anonymize),
+        TransitionKind::Delete => Some(LifecycleAction::Delete),
         TransitionKind::RoleChange => None,
     }
 }
@@ -152,8 +152,8 @@ pub async fn enqueue_role_change(
     .await
 }
 
-/// Insert a pending lifecycle-action row (deactivate / soft_delete /
-/// hard_delete). Same caller responsibilities as
+/// Insert a pending lifecycle-action row (deactivate / anonymize /
+/// delete). Same caller responsibilities as
 /// [`enqueue_role_change`]. Payload is empty `{}` — the kind itself
 /// fully describes the action.
 pub async fn enqueue_lifecycle(
@@ -438,8 +438,8 @@ impl Worker {
         match row.kind {
             TransitionKind::RoleChange => self.apply_role_change(row).await,
             TransitionKind::Deactivate
-            | TransitionKind::SoftDelete
-            | TransitionKind::HardDelete => self.apply_lifecycle(row).await,
+            | TransitionKind::Anonymize
+            | TransitionKind::Delete => self.apply_lifecycle(row).await,
         }
     }
 
@@ -534,7 +534,7 @@ impl Worker {
         Ok(())
     }
 
-    /// Apply a lifecycle transition (deactivate / soft_delete / hard_delete).
+    /// Apply a lifecycle transition (deactivate / anonymize / delete).
     /// All three follow the same transactional shape as role-change: claim
     /// the row, apply the lifecycle change, revoke sessions, audit, enqueue
     /// the applied-notification.
@@ -588,19 +588,19 @@ impl Worker {
                 let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
                 (n, None::<String>)
             }
-            LifecycleAction::SoftDelete => {
+            LifecycleAction::Anonymize => {
                 let (_, original) =
-                    identity::UserRepository::soft_delete(&mut tx, target_user_id).await?;
+                    identity::UserRepository::anonymize(&mut tx, target_user_id).await?;
                 let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
                 auth::delete_credentials(&mut tx, target_user_id).await?;
                 (n, Some(original))
             }
-            LifecycleAction::HardDelete => {
-                let (_, original) =
-                    identity::UserRepository::hard_delete(&mut tx, target_user_id).await?;
-                let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-                auth::delete_credentials(&mut tx, target_user_id).await?;
-                (n, Some(original))
+            LifecycleAction::Delete => {
+                // True removal: the row goes, and every `auth.*` row cascades
+                // with it — so there's no separate session-revoke/credential
+                // delete and no redacted-from email to record.
+                identity::UserRepository::hard_remove(&mut tx, target_user_id).await?;
+                (0, None::<String>)
             }
         };
 
@@ -610,8 +610,8 @@ impl Worker {
         };
         let event_type = match action {
             LifecycleAction::Deactivate => "user_deactivated",
-            LifecycleAction::SoftDelete => "user_deleted",
-            LifecycleAction::HardDelete => "user_purged",
+            LifecycleAction::Anonymize => "account_anonymized",
+            LifecycleAction::Delete => "account_deleted",
         };
         let mut event_data = serde_json::json!({
             "transition_id": row.id,

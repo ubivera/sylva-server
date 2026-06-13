@@ -55,7 +55,7 @@ pub async fn perform_self_anonymize(
     let user_id = user.user.id;
 
     let mut tx = state.db.begin().await?;
-    let (_redacted, original_email) = UserRepository::soft_delete(&mut tx, user_id).await?;
+    let (_redacted, original_email) = UserRepository::anonymize(&mut tx, user_id).await?;
     let revoked = SessionRepository::revoke_all_for_user(&mut tx, user_id).await?;
     auth::delete_credentials(&mut tx, user_id).await?;
     audit::append(

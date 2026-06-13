@@ -150,8 +150,8 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/pending/{id}/modal/veto", get(admin_routes::veto_modal))
         .route("/members/{id}/deactivate", post(admin_routes::deactivate_member))
         .route("/members/{id}/reactivate", post(admin_routes::reactivate_member))
+        .route("/members/{id}/anonymize", post(admin_routes::anonymize_member))
         .route("/members/{id}/delete", post(admin_routes::delete_member))
-        .route("/members/{id}/purge", post(admin_routes::purge_member))
         .route("/members/{id}/role", post(admin_routes::change_member_role))
         .route("/pending", get(pending_routes::pending_page))
         .route(
