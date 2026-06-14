@@ -12,6 +12,19 @@ CREATE TABLE hearth_meta.instance (
     -- forces it TRUE, so a second INSERT (which defaults to TRUE) collides.
     id        BOOLEAN PRIMARY KEY DEFAULT TRUE,
     closed_at TIMESTAMPTZ NULL,
+    -- Owner-editable configuration overrides. NULL means "fall back to the
+    -- env/startup default" (see `hearth::instance::effective`); a set value
+    -- wins at runtime. `smtp_password_enc` is sealed with the instance
+    -- `secret_key` (XChaCha20-Poly1305), never stored in the clear.
+    instance_name      TEXT NULL,
+    notifications_mode  TEXT NULL,
+    smtp_host           TEXT NULL,
+    smtp_port           INT  NULL,
+    smtp_tls            TEXT NULL,
+    smtp_username       TEXT NULL,
+    smtp_password_enc   BYTEA NULL,
+    smtp_from_email     TEXT NULL,
+    smtp_from_name      TEXT NULL,
     CONSTRAINT instance_singleton CHECK (id)
 );
 

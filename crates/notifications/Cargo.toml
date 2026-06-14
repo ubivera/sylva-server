@@ -22,6 +22,7 @@ sqlx = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 lettre = { workspace = true }
+arc-swap = { workspace = true }
 
 identity = { path = "../identity" }
 

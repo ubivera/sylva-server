@@ -3,6 +3,10 @@
    No build step, no preprocessor. */
 
 :root {
+    /* Tells the browser to render native controls (select popups,
+       scrollbars, date pickers) in the active theme. Mirrored per-theme
+       below so the dropdown option list isn't a bright flash in dark mode. */
+    color-scheme: light;
     --color-bg: #fafafa;
     --color-surface: #ffffff;
     --color-surface-alt: #f4f4f5;
@@ -55,6 +59,7 @@
 
 @media (prefers-color-scheme: dark) {
     :root {
+        color-scheme: dark;
         /* Page bg lifted from near-black to a medium-dark gray so cards
            and surfaces can read as either inset (darker) or floating
            (lighter) without losing legibility. Popovers/menus use the
@@ -106,6 +111,7 @@
    elsewhere only adjust accent colours that read fine in either
    mode, so we don't bother mirroring them here. */
 :root[data-theme="dark"] {
+    color-scheme: dark;
     --color-bg: #1f1f21;
     --color-surface: #26262a;
     --color-surface-alt: #2f2f33;
@@ -131,6 +137,7 @@
     --color-primary-soft: #4A338E;
 }
 :root[data-theme="light"] {
+    color-scheme: light;
     --color-bg: #fafafa;
     --color-surface: #ffffff;
     --color-surface-alt: #f4f4f5;
@@ -3701,6 +3708,23 @@ dialog.action-dialog.action-dialog-large[open] {
     font: inherit;
 }
 .settings-row-control input:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -2px;
+}
+/* Delivery-mode dropdown — matches the text inputs in the same column.
+   The native option popup follows the per-theme `color-scheme` set on
+   `:root`, so it renders dark in dark mode instead of a bright flash. */
+.settings-select {
+    width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--color-popover);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    font: inherit;
+    cursor: pointer;
+}
+.settings-select:focus-visible {
     outline: 2px solid var(--color-primary);
     outline-offset: -2px;
 }

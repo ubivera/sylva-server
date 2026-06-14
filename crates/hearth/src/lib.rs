@@ -14,6 +14,7 @@ pub mod job_object;
 pub mod mfa;
 pub mod postgres;
 pub mod rate_limit;
+pub mod settings_logic;
 pub mod shutdown;
 pub mod signed_token;
 pub mod webauthn;
@@ -105,15 +106,25 @@ async fn serve(
     let sessions = auth::SessionRepository::new(pool.clone());
     let invitations = identity::InvitationRepository::new(pool.clone());
 
-    let notifier = build_notifier(&config.notifications)?;
-    let notif_worker = notifications::Worker::new(pool.clone(), notifier);
+    // Effective config = DB overrides (Owner Settings page) layered over the
+    // env defaults. Seeds the hot-swappable `instance_name` + `notifier` cells;
+    // the notifier cell is shared with the worker so a live SMTP change applies
+    // on the next send.
+    let secret_key = std::sync::Arc::new(config.load_secret_key()?);
+    let effective = instance::effective(&pool, config, &secret_key).await?;
+    let notifier = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(build_notifier(
+        &effective.notifications,
+    )?));
+    let instance_name =
+        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(effective.instance_name));
+    let notif_worker = notifications::Worker::new(pool.clone(), notifier.clone());
     let (worker_shutdown_tx, worker_shutdown_rx) =
         tokio::sync::watch::channel::<bool>(false);
     let notif_handle = tokio::spawn(
         notif_worker.run_forever(std::time::Duration::from_secs(5), worker_shutdown_rx.clone()),
     );
     tracing::info!(
-        mode = ?notifications_mode_label(&config.notifications),
+        mode = ?notifications_mode_label(&effective.notifications),
         "notification worker started"
     );
 
@@ -136,10 +147,12 @@ async fn serve(
         sessions,
         invitations,
         public_base_url: config.public_base_url.clone(),
-        instance_name: config.instance_name.clone(),
+        instance_name,
+        notifier,
+        env_config: std::sync::Arc::new(config.clone()),
         csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
         rate_limiter: std::sync::Arc::new(rate_limit::RateLimiter::auth_default()),
-        secret_key: std::sync::Arc::new(config.load_secret_key()?),
+        secret_key,
         trust_proxy: config.trust_proxy,
         instance_closed,
     };

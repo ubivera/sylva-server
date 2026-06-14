@@ -959,11 +959,17 @@ pub fn backoff_for(attempts: i32) -> Duration {
 #[derive(Clone)]
 pub struct Worker {
     pool: PgPool,
-    notifier: NotifierImpl,
+    /// Shared, hot-swappable notifier. The Owner Settings page rebuilds it
+    /// (e.g. new SMTP config) and `store`s into the same cell, so the next
+    /// drain cycle picks it up without a restart.
+    notifier: std::sync::Arc<arc_swap::ArcSwap<NotifierImpl>>,
 }
 
 impl Worker {
-    pub fn new(pool: PgPool, notifier: NotifierImpl) -> Self {
+    pub fn new(
+        pool: PgPool,
+        notifier: std::sync::Arc<arc_swap::ArcSwap<NotifierImpl>>,
+    ) -> Self {
         Self { pool, notifier }
     }
 
@@ -992,9 +998,10 @@ impl Worker {
         .await?;
 
         let count = claimed.len();
+        // Snapshot the current notifier for this drain cycle.
+        let notifier = self.notifier.load();
         for row in claimed {
-            let outcome = self
-                .notifier
+            let outcome = notifier
                 .send(&OutboundMessage {
                     to: row.recipient_email.clone(),
                     subject: row.subject.clone(),

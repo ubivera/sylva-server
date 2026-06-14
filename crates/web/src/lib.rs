@@ -1,6 +1,7 @@
 pub mod admin_routes;
 pub mod pending_routes;
 pub mod routes;
+pub mod settings_routes;
 pub mod views;
 
 use axum::{
@@ -157,6 +158,31 @@ pub fn ui_router(state: AppState) -> Router {
         .route(
             "/pending/{id}/veto",
             post(pending_routes::veto_pending),
+        )
+        // Owner-only instance settings (page + identity / notifications saves +
+        // a test-send). Role is enforced in each handler.
+        .route("/settings", get(settings_routes::settings_page))
+        .route(
+            "/settings/identity",
+            post(settings_routes::settings_identity_submit),
+        )
+        .route(
+            "/settings/notifications",
+            post(settings_routes::settings_notifications_submit),
+        )
+        .route(
+            "/settings/notifications/test",
+            post(settings_routes::settings_test_email),
+        )
+        // Owner force-close (scorch + close the whole instance). Critical-reauth
+        // gated; the confirm dialog is fetched into `#modal-host` on demand.
+        .route(
+            "/modals/settings/shutdown",
+            get(settings_routes::settings_shutdown_modal),
+        )
+        .route(
+            "/settings/shutdown",
+            post(settings_routes::settings_shutdown_submit),
         )
         .route("/logout", post(routes::logout_submit))
         .nest_service("/assets", ServeDir::new(assets_dir()))

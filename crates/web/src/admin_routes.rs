@@ -362,7 +362,7 @@ pub async fn invite_form(
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -402,7 +402,7 @@ pub async fn invite_submit(
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
     let pending_count = pending_count_for(&state, admin.0.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &admin.0.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -607,7 +607,7 @@ pub async fn reissue_invitation(
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
     let pending_count = pending_count_for(&state, admin.0.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &admin.0.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -784,7 +784,7 @@ pub async fn invite_modal_fragment(
     };
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &admin.0.user,
         csrf_token: &csrf_token,
         pending_count: None,

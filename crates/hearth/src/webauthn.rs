@@ -58,7 +58,7 @@ pub fn build(public_base_url: &str, rp_name: &str) -> anyhow::Result<Webauthn> {
 
 /// Whether passkeys are configurable on this instance (RP can be built).
 pub fn available(state: &AppState) -> bool {
-    build(&state.public_base_url, &state.instance_name).is_ok()
+    build(&state.public_base_url, &state.instance_name.load()).is_ok()
 }
 
 // ── Public read API (used by the Security-tab UI + login branch) ──────────
@@ -120,7 +120,7 @@ pub async fn start_registration(
     state: &AppState,
     user: &User,
 ) -> anyhow::Result<(Uuid, Value)> {
-    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let webauthn = build(&state.public_base_url, &state.instance_name.load())?;
     let exclude = existing_cred_ids(&state.db, user.id).await?;
     let exclude = if exclude.is_empty() { None } else { Some(exclude) };
     let (ccr, reg_state) =
@@ -140,7 +140,7 @@ pub async fn finish_registration(
     label: &str,
     credential_json: &str,
 ) -> anyhow::Result<()> {
-    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let webauthn = build(&state.public_base_url, &state.instance_name.load())?;
     let reg: RegisterPublicKeyCredential = serde_json::from_str(credential_json)
         .context("malformed passkey registration response")?;
     let state_json = take_challenge(&state.db, user.id, challenge_id, PURPOSE_REGISTER)
@@ -172,7 +172,7 @@ pub async fn start_authentication(
     if passkeys.is_empty() {
         return Ok(None);
     }
-    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let webauthn = build(&state.public_base_url, &state.instance_name.load())?;
     let creds: Vec<Passkey> = passkeys.into_iter().map(|(_, pk)| pk).collect();
     let (rcr, auth_state) = webauthn.start_passkey_authentication(&creds)?;
     let challenge_id =
@@ -189,7 +189,7 @@ pub async fn finish_authentication(
     challenge_id: Uuid,
     credential_json: &str,
 ) -> anyhow::Result<bool> {
-    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let webauthn = build(&state.public_base_url, &state.instance_name.load())?;
     let pkc: PublicKeyCredential = match serde_json::from_str(credential_json) {
         Ok(c) => c,
         Err(err) => {
@@ -240,7 +240,7 @@ pub async fn finish_authentication(
 /// options — the client ignores that field to drive a click-to-pick modal
 /// instead of autofill.)
 pub async fn start_discoverable(state: &AppState) -> anyhow::Result<(Uuid, Value)> {
-    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let webauthn = build(&state.public_base_url, &state.instance_name.load())?;
     let (rcr, disc_state) = webauthn.start_discoverable_authentication()?;
     let challenge_id =
         insert_discoverable_challenge(&state.db, &serde_json::to_value(&disc_state)?).await?;
@@ -257,7 +257,7 @@ pub async fn finish_discoverable(
     challenge_id: Uuid,
     credential_json: &str,
 ) -> anyhow::Result<Option<UserId>> {
-    let webauthn = build(&state.public_base_url, &state.instance_name)?;
+    let webauthn = build(&state.public_base_url, &state.instance_name.load())?;
     let pkc: PublicKeyCredential = match serde_json::from_str(credential_json) {
         Ok(c) => c,
         Err(err) => {

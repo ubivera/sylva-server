@@ -101,7 +101,7 @@ pub async fn pending_page(
 
     let pending_count = Some(active.len() as u32);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count,

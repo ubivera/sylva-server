@@ -2,13 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
+
 use auth::SessionRepository;
 use axum::{Router, routing::{get, patch, post}};
 use identity::{InvitationRepository, UserRepository};
 use sqlx::PgPool;
-use tower_http::trace::TraceLayer;
 
-use crate::{account_routes, admin_routes, auth_routes, csrf, health};
+use crate::{account_routes, admin_routes, auth_routes, csrf};
 
 /// Shared state for every Hearth HTTP handler. Cloning is cheap - every
 /// field is itself a handle (Pool, Repository wrappers, Instant, Arc).
@@ -24,10 +25,20 @@ pub struct AppState {
     /// `HEARTH_PUBLIC_BASE_URL`; reverse proxies in production override
     /// the default loopback value.
     pub public_base_url: String,
-    /// Operator-chosen display name for this Hearth instance. Shown in
-    /// the admin UI chrome and page titles. Set from
-    /// `HEARTH_INSTANCE_NAME` (default `"Hearth"`).
-    pub instance_name: String,
+    /// Operator-chosen display name for this instance, shown in the chrome +
+    /// page titles. Hot-swappable: seeded at startup from the DB override or
+    /// `HEARTH_INSTANCE_NAME`, and replaced live when an Owner edits it on the
+    /// Settings page. Read via `.load()` at use-time.
+    pub instance_name: Arc<ArcSwap<String>>,
+    /// Shared, hot-swappable notification backend. Same cell the notification
+    /// worker drains from, so an Owner saving new SMTP config on the Settings
+    /// page takes effect on the next send (no restart). See `crate::instance`.
+    pub notifier: Arc<ArcSwap<notifications::NotifierImpl>>,
+    /// The frozen env/startup [`crate::config::Config`] — the baseline the
+    /// Owner Settings page overlays DB overrides on. Held so a save can
+    /// recompute the effective config ([`crate::instance::effective`]) and
+    /// re-seed the hot-swappable cells above. See [`crate::settings_logic`].
+    pub env_config: Arc<crate::config::Config>,
     /// Per-process secret for deriving CSRF tokens from session ids.
     /// Generated on startup; restart invalidates in-flight forms but not
     /// sessions. Behind an `Arc` so cloning [`AppState`] doesn't copy 32
@@ -49,48 +60,6 @@ pub struct AppState {
     /// flipped when a close empties the instance, so the closed-page
     /// middleware never hits the DB on the hot path. See [`crate::instance`].
     pub instance_closed: Arc<AtomicBool>,
-}
-
-/// Convenience used by the integration test harness. Constructs the
-/// shared [`AppState`] and returns the JSON API surface nested under
-/// `/api`. Production composition happens in
-/// [`crate::run`] and composes a UI router alongside this.
-pub fn router(
-    started_at: Instant,
-    db: PgPool,
-    users: UserRepository,
-    sessions: SessionRepository,
-    invitations: InvitationRepository,
-    public_base_url: String,
-    instance_name: String,
-) -> Router {
-    let state = AppState {
-        started_at,
-        db,
-        users,
-        sessions,
-        invitations,
-        public_base_url,
-        instance_name,
-        csrf_secret: Arc::new(csrf::generate_secret()),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::auth_default()),
-        // Ephemeral key for this test-harness constructor; production
-        // composition in `crate::run` loads the persistent key.
-        secret_key: Arc::new(csrf::generate_secret()),
-        // Test convenience constructor: trust forwarding headers so tests
-        // can simulate distinct clients via `X-Forwarded-For`.
-        trust_proxy: true,
-        instance_closed: Arc::new(AtomicBool::new(false)),
-    };
-
-    let health = Router::new()
-        .route("/health", get(health::handler))
-        .with_state(state.clone());
-
-    Router::new()
-        .nest("/api", api_router(state))
-        .merge(health)
-        .layer(TraceLayer::new_for_http())
 }
 
 /// Build the JSON API router with state already applied. Returned with

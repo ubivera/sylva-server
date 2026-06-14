@@ -24,11 +24,13 @@ fn asset_version() -> &'static str {
     })
 }
 
-/// Per-request context for authenticated chrome. Borrowed pointers so
-/// handlers can pass references straight from `AppState` + the
-/// authenticated user without cloning.
+/// Per-request context for authenticated chrome. Mostly borrowed pointers so
+/// handlers can pass references straight from `AppState` + the authenticated
+/// user without cloning; `instance_name` is a cheap `Arc<String>` snapshot of
+/// the hot-swappable `AppState::instance_name` cell (Owner-editable at runtime).
 pub struct ChromeContext<'a> {
-    pub instance_name: &'a str,
+    /// Instance display name, read from the live (Owner-editable) cell.
+    pub instance_name: std::sync::Arc<String>,
     pub user: &'a User,
     /// CSRF token for this session — derived via
     /// [`hearth::csrf::compute_token`]. Embed in every state-changing
@@ -60,6 +62,7 @@ pub enum PageId {
     Profile,
     Members,
     Pending,
+    Settings,
 }
 
 /// Sortable column on `/users`. Default is `Joined` ascending, which
@@ -353,7 +356,7 @@ fn shell_app_inner(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " · " (ctx.instance_name) }
+                title { (title) " · " (ctx.instance_name.as_str()) }
                 // Theme bootstrap runs before the stylesheet link so
                 // it can stamp `<html data-theme>` ahead of the first
                 // paint — no flash of system-theme before the saved
@@ -1069,7 +1072,7 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                     }
                     span class="brand-prefix" { "Sylva" }
                     span class="brand-sep" { " · " }
-                    span class="brand-instance" { (ctx.instance_name) }
+                    span class="brand-instance" { (ctx.instance_name.as_str()) }
                 }
             }
 
@@ -1094,6 +1097,17 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                         current == PageId::Members,
                         ctx.pending_count,
                         users_icon(),
+                    ))
+                }
+                // Owner-only: instance configuration. Admins manage users;
+                // Owners configure the instance. Defense-in-depth — `/settings`
+                // re-checks the role server-side.
+                @if is_owner(ctx.user.instance_role) {
+                    (nav_link(
+                        "/settings",
+                        "Settings",
+                        current == PageId::Settings,
+                        settings_icon(),
                     ))
                 }
             }
@@ -1485,7 +1499,7 @@ pub fn instance_closed_page() -> Markup {
                 "is no longer in use and there's nothing here anymore. For users, "
                 "feel free to close this tab and move on. Desktop and mobile apps will "
                 "no longer sync any of your data, and will switch to offline mode on "
-                "next use. For owners, please shut down server application one last  "
+                "next use. For owners, please shut down the server application one last  "
                 "time and uninstall the software from the host."
             }
         }
@@ -6195,6 +6209,356 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
 fn render_banner(_banner: &MembersBanner<'_>) -> Markup {
     html! {}
 }
+
+// ── Owner Settings page ───────────────────────────────────────────────────
+
+/// Owner-only instance configuration page. Two sections: instance identity
+/// (display name) and email/notifications (mode + SMTP). The notifications
+/// save is reauth-gated (it carries credentials); identity is CSRF-only. Both
+/// apply live — the handlers swap the hot-reloadable `AppState` cells.
+pub fn settings_page(
+    ctx: &ChromeContext,
+    notifications: &hearth::config::NotificationsConfig,
+    smtp_password_set: bool,
+) -> Markup {
+    let content = html! {
+        (settings_identity_section(ctx))
+        hr class="settings-divider";
+        (settings_notifications_section(ctx, notifications, smtp_password_set))
+        hr class="settings-divider";
+        (settings_danger_section())
+        script { (maud::PreEscaped(SETTINGS_SMTP_TOGGLE_JS)) }
+    };
+    shell_app_wide(ctx, "Settings", PageId::Settings, content)
+}
+
+/// Instance-identity section: the display-name override. CSRF-only (no
+/// credentials change), submitted via htmx; the handler redirects back with a
+/// toast so the re-rendered sidebar brand reflects the new name immediately.
+fn settings_identity_section(ctx: &ChromeContext) -> Markup {
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" { (settings_icon()) }
+                div {
+                    h3 { "Instance" }
+                    p class="settings-section-tagline" {
+                        "The name shown in the sidebar and on page titles."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                form id="form-settings-identity"
+                     class="settings-row"
+                     hx-post="/settings/identity"
+                     hx-swap="none" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row-label" {
+                        label for="settings-instance-name" { "Display name" }
+                        p class="settings-row-hint" {
+                            "Up to 64 characters. Leaving it blank restores the "
+                            "configured default."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        input type="text" id="settings-instance-name"
+                              name="instance_name" value=(ctx.instance_name.as_str())
+                              maxlength="64" autocomplete="off";
+                        button type="submit" class="btn-secondary" { "Save" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Email / notifications section: mode select + SMTP fields. Reauth-gated — the
+/// Save button (in the header) drives `REAUTH_CHAIN_JS` via `data-reauth-confirm`,
+/// which re-posts the form over htmx after a step-up. The password field is
+/// write-only (`smtp_password`, never the literal `password` the chain strips)
+/// and shows "saved" vs "not set" without revealing the secret.
+fn settings_notifications_section(
+    ctx: &ChromeContext,
+    notifications: &hearth::config::NotificationsConfig,
+    smtp_password_set: bool,
+) -> Markup {
+    use hearth::config::{NotificationsConfig, SmtpTls};
+    let smtp = match notifications {
+        NotificationsConfig::Smtp(s) => Some(s),
+        _ => None,
+    };
+    let mode = match notifications {
+        NotificationsConfig::Disabled => "disabled",
+        NotificationsConfig::Log => "log",
+        NotificationsConfig::Smtp(_) => "smtp",
+    };
+    let port = smtp.map(|s| s.port).unwrap_or(587);
+    let port_str = port.to_string();
+    let tls_val = match smtp.map(|s| s.tls) {
+        Some(SmtpTls::Implicit) => "implicit",
+        Some(SmtpTls::None) => "none",
+        _ => "starttls",
+    };
+    let host = smtp.map(|s| s.host.as_str()).unwrap_or_default();
+    let username = smtp.map(|s| s.username.as_str()).unwrap_or_default();
+    let from_email = smtp.map(|s| s.from_email.as_str()).unwrap_or_default();
+    let from_name = smtp.and_then(|s| s.from_name.as_deref()).unwrap_or_default();
+    let pw_placeholder = if smtp_password_set {
+        "Saved — leave blank to keep"
+    } else {
+        "SMTP password"
+    };
+    let smtp_hidden = mode != "smtp";
+
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header settings-section-header-actions" {
+                div class="settings-section-heading" {
+                    span class="settings-section-icon" aria-hidden="true" { (mail_icon()) }
+                    div {
+                        h3 { "Email" }
+                        p class="settings-section-tagline" {
+                            "How the instance sends mail — invitations and "
+                            "account notifications."
+                        }
+                    }
+                }
+                // Carries credentials → reauth-gated. The button references the
+                // form by id; REAUTH_CHAIN_JS re-posts it after the step-up.
+                button type="button" class="btn-secondary"
+                       data-reauth-confirm="form-settings-notifications" {
+                    "Save email settings"
+                }
+            }
+            div class="settings-section-body" {
+                form id="form-settings-notifications"
+                     method="post" action="/settings/notifications" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row" {
+                        div class="settings-row-label" {
+                            label for="settings-notifications-mode" { "Delivery mode" }
+                            p class="settings-row-hint" {
+                                "Disabled sends nothing. Log records without "
+                                "sending. SMTP delivers real email."
+                            }
+                        }
+                        div class="settings-row-control" {
+                            select name="mode" id="settings-notifications-mode"
+                                   class="settings-select" {
+                                option value="disabled" selected[mode == "disabled"] {
+                                    "Disabled"
+                                }
+                                option value="log" selected[mode == "log"] { "Log only" }
+                                option value="smtp" selected[mode == "smtp"] { "SMTP" }
+                            }
+                        }
+                    }
+                    div data-smtp-fields hidden[smtp_hidden] {
+                        (settings_text_row("settings-smtp-host", "smtp_host",
+                            "SMTP host", "text", host, "mail.example.com"))
+                        (settings_text_row("settings-smtp-port", "smtp_port",
+                            "Port", "number", &port_str, "587"))
+                        div class="settings-row" {
+                            div class="settings-row-label" {
+                                label for="settings-smtp-tls" { "Encryption" }
+                            }
+                            div class="settings-row-control" {
+                                select name="smtp_tls" id="settings-smtp-tls"
+                                       class="settings-select" {
+                                    option value="starttls" selected[tls_val == "starttls"] {
+                                        "STARTTLS"
+                                    }
+                                    option value="implicit" selected[tls_val == "implicit"] {
+                                        "Implicit TLS"
+                                    }
+                                    option value="none" selected[tls_val == "none"] { "None" }
+                                }
+                            }
+                        }
+                        (settings_text_row("settings-smtp-username", "smtp_username",
+                            "Username", "text", username, "user@example.com"))
+                        div class="settings-row" {
+                            div class="settings-row-label" {
+                                label for="settings-smtp-password" { "Password" }
+                                p class="settings-row-hint" {
+                                    "Stored encrypted. Leave blank to keep the "
+                                    "current password."
+                                }
+                            }
+                            div class="settings-row-control" {
+                                input type="password" id="settings-smtp-password"
+                                      name="smtp_password" placeholder=(pw_placeholder)
+                                      autocomplete="off";
+                            }
+                        }
+                        (settings_text_row("settings-smtp-from-email", "smtp_from_email",
+                            "From address", "email", from_email, "noreply@example.com"))
+                        (settings_text_row("settings-smtp-from-name", "smtp_from_name",
+                            "From name", "text", from_name, "Sylva Hearth"))
+                    }
+                }
+
+                // Sends through the *saved* notifier (configure → save → test),
+                // not unsaved form values. CSRF-only; reports the result inline.
+                form class="settings-row"
+                     hx-post="/settings/notifications/test" hx-swap="none" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row-label" {
+                        label { "Test delivery" }
+                        p class="settings-row-hint" {
+                            "Sends a test message to your address using the saved "
+                            "settings."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        button type="submit" class="btn-secondary" {
+                            "Send test email"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Danger zone: the Owner can permanently close the whole instance. Mirrors
+/// the account-close section's restrained-red styling; the button opens the
+/// confirm dialog fetched from `/modals/settings/shutdown`.
+fn settings_danger_section() -> Markup {
+    html! {
+        section class="settings-section settings-section-danger" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" { (trash_icon()) }
+                div {
+                    h3 { "Close this server" }
+                    p class="settings-section-tagline" {
+                        "Permanently shut down the whole instance and erase all of \
+                         its data, for everyone."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                div class="settings-danger-row" {
+                    p class="settings-row-hint" {
+                        "Every account and everything created on this server is "
+                        "removed, the server is closed for all members, and this "
+                        "cannot be undone — the same teardown as the last member "
+                        "deleting their account. Use it only to decommission the "
+                        "instance."
+                    }
+                    div class="settings-row-actions" {
+                        button type="button" class="btn-danger-ghost"
+                               data-open-modal="/modals/settings/shutdown" {
+                            "Close this server"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Confirm dialog for closing the whole server — fetched into `#modal-host`
+/// from `/modals/settings/shutdown`. Two gates before the button enables (an
+/// "I understand" checkbox + typing the server's name, wired by
+/// `ACCOUNT_CLOSE_GATE_JS`), then the **critical** re-auth
+/// (`data-reauth-critical`) always re-prompts before the scorch runs.
+pub fn settings_shutdown_modal(ctx: &ChromeContext) -> Markup {
+    let name = ctx.instance_name.as_str();
+    html! {
+        dialog id="dlg-settings-shutdown" class="action-dialog action-dialog-centered" {
+            form id="form-settings-shutdown" method="post" action="/settings/shutdown" {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-danger" { (trash_icon()) }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 class="dialog-center-title" { "Close this server" }
+                p class="dialog-description dialog-center-text" {
+                    "This permanently shuts down " strong { (name) } " and erases "
+                    "every account and all data on it. Everyone is signed out and "
+                    "the server shows a closed page from now on."
+                }
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { "This wipes all data for everyone and cannot be undone." }
+                }
+                (csrf_input(ctx.csrf_token))
+                label class="confirm-checkbox-field" {
+                    input type="checkbox" class="member-checkbox" data-close-ack;
+                    span { "I understand this permanently closes the server for all members." }
+                }
+                div class="field confirm-name-field" {
+                    label for="confirm-shutdown-name" {
+                        "Type the server name " strong { "\"" (name) "\"" } " to confirm"
+                    }
+                    input type="text" id="confirm-shutdown-name" data-close-email=(name)
+                          autocomplete="off" spellcheck="false" autocapitalize="off";
+                }
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn-danger"
+                           data-reauth-confirm="form-settings-shutdown"
+                           data-reauth-critical
+                           disabled {
+                        "Close this server"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One label+input row for the SMTP form.
+fn settings_text_row(
+    id: &str,
+    name: &str,
+    label_text: &str,
+    input_type: &str,
+    value: &str,
+    placeholder: &str,
+) -> Markup {
+    html! {
+        div class="settings-row" {
+            div class="settings-row-label" {
+                label for=(id) { (label_text) }
+            }
+            div class="settings-row-control" {
+                input type=(input_type) id=(id) name=(name) value=(value)
+                      placeholder=(placeholder) autocomplete="off";
+            }
+        }
+    }
+}
+
+/// Envelope glyph for the Email section header. Stroke uses `currentColor`.
+fn mail_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            rect x="2" y="4" width="20" height="16" rx="2" {}
+            path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" {}
+        }
+    }
+}
+
+/// Toggles the SMTP field block based on the delivery-mode select, on load +
+/// change, so the credential fields only show when mode is SMTP.
+const SETTINGS_SMTP_TOGGLE_JS: &str = r#"
+(function() {
+  var sel = document.querySelector('select[name="mode"]');
+  var fields = document.querySelector('[data-smtp-fields]');
+  if (!sel || !fields) return;
+  function sync() { fields.hidden = (sel.value !== 'smtp'); }
+  sel.addEventListener('change', sync);
+  sync();
+})();
+"#;
 
 /// Kind of toast — drives the icon + colour palette. Three flavours:
 ///

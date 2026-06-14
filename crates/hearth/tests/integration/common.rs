@@ -180,10 +180,15 @@ fn workspace_root() -> PathBuf {
 pub struct TestApp {
     pub router: Router,
     pub pool: PgPool,
-    /// Test-side notification worker. Defaults to [`notifications::NotifierImpl::Log`]
-    /// — tests that need to observe failure paths swap it via
-    /// [`TestApp::set_notifier`].
-    pub notification_worker: std::sync::Mutex<notifications::Worker>,
+    /// Test-side notification worker, sharing the [`Self::notifier`] cell with
+    /// `AppState` (defaults to [`notifications::NotifierImpl::Log`]). Tests that
+    /// observe failure paths swap the notifier via [`TestApp::set_notifier`].
+    pub notification_worker: notifications::Worker,
+    /// Shared, hot-swappable notifier cell — the same `Arc` wired into
+    /// `AppState::notifier` and the worker, mirroring production. Flipping it
+    /// via [`TestApp::set_notifier`] is observed by the worker's next drain and
+    /// by any handler reading `AppState::notifier`.
+    pub notifier: std::sync::Arc<arc_swap::ArcSwap<notifications::NotifierImpl>>,
     /// The CSRF secret used by this app's `AppState`. Held here so tests
     /// can compute valid tokens via [`TestApp::csrf_for`] without scraping
     /// rendered HTML.
@@ -252,6 +257,12 @@ impl TestApp {
         // `hearth::serve` and `web::ui_router`.
         let csrf_secret = std::sync::Arc::new(hearth::csrf::generate_secret());
         let secret_key = std::sync::Arc::new(hearth::csrf::generate_secret());
+        // Shared notifier cell: production wires the same `Arc` into both
+        // `AppState` and the worker so an Owner's live SMTP change is picked up
+        // on the next drain. Tests flip it via `set_notifier`.
+        let notifier = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            notifications::NotifierImpl::Log,
+        ));
         let app_state = app::AppState {
             started_at: Instant::now(),
             db: pool.clone(),
@@ -259,7 +270,20 @@ impl TestApp {
             sessions,
             invitations,
             public_base_url: "http://localhost:8443".to_string(),
-            instance_name: "test-instance".to_string(),
+            instance_name: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                "test-instance".to_string(),
+            )),
+            notifier: notifier.clone(),
+            // Env baseline for the effective-config model — kept consistent
+            // with the seeded cells above (name "test-instance", log notifier).
+            env_config: std::sync::Arc::new(
+                hearth::config::Config::from_env_lookup(|k| match k {
+                    "HEARTH_INSTANCE_NAME" => Some("test-instance".to_string()),
+                    "HEARTH_NOTIFICATIONS_MODE" => Some("log".to_string()),
+                    _ => None,
+                })
+                .expect("default test config parses"),
+            ),
             csrf_secret: csrf_secret.clone(),
             rate_limiter: std::sync::Arc::new(hearth::rate_limit::RateLimiter::auth_default()),
             secret_key: secret_key.clone(),
@@ -282,13 +306,13 @@ impl TestApp {
             .merge(web::ui_router(app_state))
             .merge(health);
 
-        let worker =
-            notifications::Worker::new(pool.clone(), notifications::NotifierImpl::Log);
+        let worker = notifications::Worker::new(pool.clone(), notifier.clone());
 
         TestApp {
             router,
             pool,
-            notification_worker: std::sync::Mutex::new(worker),
+            notification_worker: worker,
+            notifier,
             csrf_secret,
             secret_key,
             db_name,
@@ -387,25 +411,18 @@ impl TestApp {
             .expect("looking up session by token hash")
     }
 
-    /// Replace the notification worker's notifier (e.g. with
-    /// `NotifierImpl::AlwaysFail` to drive the retry/dead path). Returns
-    /// nothing; callers that need to flip back to log mode build a fresh
-    /// worker with `notifications::NotifierImpl::Log`.
+    /// Replace the live notifier (e.g. with `NotifierImpl::AlwaysFail` to drive
+    /// the retry/dead path, or back to `NotifierImpl::Log`). Stores into the
+    /// shared [`Self::notifier`] cell, so the worker picks it up on its next
+    /// drain — the same hot-swap path production uses.
     pub fn set_notifier(&self, notifier: notifications::NotifierImpl) {
-        let mut guard = self.notification_worker.lock().expect("worker mutex poisoned");
-        *guard = notifications::Worker::new(self.pool.clone(), notifier);
+        self.notifier.store(std::sync::Arc::new(notifier));
     }
 
     /// Run a single drain cycle of the notification worker. Returns the
     /// number of rows processed.
     pub async fn run_notifications_once(&self) -> usize {
-        // Clone the worker out so we don't hold the mutex across the await.
-        let worker = self
-            .notification_worker
-            .lock()
-            .expect("worker mutex poisoned")
-            .clone();
-        worker
+        self.notification_worker
             .process_pending()
             .await
             .expect("notification worker cycle failed")

@@ -449,7 +449,7 @@ pub async fn me_page(
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -501,7 +501,7 @@ pub async fn account_settings_modal(
         .await
         .unwrap_or(false);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -551,7 +551,7 @@ async fn sessions_section_response(
     let sessions = active_sessions(state, auth.user.id).await;
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -740,7 +740,7 @@ pub async fn reauth_modal(
     let (has_totp, has_passkey) = enrolled_factors(&state, auth.user.id).await;
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -919,7 +919,7 @@ fn reauth_modal_error(
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -1374,7 +1374,7 @@ fn totp_enroll_response(
     error: Option<&str>,
 ) -> Response {
     let secret_b32 = auth::totp::base32_encode(secret);
-    let uri = auth::totp::otpauth_uri(&state.instance_name, &auth.user.email, &secret_b32);
+    let uri = auth::totp::otpauth_uri(&state.instance_name.load(), &auth.user.email, &secret_b32);
     let qr = render_qr_svg(&uri);
     let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
     Html(views::totp_enroll_modal_content(&qr, &secret_b32, cred_id, &csrf, error).into_string())
@@ -1397,7 +1397,7 @@ async fn totp_section_response(
     };
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -1545,7 +1545,7 @@ pub async fn me_totp_confirm(
                 .unwrap_or_default();
             let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
             let ctx = views::ChromeContext {
-                instance_name: &state.instance_name,
+                instance_name: state.instance_name.load_full(),
                 user: &auth.user,
                 csrf_token: &csrf,
                 pending_count: None,
@@ -1697,7 +1697,7 @@ async fn totp_removed_response(
     };
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -1736,7 +1736,7 @@ async fn passkey_section_response(
     let available = hearth::webauthn::available(state);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -1851,7 +1851,7 @@ pub async fn me_passkey_finish(
             let available = hearth::webauthn::available(&state);
             let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
             let ctx = views::ChromeContext {
-                instance_name: &state.instance_name,
+                instance_name: state.instance_name.load_full(),
                 user: &auth.user,
                 csrf_token: &csrf,
                 pending_count: None,
@@ -1988,7 +1988,7 @@ async fn passkey_removed_response(
     let available = hearth::webauthn::available(state);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -2061,7 +2061,7 @@ fn render_name_partial(
 ) -> Response {
     let csrf_token = csrf::compute_token(&state.csrf_secret, session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user,
         csrf_token: &csrf_token,
         pending_count: None,
@@ -2328,7 +2328,7 @@ pub async fn members_page(
             .collect();
 
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -2412,7 +2412,7 @@ pub struct GoodbyeQuery {
 /// Build the response that ends a just-closed account's session: tell htmx to
 /// navigate to the public `/goodbye` page, and clear the session, sudo, and
 /// critical-sudo cookies. `location` is a fixed same-origin path.
-fn account_closed_response(state: &AppState, location: &'static str) -> Response {
+pub(crate) fn account_closed_response(state: &AppState, location: &'static str) -> Response {
     let mut resp = StatusCode::OK.into_response();
     resp.headers_mut()
         .insert("HX-Redirect", axum::http::HeaderValue::from_static(location));
@@ -2535,7 +2535,7 @@ pub async fn account_close_modal(
         .unwrap_or(false);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count: None,
