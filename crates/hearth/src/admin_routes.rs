@@ -157,6 +157,7 @@ pub async fn list_audit(
         since: q.since,
         before_seqno: q.cursor,
         limit: q.limit,
+        ..Default::default()
     };
 
     match audit::list(&state.db, &filter).await {

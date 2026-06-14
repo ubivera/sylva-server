@@ -6221,21 +6221,37 @@ fn render_banner(_banner: &MembersBanner<'_>) -> Markup {
 
 // ── Events (audit log) page ───────────────────────────────────────────────
 
+/// Audit-log viewer state passed to [`events_page`] — the active search/filter
+/// plus everything needed to render the toolbar and the pagination bar.
+pub struct EventsView<'a> {
+    /// Current free-text search (empty = none).
+    pub search: &'a str,
+    /// Current event-type filter (empty = all types).
+    pub type_filter: &'a str,
+    /// Distinct event types present in the log — populates the filter select.
+    pub types: &'a [String],
+    pub pagination: PaginationState,
+}
+
 /// Admin/Owner-only audit-log viewer. Read-only table of events, newest first,
-/// with cursor pagination (`older_cursor` = the seqno to pass as `?before=` for
-/// the next older page; `has_newer` = we're on a paged-back view, so offer a
-/// jump back to the newest). Wide chrome so the details column has room.
+/// with a search + event-type filter (the toolbar) and an offset pagination bar
+/// pinned at the foot (the same component as Members). Rows open a detail modal.
+/// Wide chrome so the details column has room.
 pub fn events_page(
     ctx: &ChromeContext,
     events: &[audit::AuditEvent],
     now: chrono::DateTime<chrono::Utc>,
-    older_cursor: Option<i64>,
-    has_newer: bool,
+    view: &EventsView<'_>,
 ) -> Markup {
+    let filtering = !view.search.is_empty() || !view.type_filter.is_empty();
     let content = html! {
+        (events_toolbar(view))
         @if events.is_empty() {
             div class="card" {
-                p class="muted" { "No events recorded yet." }
+                p class="muted" {
+                    @if filtering { "No events match these filters." }
+                    @else { "No events recorded yet." }
+                }
             }
         } @else {
             table class="users-table events-table" {
@@ -6254,9 +6270,34 @@ pub fn events_page(
                 }
             }
         }
-        (events_pager(older_cursor, has_newer))
+        // Pagination always renders (even at one page) so the foot of the page
+        // stays put as rows come and go — same behaviour as Members.
+        (events_pagination_bar(view.pagination, view.search, view.type_filter))
     };
     shell_app_wide(ctx, "Events", PageId::Events, content)
+}
+
+/// Search + event-type filter bar. A single GET form so Enter (or Apply)
+/// submits both and resets to page 1; `rows` rides a hidden input so the
+/// current page size survives a search.
+fn events_toolbar(view: &EventsView<'_>) -> Markup {
+    html! {
+        form method="get" action="/events" class="users-toolbar events-toolbar" {
+            input type="search" name="q" value=(view.search) class="users-search"
+                  placeholder="Search events…" autocomplete="off" aria-label="Search events";
+            select name="type" class="settings-select events-type-select"
+                   aria-label="Filter by event type" {
+                option value="" selected[view.type_filter.is_empty()] { "All event types" }
+                @for t in view.types {
+                    option value=(t) selected[t.as_str() == view.type_filter] {
+                        (humanize_event_type(t))
+                    }
+                }
+            }
+            input type="hidden" name="rows" value=(view.pagination.rows_per_page);
+            button type="submit" class="btn-secondary" { "Apply" }
+        }
+    }
 }
 
 /// One audit-event row: relative time (absolute in the tooltip), actor (or
@@ -6265,7 +6306,9 @@ pub fn events_page(
 fn event_row(ev: &audit::AuditEvent, now: chrono::DateTime<chrono::Utc>) -> Markup {
     let absolute = ev.occurred_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
     html! {
-        tr {
+        // Whole row opens the detail modal (handled by the shell's
+        // `data-open-modal` delegate → `#modal-host`).
+        tr class="events-row" data-open-modal=(format!("/events/{}/modal", ev.seqno)) {
             td class="col-time" title=(absolute) { (relative_time(ev.occurred_at, now)) }
             td class="col-actor" {
                 @match &ev.actor_display_name {
@@ -6319,23 +6362,195 @@ fn value_compact(value: &serde_json::Value) -> String {
     }
 }
 
-/// Footer for the events table: "Newest" (jump to the top) when paged back, and
-/// "Older" (next cursor page) when more history remains.
-fn events_pager(older_cursor: Option<i64>, has_newer: bool) -> Markup {
-    html! {
-        nav class="events-pager" aria-label="Pagination" {
-            div {
-                @if has_newer {
-                    a href="/events" { "↑ Newest" }
-                }
+/// Offset pagination bar at the foot of the Events table — the same chrome as
+/// the Members bar (editable "Page X of N", step + number controls, rows-per-
+/// page dropdown), but its links carry the events query (`q` / `type` / `rows`).
+fn events_pagination_bar(state: PaginationState, search: &str, type_filter: &str) -> Markup {
+    let cur = state.current_page;
+    let total = state.total_pages;
+    let rows = state.rows_per_page;
+    let at_first = cur <= 1;
+    let at_last = cur >= total;
+    let prev_page = cur.saturating_sub(1).max(1);
+    let next_page = (cur + 1).min(total);
+
+    let step = |page: u32, disabled: bool, label: &str, icon: Markup| -> Markup {
+        let aria = format!("Go to {label} page");
+        if disabled {
+            html! {
+                span class="pagination-step pagination-step-disabled"
+                     aria-label=(aria) aria-disabled="true" { (icon) }
             }
-            div {
-                @if let Some(cursor) = older_cursor {
-                    a href=(format!("/events?before={cursor}")) { "Older →" }
+        } else {
+            let href = events_url(search, type_filter, page, rows);
+            html! { a class="pagination-step" href=(href) aria-label=(aria) { (icon) } }
+        }
+    };
+    let number = |page: u32, active: bool| -> Markup {
+        if active {
+            html! {
+                span class="pagination-number pagination-number-active"
+                     aria-current="page" { (page) }
+            }
+        } else {
+            let href = events_url(search, type_filter, page, rows);
+            html! { a class="pagination-number" href=(href) { (page) } }
+        }
+    };
+
+    html! {
+        nav class="pagination-bar" aria-label="Pagination" {
+            form method="get" action="/events" class="pagination-jump" {
+                label class="pagination-jump-label" for="page-jump" { "Page" }
+                input type="number" id="page-jump" name="page" class="pagination-jump-input"
+                      value=(cur) min="1" max=(total);
+                span class="pagination-jump-of" { "of " (total) }
+                input type="hidden" name="q" value=(search);
+                input type="hidden" name="type" value=(type_filter);
+                input type="hidden" name="rows" value=(rows);
+            }
+            div class="pagination-numbers" {
+                (step(1, at_first, "first", chevron_double_left_icon()))
+                (step(prev_page, at_first, "previous", chevron_left_icon()))
+                @for item in page_items(cur, total) {
+                    @match item {
+                        PageItem::Number(n) => (number(n, n == cur)),
+                        PageItem::Ellipsis => span class="pagination-ellipsis" aria-hidden="true" { "…" },
+                    }
+                }
+                (step(next_page, at_last, "next", chevron_right_icon()))
+                (step(total, at_last, "last", chevron_double_right_icon()))
+            }
+            div class="pagination-rows" {
+                span class="pagination-rows-label" { "Rows per page" }
+                details class="filter-menu pagination-rows-menu" {
+                    summary class="filter-trigger pagination-rows-trigger" {
+                        span class="filter-trigger-value" { (rows) }
+                        (chevron_down_icon())
+                    }
+                    div class="filter-menu-list" {
+                        @for option in ROWS_PER_PAGE_OPTIONS {
+                            @let active = *option == rows;
+                            @let class = if active {
+                                "filter-menu-item filter-menu-item-active"
+                            } else {
+                                "filter-menu-item"
+                            };
+                            @let href = events_url(search, type_filter, 1, *option);
+                            a class=(class) href=(href) {
+                                span { (option) }
+                                @if active { (check_small_icon()) }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Build a `/events?…` URL preserving the active search + type filter.
+fn events_url(search: &str, type_filter: &str, page: u32, rows: u32) -> String {
+    let mut url = format!("/events?page={page}&rows={rows}");
+    if !search.is_empty() {
+        url.push_str(&format!("&q={}", query_encode(search)));
+    }
+    if !type_filter.is_empty() {
+        url.push_str(&format!("&type={}", query_encode(type_filter)));
+    }
+    url
+}
+
+/// Percent-encode a query-string value (RFC 3986 unreserved set kept literal).
+fn query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Detail modal for one audit event — the full `event_data` (pretty JSON) plus
+/// the chain fields (seqno + prev_hash/hash hex), fetched on demand into
+/// `#modal-host` when a row is clicked. Read-only; no actions.
+pub fn event_detail_modal(ev: &audit::AuditEvent) -> Markup {
+    let pretty =
+        serde_json::to_string_pretty(&ev.event_data).unwrap_or_else(|_| ev.event_data.to_string());
+    let absolute = ev.occurred_at.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string();
+    html! {
+        dialog id="dlg-event-detail" class="action-dialog" {
+            div class="dialog-header" {
+                h2 { "Event #" (ev.seqno) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            div class="event-detail" {
+                (detail_pair("Time", html! { (absolute) }))
+                (detail_pair("Actor", html! {
+                    @match &ev.actor_display_name {
+                        Some(name) => (name),
+                        None => span class="event-actor-system" { "System" },
+                    }
+                    @if let Some(id) = ev.actor_user_id {
+                        span class="event-detail-sub" { " · " (id) }
+                    }
+                }))
+                (detail_pair("Event", html! {
+                    (humanize_event_type(&ev.event_type))
+                    span class="event-detail-sub" { " · " (ev.event_type) }
+                }))
+                @if let Some(app) = &ev.app_id {
+                    (detail_pair("App", html! { (app) }))
+                }
+            }
+            div class="event-detail-block" {
+                span class="event-detail-label" { "Data" }
+                pre class="event-detail-json" { (pretty) }
+            }
+            div class="event-detail-block" {
+                span class="event-detail-label" { "Chain" }
+                div class="event-hash-row" {
+                    span class="event-hash-key" { "seqno" }
+                    span class="event-hash-val" { (ev.seqno) }
+                }
+                div class="event-hash-row" {
+                    span class="event-hash-key" { "prev_hash" }
+                    span class="event-hash-val" { (hex_encode(&ev.prev_hash)) }
+                }
+                div class="event-hash-row" {
+                    span class="event-hash-key" { "hash" }
+                    span class="event-hash-val" { (hex_encode(&ev.hash)) }
+                }
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn" data-close-dialog { "Close" }
+            }
+        }
+    }
+}
+
+/// One label/value row in the event detail modal's summary block.
+fn detail_pair(label: &str, value: Markup) -> Markup {
+    html! {
+        div class="event-detail-pair" {
+            span class="event-detail-label" { (label) }
+            span class="event-detail-value" { (value) }
+        }
+    }
+}
+
+/// Lowercase hex of a byte slice (chain hashes).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// List glyph for the Events nav entry. Stroke uses `currentColor`.

@@ -1835,26 +1835,64 @@ p.muted {
     word-break: break-word;
 }
 .events-table .event-meta-key { color: var(--color-text-faint); }
-/* Cursor pager under the events table: Newest (left) / Older (right). */
-.events-pager {
+/* Events toolbar (search + event-type filter) above the table. */
+.events-toolbar {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: var(--space-md) 0;
-    margin-top: var(--space-sm);
+    gap: var(--space-sm);
+    flex-wrap: wrap;
 }
-.events-pager a {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-xs);
-    padding: 0.4rem 0.8rem;
+.events-toolbar .events-type-select { width: auto; min-width: 12rem; }
+/* Rows are clickable — they open the detail modal. */
+.events-table .events-row { cursor: pointer; }
+
+/* Event detail modal: read-only summary + pretty JSON + chain hashes. */
+.event-detail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin: var(--space-md) 0;
+}
+.event-detail-pair { display: flex; gap: var(--space-md); font-size: 0.9rem; }
+.event-detail-label {
+    color: var(--color-text-muted);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.event-detail-pair .event-detail-label { flex: 0 0 5rem; }
+.event-detail-value { color: var(--color-text); word-break: break-word; }
+.event-detail-sub {
+    color: var(--color-text-faint);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+}
+.event-detail-block { margin-top: var(--space-md); }
+.event-detail-block .event-detail-label { display: block; margin-bottom: var(--space-xs); }
+.event-detail-json {
+    margin: 0;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--color-popover);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.5;
     color: var(--color-text);
-    text-decoration: none;
-    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 16rem;
+    overflow: auto;
 }
-.events-pager a:hover { background: var(--color-surface-alt); }
+.event-hash-row {
+    display: flex;
+    gap: var(--space-md);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.6;
+}
+.event-hash-key { flex: 0 0 5rem; color: var(--color-text-faint); }
+.event-hash-val { color: var(--color-text-muted); word-break: break-all; }
 
 .users-table .col-date {
     text-align: right;

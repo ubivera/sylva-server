@@ -90,36 +90,112 @@ async fn events_page_shows_recent_events() {
     assert!(me.contains("href=\"/events\""));
 }
 
+/// Count rendered data rows by their per-row modal trigger.
+fn row_count(html: &str) -> usize {
+    html.matches("data-open-modal=\"/events/").count()
+}
+
+/// Append a single audit event (no Argon2 cost) and return its seqno.
+async fn append_event(app: &TestApp, event_type: &str, data: serde_json::Value) -> i64 {
+    let mut tx = app.pool.begin().await.unwrap();
+    let ev = audit::append(&mut tx, None, None, event_type, data).await.unwrap();
+    tx.commit().await.unwrap();
+    ev.seqno
+}
+
 #[tokio::test]
-async fn events_page_paginates_with_cursor() {
+async fn events_page_offset_pagination() {
     let app = TestApp::new().await;
     app.seed_user("owner@test.local", "Ownie", "pw", InstanceRole::Owner)
         .await;
     let (cookie, _) = web_login_session(&app, "owner@test.local", "pw").await;
 
-    // Append more than one page of events directly (no Argon2 cost).
-    for i in 0..(audit::DEFAULT_PAGE_SIZE as usize + 3) {
-        let mut tx = app.pool.begin().await.unwrap();
-        audit::append(&mut tx, None, None, "test_event", serde_json::json!({ "i": i }))
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
+    // 25 appended, plus the seed + login events → ≥3 pages at 10/page.
+    for i in 0..25 {
+        append_event(&app, "test_event", serde_json::json!({ "i": i })).await;
     }
 
-    // Newest page is full → offers an "Older" cursor link.
+    // Page 1: a full page (10 rows) + the Members-style bar with page links.
     let (status, html) = get_with_cookie(&app, "/events", &cookie).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        html.contains("/events?before="),
-        "a full newest page should offer an Older cursor"
-    );
+    assert!(html.contains("pagination-bar"));
+    assert!(html.contains("Rows per page"));
+    assert!(html.contains("/events?page=2"));
+    assert!(html.contains("/events?page=3"));
+    assert_eq!(row_count(&html), 10, "default page size is 10");
 
-    // The tail page (low seqno) has no further history and offers "Newest".
-    let (status, tail) = get_with_cookie(&app, "/events?before=5", &cookie).await;
+    // Page 2 is also full; offset paging splits the log into 10-row pages.
+    let (status, p2) = get_with_cookie(&app, "/events?page=2", &cookie).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(tail.contains("Newest"), "a paged-back view should offer Newest");
-    assert!(
-        !tail.contains("/events?before="),
-        "the tail page should not offer a further Older cursor"
-    );
+    assert_eq!(row_count(&p2), 10);
+
+    // A larger page size collapses it to a single page.
+    let (status, big) = get_with_cookie(&app, "/events?rows=100", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(big.contains("of 1"), "100/page fits everything on one page");
+}
+
+#[tokio::test]
+async fn events_filter_by_type() {
+    let app = TestApp::new().await;
+    app.seed_user("owner@test.local", "Ownie", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, "owner@test.local", "pw").await;
+
+    for _ in 0..3 {
+        append_event(&app, "alpha_event", serde_json::json!({})).await;
+    }
+    for _ in 0..2 {
+        append_event(&app, "beta_event", serde_json::json!({})).await;
+    }
+
+    let (status, html) = get_with_cookie(&app, "/events?type=alpha_event", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_count(&html), 3, "only alpha_event rows");
+}
+
+#[tokio::test]
+async fn events_search_matches_event_data() {
+    let app = TestApp::new().await;
+    app.seed_user("owner@test.local", "Ownie", "pw", InstanceRole::Owner)
+        .await;
+    let (cookie, _) = web_login_session(&app, "owner@test.local", "pw").await;
+
+    append_event(&app, "test_event", serde_json::json!({ "needle": "haystack" })).await;
+
+    // Matches the value inside event_data.
+    let (status, hit) = get_with_cookie(&app, "/events?q=haystack", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_count(&hit), 1);
+
+    // No match → the filtered empty state.
+    let (status, miss) = get_with_cookie(&app, "/events?q=zzzznevermatches", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_count(&miss), 0);
+    assert!(miss.contains("No events match"));
+}
+
+#[tokio::test]
+async fn event_detail_modal_shows_data_and_hashes() {
+    let app = TestApp::new().await;
+    app.seed_user("admin@test.local", "Adminna", "pw", InstanceRole::Admin)
+        .await;
+    let (cookie, _) = web_login_session(&app, "admin@test.local", "pw").await;
+
+    let seqno = append_event(&app, "test_event", serde_json::json!({ "marker_value": 12345 })).await;
+
+    let (status, html) = get_with_cookie(&app, &format!("/events/{seqno}/modal"), &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&format!("Event #{seqno}")));
+    assert!(html.contains("prev_hash"), "chain hashes shown");
+    assert!(html.contains("Chain"));
+    assert!(html.contains("marker_value"), "full event_data rendered");
+    assert!(html.contains("12345"));
+
+    // A Member can't reach the detail either.
+    app.seed_user("member@test.local", "Mem", "pw", InstanceRole::Member)
+        .await;
+    let (mcookie, _) = web_login_session(&app, "member@test.local", "pw").await;
+    let (mstatus, _) = get_with_cookie(&app, &format!("/events/{seqno}/modal"), &mcookie).await;
+    assert_eq!(mstatus, StatusCode::FORBIDDEN);
 }
