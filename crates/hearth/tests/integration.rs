@@ -16,6 +16,8 @@ mod admin;
 mod audit_chain;
 #[path = "integration/auth.rs"]
 mod auth;
+#[path = "integration/events.rs"]
+mod events;
 #[path = "integration/notifications.rs"]
 mod notifications;
 #[path = "integration/pending_transitions.rs"]

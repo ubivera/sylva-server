@@ -1,4 +1,5 @@
 pub mod admin_routes;
+pub mod events_routes;
 pub mod pending_routes;
 pub mod routes;
 pub mod settings_routes;
@@ -154,6 +155,8 @@ pub fn ui_router(state: AppState) -> Router {
         .route("/members/{id}/anonymize", post(admin_routes::anonymize_member))
         .route("/members/{id}/delete", post(admin_routes::delete_member))
         .route("/members/{id}/role", post(admin_routes::change_member_role))
+        // Admin/Owner audit-log viewer.
+        .route("/events", get(events_routes::events_page))
         .route("/pending", get(pending_routes::pending_page))
         .route(
             "/pending/{id}/veto",

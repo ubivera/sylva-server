@@ -1815,6 +1815,47 @@ p.muted {
 .users-table tbody tr:last-child td { border-bottom: none; }
 .users-table tbody tr:hover td { background: var(--color-sidebar-hover); }
 
+/* Events (audit log) table — reuses the .users-table chrome with its own
+   column widths + a compact monospace details cell. */
+.events-table td { vertical-align: top; }
+.events-table .col-time {
+    width: 11rem;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+.events-table .col-actor { width: 12rem; }
+.events-table .col-event { width: 14rem; }
+.events-table .event-actor-system { color: var(--color-text-faint); font-style: italic; }
+.events-table .event-meta {
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    word-break: break-word;
+}
+.events-table .event-meta-key { color: var(--color-text-faint); }
+/* Cursor pager under the events table: Newest (left) / Older (right). */
+.events-pager {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-md) 0;
+    margin-top: var(--space-sm);
+}
+.events-pager a {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: 0.4rem 0.8rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    text-decoration: none;
+    font-size: 0.85rem;
+}
+.events-pager a:hover { background: var(--color-surface-alt); }
+
 .users-table .col-date {
     text-align: right;
     white-space: nowrap;

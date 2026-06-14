@@ -61,6 +61,7 @@ pub fn csrf_input(token: &str) -> Markup {
 pub enum PageId {
     Profile,
     Members,
+    Events,
     Pending,
     Settings,
 }
@@ -1097,6 +1098,14 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                         current == PageId::Members,
                         ctx.pending_count,
                         users_icon(),
+                    ))
+                    // Audit log viewer — Admins + Owners. `/events` re-checks
+                    // the role server-side.
+                    (nav_link(
+                        "/events",
+                        "Events",
+                        current == PageId::Events,
+                        events_icon(),
                     ))
                 }
                 // Owner-only: instance configuration. Admins manage users;
@@ -6208,6 +6217,143 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
 /// banners for a niche case.
 fn render_banner(_banner: &MembersBanner<'_>) -> Markup {
     html! {}
+}
+
+// ── Events (audit log) page ───────────────────────────────────────────────
+
+/// Admin/Owner-only audit-log viewer. Read-only table of events, newest first,
+/// with cursor pagination (`older_cursor` = the seqno to pass as `?before=` for
+/// the next older page; `has_newer` = we're on a paged-back view, so offer a
+/// jump back to the newest). Wide chrome so the details column has room.
+pub fn events_page(
+    ctx: &ChromeContext,
+    events: &[audit::AuditEvent],
+    now: chrono::DateTime<chrono::Utc>,
+    older_cursor: Option<i64>,
+    has_newer: bool,
+) -> Markup {
+    let content = html! {
+        @if events.is_empty() {
+            div class="card" {
+                p class="muted" { "No events recorded yet." }
+            }
+        } @else {
+            table class="users-table events-table" {
+                thead {
+                    tr {
+                        th class="col-time" { "Time" }
+                        th class="col-actor" { "Actor" }
+                        th class="col-event" { "Event" }
+                        th class="col-details" { "Details" }
+                    }
+                }
+                tbody {
+                    @for ev in events {
+                        (event_row(ev, now))
+                    }
+                }
+            }
+        }
+        (events_pager(older_cursor, has_newer))
+    };
+    shell_app_wide(ctx, "Events", PageId::Events, content)
+}
+
+/// One audit-event row: relative time (absolute in the tooltip), actor (or
+/// "System" for actor-less events), the humanized event type (raw type in the
+/// tooltip), and a compact key/value rendering of the event data.
+fn event_row(ev: &audit::AuditEvent, now: chrono::DateTime<chrono::Utc>) -> Markup {
+    let absolute = ev.occurred_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    html! {
+        tr {
+            td class="col-time" title=(absolute) { (relative_time(ev.occurred_at, now)) }
+            td class="col-actor" {
+                @match &ev.actor_display_name {
+                    Some(name) => (name),
+                    None => span class="event-actor-system" { "System" },
+                }
+            }
+            td class="col-event" title=(ev.event_type) { (humanize_event_type(&ev.event_type)) }
+            td class="col-details" { (event_details(&ev.event_data)) }
+        }
+    }
+}
+
+/// Turn a snake_case event type into a sentence, e.g. `instance_settings_updated`
+/// → "Instance settings updated". Event types are ASCII identifiers.
+fn humanize_event_type(event_type: &str) -> String {
+    let mut s = event_type.replace('_', " ");
+    if let Some(first) = s.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    s
+}
+
+/// Compact, single-line rendering of an event's `event_data`. Flat objects
+/// (the common case) render as `key: value · key: value`; anything else falls
+/// back to a dash.
+fn event_details(data: &serde_json::Value) -> Markup {
+    match data.as_object() {
+        Some(map) if !map.is_empty() => html! {
+            span class="event-meta" {
+                @for (i, (key, value)) in map.iter().enumerate() {
+                    @if i > 0 { " · " }
+                    span class="event-meta-key" { (key) ": " }
+                    (value_compact(value))
+                }
+            }
+        },
+        _ => html! { span class="muted-dash" { "—" } },
+    }
+}
+
+/// Render a JSON value compactly for the details cell — strings unquoted,
+/// scalars as-is, nested arrays/objects as compact JSON.
+fn value_compact(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Footer for the events table: "Newest" (jump to the top) when paged back, and
+/// "Older" (next cursor page) when more history remains.
+fn events_pager(older_cursor: Option<i64>, has_newer: bool) -> Markup {
+    html! {
+        nav class="events-pager" aria-label="Pagination" {
+            div {
+                @if has_newer {
+                    a href="/events" { "↑ Newest" }
+                }
+            }
+            div {
+                @if let Some(cursor) = older_cursor {
+                    a href=(format!("/events?before={cursor}")) { "Older →" }
+                }
+            }
+        }
+    }
+}
+
+/// List glyph for the Events nav entry. Stroke uses `currentColor`.
+fn events_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            line x1="8" y1="6" x2="21" y2="6" {}
+            line x1="8" y1="12" x2="21" y2="12" {}
+            line x1="8" y1="18" x2="21" y2="18" {}
+            line x1="3" y1="6" x2="3.01" y2="6" {}
+            line x1="3" y1="12" x2="3.01" y2="12" {}
+            line x1="3" y1="18" x2="3.01" y2="18" {}
+        }
+    }
 }
 
 // ── Owner Settings page ───────────────────────────────────────────────────
