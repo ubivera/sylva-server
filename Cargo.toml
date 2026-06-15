@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/audit", "crates/auth", "crates/authz", "crates/bootstrap", "crates/clean", "crates/hearth", "crates/hearth-server", "crates/identity", "crates/notifications", "crates/pending", "crates/provision", "crates/web"]
+members = ["crates/audit", "crates/auth", "crates/authz", "crates/bootstrap", "crates/clean", "crates/hearth", "crates/hearth-server", "crates/identity", "crates/notifications", "crates/pending", "crates/platform", "crates/proto", "crates/provision", "crates/web"]
 
 [workspace.package]
 edition = "2024"
@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 argon2 = "0.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 sha1 = "0.10"
 hmac = "0.12"
@@ -47,6 +48,17 @@ webauthn-rs = { version = "0.5", features = [
 url = "2.5"
 maud = "0.27"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls", "smtp-transport", "builder", "ring", "webpki-roots"] }
+
+# gRPC platform API. tonic 0.14 split codegen/runtime out of the core crate:
+# the prost codec lives in `tonic-prost`, codegen in `tonic-prost-build`.
+# `protox` is a pure-Rust .proto compiler so the build needs no system `protoc`.
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-prost-build = "0.14"
+protox = "0.9"
+tokio-stream = "0.1"
+
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [workspace.lints.rust]

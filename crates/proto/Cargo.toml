@@ -1,0 +1,25 @@
+[package]
+name = "proto"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sylva Hearth gRPC protobuf stubs (generated from /proto)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protox = { workspace = true }
+
+# NOTE: intentionally does NOT inherit `[lints] workspace = true`. The contents
+# are codegen output (tonic-prost-build) and aren't hand-audited, so the
+# workspace deny-lints (unwrap/expect/panic) don't apply here.

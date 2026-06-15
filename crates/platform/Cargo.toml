@@ -1,0 +1,31 @@
+[package]
+name = "platform"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sylva Hearth platform gRPC services (resource storage, app registration)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde_json = { workspace = true }
+
+proto = { path = "../proto" }
+auth = { path = "../auth" }
+identity = { path = "../identity" }
+audit = { path = "../audit" }
+
+[lints]
+workspace = true

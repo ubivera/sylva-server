@@ -6,6 +6,11 @@ use sqlx::postgres::PgConnectOptions;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen_addr: SocketAddr,
+    /// Address the gRPC platform API (app↔server) listens on — separate from
+    /// `listen_addr` (the REST/web portal). In production the reverse proxy
+    /// routes HTTP/2 traffic here. From `HEARTH_GRPC_LISTEN_ADDR`
+    /// (default `127.0.0.1:50051`).
+    pub grpc_listen_addr: SocketAddr,
     pub log_format: LogFormat,
     pub log_filter: String,
     pub data_dir: PathBuf,
@@ -63,6 +68,7 @@ pub enum SmtpTls {
 }
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8443";
+const DEFAULT_GRPC_LISTEN_ADDR: &str = "127.0.0.1:50051";
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_FILTER: &str = "info,hearth=debug";
 const DEFAULT_DATA_DIR: &str = "./data";
@@ -93,6 +99,12 @@ impl Config {
         let listen_addr: SocketAddr = listen_addr_str
             .parse()
             .with_context(|| format!("invalid HEARTH_LISTEN_ADDR: {listen_addr_str}"))?;
+
+        let grpc_listen_addr_str = get("HEARTH_GRPC_LISTEN_ADDR")
+            .unwrap_or_else(|| DEFAULT_GRPC_LISTEN_ADDR.to_string());
+        let grpc_listen_addr: SocketAddr = grpc_listen_addr_str.parse().with_context(|| {
+            format!("invalid HEARTH_GRPC_LISTEN_ADDR: {grpc_listen_addr_str}")
+        })?;
 
         let log_format_str = get("HEARTH_LOG_FORMAT")
             .unwrap_or_else(|| DEFAULT_LOG_FORMAT.to_string());
@@ -140,6 +152,7 @@ impl Config {
 
         Ok(Self {
             listen_addr,
+            grpc_listen_addr,
             log_format,
             log_filter,
             data_dir,
@@ -342,6 +355,26 @@ mod tests {
             HashMap::from([("HEARTH_LISTEN_ADDR", "127.0.0.1:9000")]);
         let cfg = Config::from_env_lookup(lookup(&env)).expect("parse");
         assert_eq!(cfg.listen_addr.to_string(), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn grpc_listen_addr_defaults_and_overrides() {
+        let empty: HashMap<&str, &str> = HashMap::new();
+        let cfg = Config::from_env_lookup(lookup(&empty)).expect("defaults");
+        assert_eq!(cfg.grpc_listen_addr.to_string(), "127.0.0.1:50051");
+
+        let env: HashMap<&str, &str> =
+            HashMap::from([("HEARTH_GRPC_LISTEN_ADDR", "127.0.0.1:60000")]);
+        let cfg = Config::from_env_lookup(lookup(&env)).expect("parse");
+        assert_eq!(cfg.grpc_listen_addr.to_string(), "127.0.0.1:60000");
+    }
+
+    #[test]
+    fn rejects_invalid_grpc_listen_addr() {
+        let env: HashMap<&str, &str> =
+            HashMap::from([("HEARTH_GRPC_LISTEN_ADDR", "not-a-socket")]);
+        let err = Config::from_env_lookup(lookup(&env)).unwrap_err();
+        assert!(err.to_string().contains("HEARTH_GRPC_LISTEN_ADDR"));
     }
 
     #[test]

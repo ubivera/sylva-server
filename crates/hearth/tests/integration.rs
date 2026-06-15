@@ -22,6 +22,8 @@ mod events;
 mod notifications;
 #[path = "integration/pending_transitions.rs"]
 mod pending_transitions;
+#[path = "integration/platform_grpc.rs"]
+mod platform_grpc;
 #[path = "integration/recovery.rs"]
 mod recovery;
 #[path = "integration/settings.rs"]

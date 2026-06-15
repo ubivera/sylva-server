@@ -118,10 +118,19 @@ async fn serve(
     let instance_name =
         std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(effective.instance_name));
     let notif_worker = notifications::Worker::new(pool.clone(), notifier.clone());
-    let (worker_shutdown_tx, worker_shutdown_rx) =
-        tokio::sync::watch::channel::<bool>(false);
+    // One shutdown signal fans out to both servers (HTTP + gRPC) and both
+    // background workers. `shutdown::signal()` can only be awaited once, so a
+    // bridge task awaits it and flips this watch; everyone else observes it.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown::signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+    }
     let notif_handle = tokio::spawn(
-        notif_worker.run_forever(std::time::Duration::from_secs(5), worker_shutdown_rx.clone()),
+        notif_worker.run_forever(std::time::Duration::from_secs(5), shutdown_rx.clone()),
     );
     tracing::info!(
         mode = ?notifications_mode_label(&effective.notifications),
@@ -130,7 +139,7 @@ async fn serve(
 
     let pending_worker = pending::Worker::new(pool.clone());
     let pending_handle = tokio::spawn(
-        pending_worker.run_forever(std::time::Duration::from_secs(30), worker_shutdown_rx),
+        pending_worker.run_forever(std::time::Duration::from_secs(30), shutdown_rx.clone()),
     );
     tracing::info!("pending-transition worker started");
 
@@ -139,6 +148,17 @@ async fn serve(
     let instance_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         instance::load_closed(&pool).await.unwrap_or(false),
     ));
+
+    // Context for the gRPC platform services — clones of the same repositories
+    // the REST layer uses (cheap; each just wraps the pool). Built before the
+    // AppState literal below moves the originals.
+    let platform_ctx = platform::PlatformContext {
+        sessions: sessions.clone(),
+        users: users.clone(),
+        resources: platform::resources::ResourceRepository::new(pool.clone()),
+        pool: pool.clone(),
+        secret_key: secret_key.clone(),
+    };
 
     let state = app::AppState {
         started_at,
@@ -173,19 +193,42 @@ async fn serve(
 
     tracing::info!(listen = %config.listen_addr, "http server listening");
 
+    // gRPC platform API on its own listener (separate port; a reverse proxy
+    // routes HTTP/2 here in production). Shares the same shutdown watch.
+    let grpc_listener = tokio::net::TcpListener::bind(config.grpc_listen_addr)
+        .await
+        .with_context(|| format!("failed to bind {}", config.grpc_listen_addr))?;
+    tracing::info!(listen = %config.grpc_listen_addr, "grpc server listening");
+    let grpc_handle = {
+        let mut grpc_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(platform::serve_grpc(platform_ctx, grpc_listener, async move {
+            let _ = grpc_shutdown_rx.changed().await;
+        }))
+    };
+
     // `into_make_service_with_connect_info` surfaces the socket peer
     // address to handlers (via `ConnectInfo`), which the `ClientIp`
     // extractor uses for rate-limit keying when no trusted proxy is set.
+    let mut axum_shutdown_rx = shutdown_rx.clone();
     let serve_outcome = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown::signal())
+    .with_graceful_shutdown(async move {
+        let _ = axum_shutdown_rx.changed().await;
+    })
     .await
     .context("server error");
 
-    // Tell the workers to wind down, then await them (best-effort).
-    let _ = worker_shutdown_tx.send(true);
+    // Axum has drained. Make sure the rest winds down too (idempotent if the
+    // signal already fired), then join — gRPC first, since in-flight RPCs
+    // borrow the pool, which must be closed LAST.
+    let _ = shutdown_tx.send(true);
+    match grpc_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(?err, "grpc server error"),
+        Err(err) => tracing::warn!(?err, "grpc server join failed"),
+    }
     if let Err(err) = notif_handle.await {
         tracing::warn!(?err, "notification worker join failed");
     }

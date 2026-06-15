@@ -26,7 +26,8 @@ const SCORCH_SQL: &str = "TRUNCATE \
      auth.credentials, auth.sessions, auth.recovery_codes, \
      auth.user_recovery_codes, auth.totp_credentials, \
      auth.webauthn_credentials, auth.webauthn_challenges, \
-     audit.events, notifications.outbox, pending.transitions \
+     audit.events, notifications.outbox, pending.transitions, \
+     platform.resources, platform.registered_apps, platform.trusted_publishers \
      RESTART IDENTITY CASCADE";
 
 /// Read the persistent "closed" flag. Seeded by migration `0006`, so the row
