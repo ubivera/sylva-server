@@ -8,13 +8,15 @@
 -- CP2 is **owner-scoped**: each resource is owned by its creator, and only the
 -- creator can read/update/delete it. The resource-permission (ReBAC/sharing)
 -- layer + hierarchy/inheritance land later; `parent_resource_id` is stored now
--- but not yet enforced. `app_id` is a plain UUID until app registration (CP3)
--- adds the `registered_apps` table + the foreign key (early-dev edit here).
+-- but not yet enforced. `app_id` references `platform.registered_apps(id)` (the
+-- FK is added after that table is created below — CP3b).
 CREATE SCHEMA IF NOT EXISTS platform;
 
 CREATE TABLE platform.resources (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- Owning app. FK to platform.registered_apps lands in CP3.
+    -- Owning app — FK to platform.registered_apps(id) added below (that table
+    -- is created later in this migration). CreateResource also validates the
+    -- app is registered + enabled and that resource_type is one it declared.
     app_id             UUID NOT NULL,
     resource_type      TEXT NOT NULL,
     -- The app's own identifier for this resource (client-generated UUID).
@@ -56,9 +58,9 @@ CREATE TABLE platform.trusted_publishers (
     added_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Apps registered on this instance. `app_id` (the PK) is what `resources.app_id`
--- will reference in CP3b. `resource_types` is the app's declared set (CP3b
--- validates resource creates against it). Capabilities / event-type schema +
+-- Apps registered on this instance. `id` (the PK) is what `resources.app_id`
+-- references (FK below). `resource_types` is the app's declared set; CreateResource
+-- validates resource creates against it. Capabilities / event-type schema +
 -- enable-disable / uninstall land later.
 CREATE TABLE platform.registered_apps (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -73,3 +75,10 @@ CREATE TABLE platform.registered_apps (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Tie resources to their owning app now that registered_apps exists (CP3b).
+-- ON DELETE CASCADE: uninstalling an app reaps its resources. The
+-- (app_id, …) listing index above already covers the referencing column.
+ALTER TABLE platform.resources
+    ADD CONSTRAINT resources_app_id_fkey
+    FOREIGN KEY (app_id) REFERENCES platform.registered_apps(id) ON DELETE CASCADE;

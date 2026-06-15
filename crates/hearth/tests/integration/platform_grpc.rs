@@ -47,6 +47,17 @@ fn register_request(decl: &AppDeclaration, signature: Vec<u8>) -> RegisterAppReq
     }
 }
 
+/// Register the sample app directly in the DB (the signed gRPC registration
+/// flow is exercised by the registration tests) and return its server-assigned
+/// id for use as a resource's `app_id`. Declares resource_types `task`/`project`.
+async fn seed_app(app: &TestApp) -> String {
+    registry::upsert_app(&app.pool, &sample_decl(), None)
+        .await
+        .unwrap()
+        .id
+        .to_string()
+}
+
 /// Spin up the platform gRPC server on `127.0.0.1:0` against the test pool;
 /// returns the bound address + a shutdown sender.
 async fn spawn_grpc(app: &TestApp) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
@@ -121,7 +132,7 @@ async fn resource_crud_round_trip() {
     let (addr, shutdown) = spawn_grpc(&app).await;
     let mut client = ResourcesClient::connect(format!("http://{addr}")).await.unwrap();
 
-    let app_id = uuid::Uuid::new_v4().to_string();
+    let app_id = seed_app(&app).await;
     let app_resource_id = uuid::Uuid::new_v4().to_string();
 
     // Create.
@@ -235,13 +246,13 @@ async fn resources_are_owner_scoped() {
     let (addr, shutdown) = spawn_grpc(&app).await;
     let mut client = ResourcesClient::connect(format!("http://{addr}")).await.unwrap();
 
-    let app_id = uuid::Uuid::new_v4().to_string();
+    let app_id = seed_app(&app).await;
     let created = client
         .create_resource(authed(
             &tok_a,
             CreateResourceRequest {
                 app_id: app_id.clone(),
-                resource_type: "note".into(),
+                resource_type: "task".into(),
                 app_resource_id: uuid::Uuid::new_v4().to_string(),
                 parent_resource_id: None,
                 content_blob: b"a-secret".to_vec(),
@@ -295,7 +306,7 @@ async fn resources_are_owner_scoped() {
             &tok_b,
             ListResourcesRequest {
                 app_id,
-                resource_type: "note".into(),
+                resource_type: "task".into(),
                 limit: 0,
                 offset: 0,
                 include_deleted: false,
@@ -326,7 +337,7 @@ async fn duplicate_app_resource_id_conflicts_and_auth_required() {
     let (addr, shutdown) = spawn_grpc(&app).await;
     let mut client = ResourcesClient::connect(format!("http://{addr}")).await.unwrap();
 
-    let app_id = uuid::Uuid::new_v4().to_string();
+    let app_id = seed_app(&app).await;
     let app_resource_id = uuid::Uuid::new_v4().to_string();
     let make = || CreateResourceRequest {
         app_id: app_id.clone(),
@@ -480,6 +491,61 @@ async fn register_requires_auth_and_get_missing_is_not_found() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_resource_requires_registered_enabled_app_and_declared_type() {
+    let app = TestApp::new().await;
+    app.seed_user("owner@test.local", "Olive", "pw", InstanceRole::Member)
+        .await;
+    let token = app.login("owner@test.local", "pw").await;
+    let app_id = seed_app(&app).await; // enabled; declares "task" + "project"
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = ResourcesClient::connect(format!("http://{addr}")).await.unwrap();
+
+    let make = |app_id: &str, rtype: &str| CreateResourceRequest {
+        app_id: app_id.to_string(),
+        resource_type: rtype.to_string(),
+        app_resource_id: uuid::Uuid::new_v4().to_string(),
+        parent_resource_id: None,
+        content_blob: b"x".to_vec(),
+        content_signature: b"s".to_vec(),
+        schema_version: 1,
+    };
+
+    // Unknown app_id → the app isn't registered.
+    let err = client
+        .create_resource(authed(&token, make(&uuid::Uuid::new_v4().to_string(), "task")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    // Registered app, but a resource_type it never declared.
+    let err = client
+        .create_resource(authed(&token, make(&app_id, "widget")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // A declared type on the live app succeeds (here the second declared type).
+    client
+        .create_resource(authed(&token, make(&app_id, "project")))
+        .await
+        .unwrap();
+
+    // Disabling the app refuses further creates even for a declared type.
+    sqlx::query("UPDATE platform.registered_apps SET status = 'disabled' WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&app_id).unwrap())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let err = client
+        .create_resource(authed(&token, make(&app_id, "task")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     let _ = shutdown.send(true);
 }

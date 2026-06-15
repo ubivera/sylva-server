@@ -1,10 +1,10 @@
 //! Sylva Hearth **platform** gRPC services — the app-facing API.
 //!
-//! At CP1 this is just `Platform.WhoAmI`, which proves the transport + auth
-//! path: a client presents the opaque session token (from the REST
-//! `/api/auth/login`) in `authorization: Bearer <token>` metadata and gets
-//! back its identity. Resource storage + app registration land in later
-//! checkpoints.
+//! Two services: `Platform` (`WhoAmI` + app registration) and `Resources`
+//! (owner-scoped generic content storage). Every RPC authenticates the caller
+//! by the opaque session token (from the REST `/api/auth/login`) presented in
+//! `authorization: Bearer <token>` metadata. Resources are tied to a registered,
+//! enabled app via `app_id`. Sharing/ReBAC + a sync stream are later checkpoints.
 //!
 //! Deliberately depends only on `proto`, `auth`, and `identity` — never on the
 //! `hearth` crate — so the dependency graph stays `hearth → platform → proto`
@@ -236,8 +236,28 @@ impl Resources for ResourcesService {
         if req.resource_type.trim().is_empty() {
             return Err(Status::invalid_argument("resource_type is required"));
         }
+        let app_id = parse_uuid(&req.app_id, "app_id")?;
+
+        // CP3b: a resource must belong to a registered, enabled app and carry one
+        // of that app's declared resource_types. App registration is instance-
+        // global; the resource's owner is still the caller. The FK on
+        // `resources.app_id` backstops a concurrent app-delete race (23503).
+        let app = registry::get_app(&self.ctx.pool, app_id)
+            .await
+            .map_err(|err| internal(&err, "create_resource:get_app"))?
+            .ok_or_else(|| Status::failed_precondition("app is not registered"))?;
+        if app.status != "enabled" {
+            return Err(Status::failed_precondition("app is disabled"));
+        }
+        if !app.resource_types.iter().any(|t| t == &req.resource_type) {
+            return Err(Status::invalid_argument(format!(
+                "resource_type '{}' is not declared by app '{}'",
+                req.resource_type, app.app_identifier
+            )));
+        }
+
         let new = resources::NewResource {
-            app_id: parse_uuid(&req.app_id, "app_id")?,
+            app_id,
             resource_type: req.resource_type,
             app_resource_id: parse_uuid(&req.app_resource_id, "app_resource_id")?,
             parent_resource_id: parse_opt_uuid(
@@ -254,6 +274,9 @@ impl Resources for ResourcesService {
             Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => Err(
                 Status::already_exists("a resource with that app_resource_id already exists"),
             ),
+            Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23503") => {
+                Err(Status::failed_precondition("app is not registered"))
+            }
             Err(err) => Err(internal(&err, "create_resource")),
         }
     }
