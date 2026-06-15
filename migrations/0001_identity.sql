@@ -4,8 +4,7 @@ CREATE TYPE identity.user_lifecycle AS ENUM (
     'pending_invite',
     'active',
     'deactivated',
-    'soft_deleted',
-    'hard_deleted'
+    'anonymized'
 );
 
 CREATE TYPE identity.instance_role AS ENUM (

@@ -30,9 +30,11 @@ pub fn genesis_hash() -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Who performed the audited action. `display_name` is captured as a
-/// snapshot at emission time so audit entries survive later renames
-/// or account deletion (which sets `actor_user_id` to NULL on cascade).
+/// Who performed the audited action. Both `display_name` and the stored
+/// `actor_user_id` are frozen snapshots (the column carries no foreign
+/// key), so audit entries survive later renames or a physical account
+/// deletion with their hashes intact — the id simply dangles once the
+/// user is gone.
 #[derive(Debug, Clone)]
 pub struct Actor {
     pub user_id: UserId,
@@ -104,6 +106,14 @@ pub struct ListFilter {
     /// Max rows. Defaults to `DEFAULT_PAGE_SIZE` if `None`, clamped to
     /// `MAX_PAGE_SIZE`.
     pub limit: Option<u32>,
+    /// Exact `event_type` match. `None` = no type filter.
+    pub event_type: Option<String>,
+    /// Free-text search (`ILIKE`) over `event_type`, `actor_display_name`, and
+    /// the `event_data` text. `None` = no search.
+    pub search: Option<String>,
+    /// Row offset for page-number pagination. `None` = 0. Callers pick either
+    /// `offset` (page-number) or `before_seqno` (cursor), not both.
+    pub offset: Option<i64>,
 }
 
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
@@ -125,16 +135,69 @@ pub async fn list(pool: &PgPool, filter: &ListFilter) -> Result<Vec<AuditEvent>>
          WHERE ($1::uuid IS NULL OR actor_user_id = $1)
            AND ($2::timestamptz IS NULL OR occurred_at > $2)
            AND ($3::bigint IS NULL OR seqno < $3)
+           AND ($5::text IS NULL OR event_type = $5)
+           AND ($6::text IS NULL OR event_type ILIKE '%' || $6 || '%'
+                                 OR actor_display_name ILIKE '%' || $6 || '%'
+                                 OR event_data::text ILIKE '%' || $6 || '%')
          ORDER BY seqno DESC
-         LIMIT $4",
+         LIMIT $4 OFFSET $7",
     )
     .bind(filter.actor)
     .bind(filter.since)
     .bind(filter.before_seqno)
     .bind(i64::from(limit))
+    .bind(&filter.event_type)
+    .bind(&filter.search)
+    .bind(filter.offset.unwrap_or(0))
     .fetch_all(pool)
     .await?;
     Ok(events)
+}
+
+/// Count events matching `filter`'s content predicates (actor / since /
+/// event_type / search). Pagination knobs (limit / offset / before_seqno) are
+/// ignored — this is the total for "Page X of N".
+pub async fn count_filtered(pool: &PgPool, filter: &ListFilter) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events
+         WHERE ($1::uuid IS NULL OR actor_user_id = $1)
+           AND ($2::timestamptz IS NULL OR occurred_at > $2)
+           AND ($3::text IS NULL OR event_type = $3)
+           AND ($4::text IS NULL OR event_type ILIKE '%' || $4 || '%'
+                                 OR actor_display_name ILIKE '%' || $4 || '%'
+                                 OR event_data::text ILIKE '%' || $4 || '%')",
+    )
+    .bind(filter.actor)
+    .bind(filter.since)
+    .bind(&filter.event_type)
+    .bind(&filter.search)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Distinct event types present in the log, sorted — populates the type-filter
+/// dropdown in the UI.
+pub async fn distinct_event_types(pool: &PgPool) -> Result<Vec<String>> {
+    let types: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT event_type FROM audit.events ORDER BY event_type")
+            .fetch_all(pool)
+            .await?;
+    Ok(types)
+}
+
+/// Fetch a single event by `seqno` — backs the detail view (full event_data +
+/// chain hashes).
+pub async fn get(pool: &PgPool, seqno: i64) -> Result<Option<AuditEvent>> {
+    let event: Option<AuditEvent> = sqlx::query_as(
+        "SELECT seqno, occurred_at, actor_user_id, actor_display_name, app_id,
+                event_type, event_data, prev_hash, hash
+         FROM audit.events WHERE seqno = $1",
+    )
+    .bind(seqno)
+    .fetch_optional(pool)
+    .await?;
+    Ok(event)
 }
 
 /// Append a new event to the chain within the caller's transaction.

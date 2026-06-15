@@ -128,21 +128,12 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
         .execute(&app.pool)
         .await
         .unwrap();
-    // Soft-deleted user - hidden.
+    // Anonymized user - hidden.
     let gone = app
         .seed_user("gone@test.local", "Gone", "pw", InstanceRole::Member)
         .await;
-    sqlx::query("UPDATE identity.users SET lifecycle = 'soft_deleted' WHERE id = $1")
+    sqlx::query("UPDATE identity.users SET lifecycle = 'anonymized' WHERE id = $1")
         .bind(gone.id)
-        .execute(&app.pool)
-        .await
-        .unwrap();
-    // Hard-deleted user - hidden.
-    let purged = app
-        .seed_user("purged@test.local", "Purged", "pw", InstanceRole::Member)
-        .await;
-    sqlx::query("UPDATE identity.users SET lifecycle = 'hard_deleted' WHERE id = $1")
-        .bind(purged.id)
         .execute(&app.pool)
         .await
         .unwrap();
@@ -156,11 +147,7 @@ async fn list_users_shows_active_and_deactivated_hides_deleted() {
     assert!(emails.contains(&"ghost@test.local"));
     assert!(
         !emails.contains(&"gone@test.local"),
-        "soft_deleted must be hidden: {emails:?}"
-    );
-    assert!(
-        !emails.contains(&"purged@test.local"),
-        "hard_deleted must be hidden: {emails:?}"
+        "anonymized must be hidden: {emails:?}"
     );
 
     let ghost_view = users.iter().find(|u| u.email == "ghost@test.local").unwrap();
@@ -698,7 +685,7 @@ async fn reactivate_already_active_returns_409() {
 #[tokio::test]
 async fn cannot_target_self_for_any_lifecycle_action() {
     let (app, owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
-    for action in ["deactivate", "reactivate", "delete", "purge"] {
+    for action in ["deactivate", "reactivate", "anonymize", "delete"] {
         let resp = app
             .post(
                 &format!("/api/admin/members/{}/{action}", owner.id.0),
@@ -771,7 +758,7 @@ async fn owner_can_deactivate_admin() {
 async fn lifecycle_action_on_unknown_user_returns_404() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let bogus = Uuid::new_v4();
-    for action in ["deactivate", "reactivate", "delete", "purge"] {
+    for action in ["deactivate", "reactivate", "anonymize", "delete"] {
         let resp = app
             .post(
                 &format!("/api/admin/members/{bogus}/{action}"),
@@ -789,14 +776,14 @@ async fn lifecycle_action_on_unknown_user_returns_404() {
 }
 
 #[tokio::test]
-async fn delete_redacts_pii_and_frees_email() {
+async fn anonymize_redacts_pii_and_frees_email() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, user_tok) =
         seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::Member).await;
 
     let resp = app
         .post(
-            &format!("/api/admin/members/{user_id}/delete"),
+            &format!("/api/admin/members/{user_id}/anonymize"),
             Some(&owner_tok),
             None,
         )
@@ -807,7 +794,7 @@ async fn delete_redacts_pii_and_frees_email() {
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
 
-    // Row exists with redacted PII + soft_deleted lifecycle.
+    // Row exists with redacted PII + anonymized lifecycle.
     let (email, display, lifecycle): (String, String, String) = sqlx::query_as(
         "SELECT email, display_name, lifecycle::text FROM identity.users WHERE id = $1",
     )
@@ -815,7 +802,7 @@ async fn delete_redacts_pii_and_frees_email() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(lifecycle, "soft_deleted");
+    assert_eq!(lifecycle, "anonymized");
     assert_eq!(display, "[deleted user]");
     assert!(
         email.starts_with("deleted+") && email.ends_with("@purged.invalid"),
@@ -843,7 +830,7 @@ async fn delete_redacts_pii_and_frees_email() {
 
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
         "SELECT event_data FROM audit.events
-         WHERE event_type = 'user_deleted'
+         WHERE event_type = 'account_anonymized'
          ORDER BY seqno DESC LIMIT 1",
     )
     .fetch_one(&app.pool)
@@ -856,13 +843,13 @@ async fn delete_redacts_pii_and_frees_email() {
 }
 
 #[tokio::test]
-async fn purge_can_target_already_soft_deleted_user() {
+async fn delete_can_target_already_anonymized_user() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
         seed_user_token(&app, "victim@test.local", "Victim", "pw", InstanceRole::Member).await;
 
     app.post(
-        &format!("/api/admin/members/{user_id}/delete"),
+        &format!("/api/admin/members/{user_id}/anonymize"),
         Some(&owner_tok),
         None,
     )
@@ -871,64 +858,63 @@ async fn purge_can_target_already_soft_deleted_user() {
 
     let resp = app
         .post(
-            &format!("/api/admin/members/{user_id}/purge"),
+            &format!("/api/admin/members/{user_id}/delete"),
             Some(&owner_tok),
             None,
         )
         .await;
     resp.assert_status(StatusCode::NO_CONTENT);
 
-    let lifecycle: String =
-        sqlx::query_scalar("SELECT lifecycle::text FROM identity.users WHERE id = $1")
-            .bind(user_id)
-            .fetch_one(&app.pool)
-            .await
-            .unwrap();
-    assert_eq!(lifecycle, "hard_deleted");
+    // Delete is a true removal: the row is gone.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "delete physically removes the row");
 
     let (event_data,): (serde_json::Value,) = sqlx::query_as(
         "SELECT event_data FROM audit.events
-         WHERE event_type = 'user_purged'
+         WHERE event_type = 'account_deleted'
          ORDER BY seqno DESC LIMIT 1",
     )
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(event_data["prior_lifecycle"].as_str(), Some("soft_deleted"));
+    assert_eq!(event_data["prior_lifecycle"].as_str(), Some("anonymized"));
 }
 
 #[tokio::test]
-async fn purge_directly_from_active_works() {
+async fn delete_directly_from_active_works() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
         seed_user_token(&app, "v@test.local", "V", "pw", InstanceRole::Member).await;
 
     let resp = app
         .post(
-            &format!("/api/admin/members/{user_id}/purge"),
+            &format!("/api/admin/members/{user_id}/delete"),
             Some(&owner_tok),
             None,
         )
         .await;
     resp.assert_status(StatusCode::NO_CONTENT);
 
-    let lifecycle: String =
-        sqlx::query_scalar("SELECT lifecycle::text FROM identity.users WHERE id = $1")
-            .bind(user_id)
-            .fetch_one(&app.pool)
-            .await
-            .unwrap();
-    assert_eq!(lifecycle, "hard_deleted");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "delete physically removes the row");
 }
 
 #[tokio::test]
-async fn deleted_user_is_invisible_to_admin_list() {
+async fn anonymized_user_is_invisible_to_admin_list() {
     let (app, _owner, owner_tok, _admin, _admin_tok) = app_with_owner_and_admin().await;
     let (user_id, _tok) =
         seed_user_token(&app, "vanish@test.local", "Vanish", "pw", InstanceRole::Member).await;
 
     app.post(
-        &format!("/api/admin/members/{user_id}/delete"),
+        &format!("/api/admin/members/{user_id}/anonymize"),
         Some(&owner_tok),
         None,
     )
@@ -941,7 +927,7 @@ async fn deleted_user_is_invisible_to_admin_list() {
         .json();
     assert!(
         list.iter().all(|u| u.email != "vanish@test.local"),
-        "soft-deleted user should be hidden from /admin/users"
+        "anonymized user should be hidden from /admin/members"
     );
 }
 
@@ -951,9 +937,9 @@ async fn reactivate_only_works_from_deactivated_state() {
     let (user_id, _tok) =
         seed_user_token(&app, "u@test.local", "U", "pw", InstanceRole::Member).await;
 
-    // Soft-delete then attempt reactivate → 404 (account is gone).
+    // Anonymize then attempt reactivate → 404 (account is terminal).
     app.post(
-        &format!("/api/admin/members/{user_id}/delete"),
+        &format!("/api/admin/members/{user_id}/anonymize"),
         Some(&owner_tok),
         None,
     )

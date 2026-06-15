@@ -52,8 +52,8 @@ pub const VETO_WINDOW: Duration = Duration::hours(72);
 pub enum TransitionKind {
     RoleChange,
     Deactivate,
-    SoftDelete,
-    HardDelete,
+    Anonymize,
+    Delete,
 }
 
 /// Convenience: which kinds correspond to lifecycle actions (everything
@@ -64,16 +64,16 @@ pub use notifications::LifecycleAction;
 pub fn lifecycle_to_kind(action: LifecycleAction) -> TransitionKind {
     match action {
         LifecycleAction::Deactivate => TransitionKind::Deactivate,
-        LifecycleAction::SoftDelete => TransitionKind::SoftDelete,
-        LifecycleAction::HardDelete => TransitionKind::HardDelete,
+        LifecycleAction::Anonymize => TransitionKind::Anonymize,
+        LifecycleAction::Delete => TransitionKind::Delete,
     }
 }
 
 pub fn lifecycle_from_kind(kind: TransitionKind) -> Option<LifecycleAction> {
     match kind {
         TransitionKind::Deactivate => Some(LifecycleAction::Deactivate),
-        TransitionKind::SoftDelete => Some(LifecycleAction::SoftDelete),
-        TransitionKind::HardDelete => Some(LifecycleAction::HardDelete),
+        TransitionKind::Anonymize => Some(LifecycleAction::Anonymize),
+        TransitionKind::Delete => Some(LifecycleAction::Delete),
         TransitionKind::RoleChange => None,
     }
 }
@@ -152,8 +152,8 @@ pub async fn enqueue_role_change(
     .await
 }
 
-/// Insert a pending lifecycle-action row (deactivate / soft_delete /
-/// hard_delete). Same caller responsibilities as
+/// Insert a pending lifecycle-action row (deactivate / anonymize /
+/// delete). Same caller responsibilities as
 /// [`enqueue_role_change`]. Payload is empty `{}` — the kind itself
 /// fully describes the action.
 pub async fn enqueue_lifecycle(
@@ -375,6 +375,40 @@ async fn resolve(
     }
 }
 
+/// How a transition reached `applied` — drives the stored `resolution`, the
+/// audit `via`, and the `via_recovery_bypass` notification flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApplyVia {
+    /// The 72h veto window elapsed and the worker applied it on schedule.
+    Timer,
+    /// An Owner forced it through early with the server recovery code,
+    /// bypassing the veto window ("break glass" — force out a rogue Owner).
+    RecoveryBypass,
+}
+
+impl ApplyVia {
+    fn resolution(self) -> &'static str {
+        match self {
+            ApplyVia::Timer => "timer",
+            ApplyVia::RecoveryBypass => "recovery_bypass",
+        }
+    }
+    fn is_recovery_bypass(self) -> bool {
+        matches!(self, ApplyVia::RecoveryBypass)
+    }
+}
+
+/// Result of [`Worker::force_apply`].
+pub enum ForceApplyOutcome {
+    /// Applied immediately; carries the row in its post-update shape.
+    Applied(TransitionRow),
+    /// No transition with that id.
+    NotFound,
+    /// The transition was already resolved (applied / vetoed / cancelled) —
+    /// e.g. the timer or a veto won the race.
+    NotPending,
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Worker — applies due transitions
 // ────────────────────────────────────────────────────────────────────────
@@ -390,6 +424,28 @@ pub struct Worker {
 impl Worker {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Apply a **specific** pending transition immediately, bypassing the veto
+    /// timer — the server-recovery-code "break glass" path. The caller has
+    /// already verified the recovery code + Owner authz; `by` is the Owner who
+    /// forced it (recorded as the resolver + in the audit). Race-safe: if the
+    /// row was resolved (timer/veto) between the lookup and the claim, returns
+    /// [`ForceApplyOutcome::NotPending`].
+    pub async fn force_apply(&self, id: Uuid, by: UserId) -> Result<ForceApplyOutcome> {
+        let Some(row) = find_by_id(&self.pool, id).await? else {
+            return Ok(ForceApplyOutcome::NotFound);
+        };
+        if row.state != TransitionState::Pending {
+            return Ok(ForceApplyOutcome::NotPending);
+        }
+        match self
+            .apply_one(&row, ApplyVia::RecoveryBypass, Some(by))
+            .await?
+        {
+            Some(applied) => Ok(ForceApplyOutcome::Applied(applied)),
+            None => Ok(ForceApplyOutcome::NotPending),
+        }
     }
 
     /// Apply every pending transition whose `effective_at` has come due.
@@ -418,8 +474,10 @@ impl Worker {
 
         let mut applied = 0usize;
         for row in due {
-            match self.apply_one(&row).await {
-                Ok(()) => applied += 1,
+            match self.apply_one(&row, ApplyVia::Timer, None).await {
+                Ok(Some(_)) => applied += 1,
+                // Raced — vetoed/cancelled/applied between SELECT and claim.
+                Ok(None) => {}
                 Err(err) => {
                     tracing::error!(
                         ?err,
@@ -434,16 +492,28 @@ impl Worker {
         Ok(applied)
     }
 
-    async fn apply_one(&self, row: &TransitionRow) -> Result<()> {
+    /// Apply one transition. Returns `Some(applied_row)` if this call claimed
+    /// and applied it, `None` if it was already resolved (lost the race).
+    async fn apply_one(
+        &self,
+        row: &TransitionRow,
+        via: ApplyVia,
+        resolved_by: Option<UserId>,
+    ) -> Result<Option<TransitionRow>> {
         match row.kind {
-            TransitionKind::RoleChange => self.apply_role_change(row).await,
+            TransitionKind::RoleChange => self.apply_role_change(row, via, resolved_by).await,
             TransitionKind::Deactivate
-            | TransitionKind::SoftDelete
-            | TransitionKind::HardDelete => self.apply_lifecycle(row).await,
+            | TransitionKind::Anonymize
+            | TransitionKind::Delete => self.apply_lifecycle(row, via, resolved_by).await,
         }
     }
 
-    async fn apply_role_change(&self, row: &TransitionRow) -> Result<()> {
+    async fn apply_role_change(
+        &self,
+        row: &TransitionRow,
+        via: ApplyVia,
+        resolved_by: Option<UserId>,
+    ) -> Result<Option<TransitionRow>> {
         let payload = row.role_payload()?;
         let target_id = row
             .target_user_id
@@ -459,21 +529,24 @@ impl Worker {
         // and the row stays `pending` for the next cycle to retry.
         let claimed: Option<TransitionRow> = sqlx::query_as(
             "UPDATE pending.transitions
-             SET state = 'applied', resolved_at = now(), resolution = 'timer'
+             SET state = 'applied', resolved_at = now(), resolution = $2,
+                 resolved_by_user_id = $3
              WHERE id = $1 AND state = 'pending'
              RETURNING id, kind, initiator_user_id, target_user_id, payload, state,
                        effective_at, resolved_at, resolved_by_user_id, resolution,
                        created_at",
         )
         .bind(row.id)
+        .bind(via.resolution())
+        .bind(resolved_by)
         .fetch_optional(&mut *tx)
         .await?;
 
-        if claimed.is_none() {
-            // Someone vetoed / cancelled between our SELECT and UPDATE.
+        let Some(claimed) = claimed else {
+            // Vetoed / cancelled (or the timer beat us) between SELECT + UPDATE.
             tx.rollback().await?;
-            return Ok(());
-        }
+            return Ok(None);
+        };
 
         // Look up target's current display fields for audit + notification.
         let (target_email, target_display_name, initiator_display_name): (String, String, String) =
@@ -500,20 +573,18 @@ impl Worker {
             user_id: identity::UserId::new(initiator_id),
             display_name: initiator_display_name.clone(),
         };
-        audit::append(
-            &mut tx,
-            Some(&actor),
-            None,
-            "pending_role_change_applied",
-            serde_json::json!({
-                "transition_id": row.id,
-                "via": "timer",
-                "initiator_user_id": initiator_id,
-                "target_user_id": target_id,
-                "applied_role": payload.to_role,
-            }),
-        )
-        .await?;
+        let mut event_data = serde_json::json!({
+            "transition_id": row.id,
+            "via": via.resolution(),
+            "initiator_user_id": initiator_id,
+            "target_user_id": target_id,
+            "applied_role": payload.to_role,
+        });
+        if let Some(by) = resolved_by {
+            event_data["forced_by_user_id"] = serde_json::json!(by.0);
+        }
+        audit::append(&mut tx, Some(&actor), None, "pending_role_change_applied", event_data)
+            .await?;
 
         // Notify the target that the change has landed.
         notifications::enqueue(
@@ -523,7 +594,7 @@ impl Worker {
                 target_display_name,
                 initiator_display_name,
                 applied_role: payload.to_role,
-                via_recovery_bypass: false,
+                via_recovery_bypass: via.is_recovery_bypass(),
                 transition_id: Some(row.id),
             },
         )
@@ -531,14 +602,19 @@ impl Worker {
 
         tx.commit().await?;
         let _ = &updated;
-        Ok(())
+        Ok(Some(claimed))
     }
 
-    /// Apply a lifecycle transition (deactivate / soft_delete / hard_delete).
+    /// Apply a lifecycle transition (deactivate / anonymize / delete).
     /// All three follow the same transactional shape as role-change: claim
     /// the row, apply the lifecycle change, revoke sessions, audit, enqueue
     /// the applied-notification.
-    async fn apply_lifecycle(&self, row: &TransitionRow) -> Result<()> {
+    async fn apply_lifecycle(
+        &self,
+        row: &TransitionRow,
+        via: ApplyVia,
+        resolved_by: Option<UserId>,
+    ) -> Result<Option<TransitionRow>> {
         let action = lifecycle_from_kind(row.kind)
             .ok_or_else(|| PendingError::BadPayload(format!("not a lifecycle kind: {:?}", row.kind)))?;
         let target_id = row
@@ -552,20 +628,23 @@ impl Worker {
 
         let claimed: Option<TransitionRow> = sqlx::query_as(
             "UPDATE pending.transitions
-             SET state = 'applied', resolved_at = now(), resolution = 'timer'
+             SET state = 'applied', resolved_at = now(), resolution = $2,
+                 resolved_by_user_id = $3
              WHERE id = $1 AND state = 'pending'
              RETURNING id, kind, initiator_user_id, target_user_id, payload, state,
                        effective_at, resolved_at, resolved_by_user_id, resolution,
                        created_at",
         )
         .bind(row.id)
+        .bind(via.resolution())
+        .bind(resolved_by)
         .fetch_optional(&mut *tx)
         .await?;
 
-        if claimed.is_none() {
+        let Some(claimed) = claimed else {
             tx.rollback().await?;
-            return Ok(());
-        }
+            return Ok(None);
+        };
 
         // Capture display fields for audit + notification BEFORE any
         // redaction (delete/purge wipe the email + display_name).
@@ -588,19 +667,19 @@ impl Worker {
                 let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
                 (n, None::<String>)
             }
-            LifecycleAction::SoftDelete => {
+            LifecycleAction::Anonymize => {
                 let (_, original) =
-                    identity::UserRepository::soft_delete(&mut tx, target_user_id).await?;
+                    identity::UserRepository::anonymize(&mut tx, target_user_id).await?;
                 let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
                 auth::delete_credentials(&mut tx, target_user_id).await?;
                 (n, Some(original))
             }
-            LifecycleAction::HardDelete => {
-                let (_, original) =
-                    identity::UserRepository::hard_delete(&mut tx, target_user_id).await?;
-                let n = auth::SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-                auth::delete_credentials(&mut tx, target_user_id).await?;
-                (n, Some(original))
+            LifecycleAction::Delete => {
+                // True removal: the row goes, and every `auth.*` row cascades
+                // with it — so there's no separate session-revoke/credential
+                // delete and no redacted-from email to record.
+                identity::UserRepository::hard_remove(&mut tx, target_user_id).await?;
+                (0, None::<String>)
             }
         };
 
@@ -610,18 +689,21 @@ impl Worker {
         };
         let event_type = match action {
             LifecycleAction::Deactivate => "user_deactivated",
-            LifecycleAction::SoftDelete => "user_deleted",
-            LifecycleAction::HardDelete => "user_purged",
+            LifecycleAction::Anonymize => "account_anonymized",
+            LifecycleAction::Delete => "account_deleted",
         };
         let mut event_data = serde_json::json!({
             "transition_id": row.id,
-            "via": "timer",
+            "via": via.resolution(),
             "initiator_user_id": initiator_id,
             "target_user_id": target_id,
             "sessions_revoked": sessions_revoked,
         });
         if let Some(orig) = &original_email {
             event_data["redacted_from_email"] = serde_json::Value::String(orig.clone());
+        }
+        if let Some(by) = resolved_by {
+            event_data["forced_by_user_id"] = serde_json::json!(by.0);
         }
         audit::append(&mut tx, Some(&actor), None, event_type, event_data).await?;
 
@@ -632,14 +714,14 @@ impl Worker {
                 target_display_name,
                 initiator_display_name,
                 action,
-                via_recovery_bypass: false,
+                via_recovery_bypass: via.is_recovery_bypass(),
                 transition_id: Some(row.id),
             },
         )
         .await?;
 
         tx.commit().await?;
-        Ok(())
+        Ok(Some(claimed))
     }
 
     /// Long-running poll loop. Polls every `interval`. Exits when `shutdown`

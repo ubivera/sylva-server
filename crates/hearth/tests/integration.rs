@@ -16,10 +16,16 @@ mod admin;
 mod audit_chain;
 #[path = "integration/auth.rs"]
 mod auth;
+#[path = "integration/events.rs"]
+mod events;
 #[path = "integration/notifications.rs"]
 mod notifications;
 #[path = "integration/pending_transitions.rs"]
 mod pending_transitions;
+#[path = "integration/recovery.rs"]
+mod recovery;
+#[path = "integration/settings.rs"]
+mod settings;
 #[path = "integration/web.rs"]
 mod web;
 #[path = "integration/web_admin_actions.rs"]

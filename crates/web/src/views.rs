@@ -24,11 +24,13 @@ fn asset_version() -> &'static str {
     })
 }
 
-/// Per-request context for authenticated chrome. Borrowed pointers so
-/// handlers can pass references straight from `AppState` + the
-/// authenticated user without cloning.
+/// Per-request context for authenticated chrome. Mostly borrowed pointers so
+/// handlers can pass references straight from `AppState` + the authenticated
+/// user without cloning; `instance_name` is a cheap `Arc<String>` snapshot of
+/// the hot-swappable `AppState::instance_name` cell (Owner-editable at runtime).
 pub struct ChromeContext<'a> {
-    pub instance_name: &'a str,
+    /// Instance display name, read from the live (Owner-editable) cell.
+    pub instance_name: std::sync::Arc<String>,
     pub user: &'a User,
     /// CSRF token for this session — derived via
     /// [`hearth::csrf::compute_token`]. Embed in every state-changing
@@ -59,7 +61,9 @@ pub fn csrf_input(token: &str) -> Markup {
 pub enum PageId {
     Profile,
     Members,
+    Events,
     Pending,
+    Settings,
 }
 
 /// Sortable column on `/users`. Default is `Joined` ascending, which
@@ -200,8 +204,8 @@ pub enum MemberRow<'a> {
 /// in the toolbar and round-trips via the `?filter=...` query param.
 ///
 /// `All` is the default — same data set as the unfiltered listing
-/// (`list_all`: Active + PendingInvite + Deactivated). `Status(Deleted)`
-/// is the one filter that *expands* visibility (surfaces SoftDeleted
+/// (`list_all`: Active + PendingInvite + Deactivated). `Status(Anonymized)`
+/// is the one filter that *expands* visibility (surfaces `Anonymized`
 /// rows that `list_all` hides), via `list_with_lifecycle`.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemberFilter {
@@ -222,9 +226,7 @@ impl MemberFilter {
             MemberFilter::Status(UserLifecycle::Active) => "status:active",
             MemberFilter::Status(UserLifecycle::PendingInvite) => "status:pending",
             MemberFilter::Status(UserLifecycle::Deactivated) => "status:deactivated",
-            MemberFilter::Status(UserLifecycle::SoftDeleted) => "status:deleted",
-            // HardDeleted is not surfaced in the UI — treat as "all".
-            MemberFilter::Status(UserLifecycle::HardDeleted) => "all",
+            MemberFilter::Status(UserLifecycle::Anonymized) => "status:anonymized",
         }
     }
 
@@ -240,7 +242,7 @@ impl MemberFilter {
             "status:active" => MemberFilter::Status(UserLifecycle::Active),
             "status:pending" => MemberFilter::Status(UserLifecycle::PendingInvite),
             "status:deactivated" => MemberFilter::Status(UserLifecycle::Deactivated),
-            "status:deleted" => MemberFilter::Status(UserLifecycle::SoftDeleted),
+            "status:anonymized" => MemberFilter::Status(UserLifecycle::Anonymized),
             _ => MemberFilter::All,
         }
     }
@@ -255,8 +257,7 @@ impl MemberFilter {
             MemberFilter::Status(UserLifecycle::Active) => "Active",
             MemberFilter::Status(UserLifecycle::PendingInvite) => "Pending invite",
             MemberFilter::Status(UserLifecycle::Deactivated) => "Deactivated",
-            MemberFilter::Status(UserLifecycle::SoftDeleted) => "Deleted",
-            MemberFilter::Status(UserLifecycle::HardDeleted) => "View all",
+            MemberFilter::Status(UserLifecycle::Anonymized) => "Anonymized",
         }
     }
 }
@@ -356,7 +357,7 @@ fn shell_app_inner(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " · " (ctx.instance_name) }
+                title { (title) " · " (ctx.instance_name.as_str()) }
                 // Theme bootstrap runs before the stylesheet link so
                 // it can stamp `<html data-theme>` ahead of the first
                 // paint — no flash of system-theme before the saved
@@ -418,6 +419,12 @@ fn shell_app_inner(
                 }
                 script {
                     (maud::PreEscaped(CHANGE_PASSWORD_GATE_JS))
+                }
+                // Data Control → Anonymize / Delete confirm gate (checkbox +
+                // type-your-email). Delegated on document, dormant until a
+                // close-account dialog appears.
+                script {
+                    (maud::PreEscaped(ACCOUNT_CLOSE_GATE_JS))
                 }
                 // Copy-to-clipboard for the recovery-code display that
                 // can surface in the reauth modal after a regenerate
@@ -1066,7 +1073,7 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                     }
                     span class="brand-prefix" { "Sylva" }
                     span class="brand-sep" { " · " }
-                    span class="brand-instance" { (ctx.instance_name) }
+                    span class="brand-instance" { (ctx.instance_name.as_str()) }
                 }
             }
 
@@ -1091,6 +1098,25 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                         current == PageId::Members,
                         ctx.pending_count,
                         users_icon(),
+                    ))
+                    // Audit log viewer — Admins + Owners. `/events` re-checks
+                    // the role server-side.
+                    (nav_link(
+                        "/events",
+                        "Events",
+                        current == PageId::Events,
+                        events_icon(),
+                    ))
+                }
+                // Owner-only: instance configuration. Admins manage users;
+                // Owners configure the instance. Defense-in-depth — `/settings`
+                // re-checks the role server-side.
+                @if is_owner(ctx.user.instance_role) {
+                    (nav_link(
+                        "/settings",
+                        "Settings",
+                        current == PageId::Settings,
+                        settings_icon(),
                     ))
                 }
             }
@@ -1435,6 +1461,61 @@ pub fn login_page(error: Option<&str>, prefill_email: Option<&str>) -> Markup {
     shell_public("Sign in", content)
 }
 
+/// `GET /goodbye` — public confirmation shown after a user closes their own
+/// account from Data Control. `mode == "deleted"` means the account and all
+/// its data were permanently removed; anything else is the anonymize close
+/// (the account is shut and the personal info scrubbed, data left in place).
+/// Public: the session is gone by the time the browser lands here.
+pub fn goodbye_page(mode: &str) -> Markup {
+    let deleted = mode == "deleted";
+    let (title, body) = if deleted {
+        (
+            "Your account has been deleted",
+            "Everything tied to your account has been permanently removed from \
+             this server, including anything you created or shared. There's \
+             nothing left to recover. Thank you for having been here.",
+        )
+    } else {
+        (
+            "Your account has been closed",
+            "Your account is closed and your personal information has been \
+             removed from it. Anything you took part in stays in place, no \
+             longer linked to you. Thank you for having been here.",
+        )
+    };
+    let content = html! {
+        h1 { (title) }
+        div class="card" {
+            p class="muted" { (body) }
+            p class="login-recover-link" {
+                a href="/login" { "Back to sign in" }
+            }
+        }
+    };
+    shell_public(title, content)
+}
+
+/// Terminal page served on **every** web route once the instance has been
+/// closed (the last user left). No auth, no actions — there's nothing left to
+/// do but read it. Styled via `/assets`, which the closed-page middleware
+/// exempts. Reachable again only after a `clean` + re-`provision`.
+pub fn instance_closed_page() -> Markup {
+    let content = html! {
+        h1 { "This server has been closed. Goodbye." }
+        div class="card" {
+            p class="muted" {
+                "An owner has deleted this instance and all its data. This instance "
+                "is no longer in use and there's nothing here anymore. For users, "
+                "feel free to close this tab and move on. Desktop and mobile apps will "
+                "no longer sync any of your data, and will switch to offline mode on "
+                "next use. For owners, please shut down the server application one last  "
+                "time and uninstall the software from the host."
+            }
+        }
+    };
+    shell_public("Server closed", content)
+}
+
 /// `GET /recover` — public start of the offline account-recovery flow.
 /// The operator enters their email + the recovery code they saved at
 /// invite acceptance (or last regeneration). `error` renders a generic
@@ -1445,7 +1526,7 @@ pub fn recover_page(error: Option<&str>) -> Markup {
         div class="card" {
             p class="muted recover-intro" {
                 "Enter your email and the recovery code you saved. We'll "
-                "let you set a new password. Sylva is offline-first — "
+                "let you set a new password. Sylva is offline-first - "
                 "there's no reset email, so the recovery code is the only "
                 "way back in."
             }
@@ -1592,8 +1673,7 @@ pub fn me_page(ctx: &ChromeContext) -> Markup {
         UserLifecycle::Active => "Active",
         UserLifecycle::Deactivated => "Deactivated",
         UserLifecycle::PendingInvite => "Pending invitation",
-        UserLifecycle::SoftDeleted => "Deleted",
-        UserLifecycle::HardDeleted => "Purged",
+        UserLifecycle::Anonymized => "Anonymized",
     };
     let content = html! {
         div class="card me-card" {
@@ -1706,12 +1786,21 @@ fn invite_form_fields(
 /// The form's `action` attribute is empty at render time; the JS
 /// chain in `REAUTH_CHAIN_JS` sets both `action` and `hx-post` to
 /// whichever per-row action URL the operator initiated.
-pub fn reauth_modal(ctx: &ChromeContext, has_totp: bool, has_passkey: bool, fresh: bool) -> Markup {
+pub fn reauth_modal(
+    ctx: &ChromeContext,
+    has_totp: bool,
+    has_passkey: bool,
+    fresh: bool,
+    critical: bool,
+) -> Markup {
     html! {
+        // A `critical` modal never advertises freshness, so the chain always
+        // shows the factor prompt — irreversible account actions re-prove a
+        // factor regardless of the ordinary 5-minute sudo window.
         dialog id="dlg-reauth" class="action-dialog reauth-dialog"
-               data-sudo-fresh=[fresh.then_some("1")] {
+               data-sudo-fresh=[(fresh && !critical).then_some("1")] {
             div id="reauth-modal-content" {
-                (reauth_modal_content(ctx, has_totp, has_passkey, None))
+                (reauth_modal_content(ctx, has_totp, has_passkey, None, critical))
             }
         }
     }
@@ -1734,6 +1823,7 @@ pub fn reauth_modal_content(
     has_totp: bool,
     has_passkey: bool,
     error: Option<&str>,
+    critical: bool,
 ) -> Markup {
     // Password path is offered when there's no passkey, or as the
     // fallback when a passkey user also has TOTP (still AAL2).
@@ -1767,6 +1857,7 @@ pub fn reauth_modal_content(
                 form id="form-reauth-passkey" hx-post="/me/reauth"
                      hx-target="#reauth-modal-content" hx-swap="innerHTML" {
                     (csrf_input(ctx.csrf_token))
+                    @if critical { input type="hidden" name="critical" value="1"; }
                     input type="hidden" name="challenge_id";
                     input type="hidden" name="passkey";
                 }
@@ -1820,6 +1911,7 @@ pub fn reauth_modal_content(
                 form id="form-reauth" hx-post="/me/reauth"
                      hx-target="#reauth-modal-content" hx-swap="innerHTML" {
                     (csrf_input(ctx.csrf_token))
+                    @if critical { input type="hidden" name="critical" value="1"; }
                     div class="field" {
                         label for="reauth-password" { "Password" }
                         input type="password" id="reauth-password" name="password"
@@ -2061,6 +2153,7 @@ pub fn account_settings_modal(
     sessions: &[auth::Session],
     current_session_id: uuid::Uuid,
     now: chrono::DateTime<chrono::Utc>,
+    last_owner_blocked: bool,
 ) -> Markup {
     html! {
         dialog id="dlg-account-settings"
@@ -2146,7 +2239,7 @@ pub fn account_settings_modal(
                     div class="settings-panel"
                         role="tabpanel"
                         data-settings-panel="data" {
-                        (settings_data_panel(ctx, recovery_meta))
+                        (settings_data_panel(ctx, recovery_meta, last_owner_blocked))
                     }
                 }
             }
@@ -2851,6 +2944,7 @@ pub fn passkey_limit_reached_content() -> Markup {
 fn settings_data_panel(
     ctx: &ChromeContext,
     recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
+    last_owner_blocked: bool,
 ) -> Markup {
     html! {
         section class="settings-section" {
@@ -2893,6 +2987,12 @@ fn settings_data_panel(
                 }
             }
         }
+        // Danger zone — close your own account. Anonymize keeps the data
+        // under a closed account; Delete erases everything. Both gate on a
+        // forced critical re-auth, and are disabled (with a transfer-first
+        // note) while the caller is the last owner with other users present.
+        (account_close_section(false, last_owner_blocked))
+        (account_close_section(true, last_owner_blocked))
     }
 }
 
@@ -2927,6 +3027,191 @@ pub fn recovery_status(
                     p class="settings-row-hint" {
                         "No recovery code on file. Generate one "
                         "now so you can recover this account later."
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One Data Control "danger zone" section — Anonymize (`delete_mode =
+/// false`) or Delete (`delete_mode = true`). Each is a short explainer plus
+/// a button that opens the matching confirm dialog on demand
+/// (`/modals/account/{anonymize|delete}`). The real gating (acknowledge +
+/// type-email + forced re-auth) lives in that dialog.
+fn account_close_section(delete_mode: bool, blocked: bool) -> Markup {
+    let (title, tagline, hint, label, modal) = if delete_mode {
+        (
+            "Delete my account",
+            "Permanently erase your account and everything you created \
+             across the ecosystem.",
+            "Everything tied to your account is removed from the server, \
+             even data shared with others. This cannot be undone.",
+            "Delete my account",
+            "/modals/account/delete",
+        )
+    } else {
+        (
+            "Anonymize my account",
+            "Close your account and strip your personal information, leaving \
+             anything you took part in under a closed account.",
+            "Your sign-in is removed and the account can't be reopened; your \
+             data stays in place, no longer linked to you. This cannot be undone.",
+            "Anonymize my account",
+            "/modals/account/anonymize",
+        )
+    };
+    html! {
+        section class="settings-section settings-section-danger" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" {
+                    @if delete_mode { (trash_icon()) } @else { (incognito_icon()) }
+                }
+                div {
+                    h3 { (title) }
+                    p class="settings-section-tagline" { (tagline) }
+                }
+            }
+            div class="settings-section-body" {
+                div class="settings-danger-row" {
+                    p class="settings-row-hint" { (hint) }
+                    @if blocked {
+                        p class="settings-row-note" {
+                            "You're the last owner. Transfer ownership to someone "
+                            "first (Members \u{2192} \u{22ef} \u{2192} Change role "
+                            "\u{2192} Owner), then you can close your account."
+                        }
+                        div class="settings-row-actions" {
+                            button type="button" class="btn-danger-ghost" disabled {
+                                (label)
+                            }
+                        }
+                    } @else {
+                        div class="settings-row-actions" {
+                            button type="button" class="btn-danger-ghost"
+                                   data-open-modal=(modal) {
+                                (label)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inner content shown when a close is blocked because the caller is the last
+/// owner with other users still present. Rendered both inside the confirm
+/// dialog (`account_close_modal`, `blocked = true`) and as the server-side
+/// backstop swapped into `#reauth-modal-content` if the action is reached
+/// anyway.
+pub fn account_close_blocked_content() -> Markup {
+    html! {
+        div class="dialog-header" {
+            div class="dialog-icon dialog-alert" { (alert_circle_icon()) }
+            button type="button" class="dialog-close" data-close-dialog
+                   aria-label="Close" {
+                (close_icon())
+            }
+        }
+        h2 class="dialog-center-title" { "Transfer ownership first" }
+        p class="dialog-description dialog-center-text" {
+            "You're the last owner of this server. Make someone else an owner "
+            "(Members \u{2192} \u{22ef} \u{2192} Change role \u{2192} Owner) before "
+            "you close your account, so the instance isn't left without an "
+            "administrator."
+        }
+        div class="dialog-actions dialog-actions-centered" {
+            button type="button" class="btn" data-close-dialog { "Got it" }
+        }
+    }
+}
+
+/// Confirm dialog for closing your own account — fetched on demand into
+/// `#modal-host` from `/modals/account/{anonymize|delete}`. Mirrors the admin
+/// destructive dialogs (centered danger chrome + alert + type-to-confirm) but
+/// stacks two gates before the action button enables: an "I understand"
+/// checkbox (`data-close-ack`) *and* typing your own email
+/// (`data-close-email`), wired by `ACCOUNT_CLOSE_GATE_JS`. The confirm button
+/// then drives the **critical** re-auth (`data-reauth-critical`), which always
+/// re-prompts regardless of the sudo window. When `blocked` (last owner with
+/// others present), the dangerous form is replaced by a "transfer first" note.
+pub fn account_close_modal(ctx: &ChromeContext, delete_mode: bool, blocked: bool) -> Markup {
+    if blocked {
+        let slug = if delete_mode { "delete" } else { "anonymize" };
+        return html! {
+            dialog id=(format!("dlg-account-{slug}"))
+                   class="action-dialog action-dialog-centered" {
+                (account_close_blocked_content())
+            }
+        };
+    }
+    let (slug, action, title, lead, alert, button) = if delete_mode {
+        (
+            "delete",
+            "/me/account/delete",
+            "Delete your account",
+            "Everything you created across the ecosystem is permanently \
+             removed, even data shared with others, leaving no trace of your \
+             footprint. Your account becomes inaccessible right away.",
+            "This permanently deletes your account and all of its data. It \
+             cannot be undone.",
+            "Delete my account",
+        )
+    } else {
+        (
+            "anonymize",
+            "/me/account/anonymize",
+            "Anonymize your account",
+            "Your account is closed and your personal information is removed \
+             from it. Anything you took part in stays in place under a closed \
+             account, no longer linked to you. Your account becomes \
+             inaccessible right away.",
+            "This permanently closes your account. It cannot be undone.",
+            "Anonymize my account",
+        )
+    };
+    let form_id = format!("form-account-{slug}");
+    let input_id = format!("confirm-email-{slug}");
+    let email = &ctx.user.email;
+    html! {
+        dialog id=(format!("dlg-account-{slug}"))
+               class="action-dialog action-dialog-centered" {
+            form id=(form_id) method="post" action=(action) {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-danger" {
+                        @if delete_mode { (trash_icon()) } @else { (incognito_icon()) }
+                    }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 class="dialog-center-title" { (title) }
+                p class="dialog-description dialog-center-text" { (lead) }
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { (alert) }
+                }
+                (csrf_input(ctx.csrf_token))
+                label class="confirm-checkbox-field" {
+                    input type="checkbox" class="member-checkbox" data-close-ack;
+                    span { "I understand this is permanent and that I won't be able to sign in again." }
+                }
+                div class="field confirm-name-field" {
+                    label for=(input_id) {
+                        "Type your email " strong { "\"" (email) "\"" } " to confirm"
+                    }
+                    input type="text" id=(input_id) data-close-email=(email)
+                          autocomplete="off" spellcheck="false" autocapitalize="off";
+                }
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn-danger"
+                           data-reauth-confirm=(form_id)
+                           data-reauth-critical
+                           disabled {
+                        (button)
                     }
                 }
             }
@@ -3732,7 +4017,7 @@ fn alert_circle_icon() -> Markup {
 }
 
 /// 22px trash-can icon used as the centered feature icon on the
-/// Purge modal (terminal hard-delete). Stroke uses `currentColor`
+/// Delete modal (terminal full removal). Stroke uses `currentColor`
 /// so the icon inherits the `.dialog-icon-danger` red tint without
 /// needing a dedicated fill rule.
 fn trash_icon() -> Markup {
@@ -3793,7 +4078,7 @@ fn search_glyph_icon() -> Markup {
 /// icon on the Anonymize modal. The classic browser-incognito
 /// imagery telegraphs "identity is scrubbed; the row stays" more
 /// accurately than a trash can, which reads as terminal delete and
-/// blurs the distinction with the Purge modal. Stroke + fill both
+/// blurs the distinction with the Delete modal. Stroke + fill both
 /// use `currentColor` so the icon inherits the
 /// `.dialog-icon-danger` red tint; the sunglass lenses fill solid
 /// for the iconic dark-lens silhouette.
@@ -4079,8 +4364,8 @@ pub struct MembersBanner<'a> {
     pub error: Option<&'a str>,
 }
 
-/// `GET /members` page — admin-only directory of every non-purged Member.
-/// Renders as a table; soft/hard-deleted accounts and Guests are filtered
+/// `GET /members` page — admin-only directory of live Members.
+/// Renders as a table; anonymized accounts and Guests are filtered
 /// out by [`identity::UserRepository::list_all`]. Each row carries a
 /// kebab (`<details>`) menu whose contents depend on the viewer's role
 /// and the target's lifecycle (see [`available_actions`]).
@@ -4694,6 +4979,48 @@ const CONFIRM_CHECKBOX_JS: &str = r#"
 })();
 "#;
 
+// Account-close confirm dialogs (Data Control → Anonymize / Delete): the
+// danger button enables only when BOTH gates pass — the "I understand"
+// checkbox (data-close-ack) is ticked AND the typed value matches the account
+// email (data-close-email, case-insensitive + trimmed). Deliberately distinct
+// attribute names from CONFIRM_NAME_JS / CONFIRM_CHECKBOX_JS so the gates never
+// fight when both scripts are present (the settings modal can be opened from
+// /members, which loads those). Reset on dialog close.
+const ACCOUNT_CLOSE_GATE_JS: &str = r#"
+(function() {
+    function refresh(dialog) {
+        if (!dialog) return;
+        var email = dialog.querySelector('[data-close-email]');
+        var ack = dialog.querySelector('[data-close-ack]');
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (!btn) return;
+        var want = ((email && email.getAttribute('data-close-email')) || '').trim().toLowerCase();
+        var got = ((email && email.value) || '').trim().toLowerCase();
+        var emailOk = want.length > 0 && got === want;
+        var ackOk = !!(ack && ack.checked);
+        btn.disabled = !(emailOk && ackOk);
+    }
+    document.addEventListener('input', function(e) {
+        var el = e.target.closest('[data-close-email]');
+        if (el) refresh(el.closest('dialog'));
+    });
+    document.addEventListener('change', function(e) {
+        var el = e.target.closest('[data-close-ack]');
+        if (el) refresh(el.closest('dialog'));
+    });
+    document.addEventListener('close', function(e) {
+        var dialog = e.target;
+        if (!(dialog instanceof HTMLDialogElement)) return;
+        var email = dialog.querySelector('[data-close-email]');
+        if (email) email.value = '';
+        var ack = dialog.querySelector('[data-close-ack]');
+        if (ack) ack.checked = false;
+        var btn = dialog.querySelector('[data-reauth-confirm]');
+        if (btn && (email || ack)) btn.disabled = true;
+    }, true);
+})();
+"#;
+
 // Chains action dialog → reauth modal. Any button with
 // `data-reauth-confirm="<form-id>"` does:
 //   1. Read the named form's action URL + payload (skipping the form's
@@ -4786,13 +5113,19 @@ const REAUTH_CHAIN_JS: &str = r#"
         var sourceDialog = btn.closest('dialog');
         var keepSource = btn.hasAttribute('data-keep-source');
         var keepSourceOpen = btn.hasAttribute('data-keep-source-open');
+        // Irreversible account actions (self anonymize / delete) demand a
+        // *critical* re-auth: the modal then never reports a fresh grant, so
+        // the factor prompt always shows, and the verify mints the separate
+        // short-lived grant those handlers require.
+        var critical = btn.hasAttribute('data-reauth-critical');
+        var reauthUrl = critical ? '/modals/reauth?critical=1' : '/modals/reauth';
 
         // (Re)fetch the reauth modal — it carries data-sudo-fresh telling us
         // whether a recent step-up still covers this action. Drop a stale
         // one first so the flag is current.
         var stale = document.getElementById('dlg-reauth');
         if (stale) stale.remove();
-        window.hearthOpenModal('/modals/reauth').then(function(dlg) {
+        window.hearthOpenModal(reauthUrl).then(function(dlg) {
             if (!dlg) return;
             var fresh = dlg.dataset.sudoFresh === '1';
 
@@ -4907,7 +5240,7 @@ fn filter_menu(current: MemberFilter, sort: SortState) -> Markup {
                 (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::Active)))
                 (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::PendingInvite)))
                 (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::Deactivated)))
-                (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::SoftDeleted)))
+                (filter_menu_item(current, sort, MemberFilter::Status(UserLifecycle::Anonymized)))
             }
         }
     }
@@ -5271,8 +5604,8 @@ pub(crate) enum RowAction {
     Deactivate,
     Reactivate,
     ChangeRole,
+    Anonymize,
     Delete,
-    Purge,
 }
 
 /// Map a member-action modal path segment to the `RowAction` it gates
@@ -5285,8 +5618,8 @@ pub(crate) fn row_action_for_segment(seg: &str) -> Option<RowAction> {
         "deactivate" => Some(RowAction::Deactivate),
         "reactivate" => Some(RowAction::Reactivate),
         "role" | "role-owner-confirm" => Some(RowAction::ChangeRole),
+        "anonymize" => Some(RowAction::Anonymize),
         "delete" => Some(RowAction::Delete),
-        "purge" => Some(RowAction::Purge),
         _ => None,
     }
 }
@@ -5310,8 +5643,8 @@ pub(crate) fn member_action_modal(
         "role-owner-confirm" => {
             Some(role_owner_confirm_dialog(id, &target.display_name, csrf_token))
         }
+        "anonymize" => Some(render_action_dialog(RowAction::Anonymize, target, csrf_token, id)),
         "delete" => Some(render_action_dialog(RowAction::Delete, target, csrf_token, id)),
-        "purge" => Some(render_action_dialog(RowAction::Purge, target, csrf_token, id)),
         _ => None,
     }
 }
@@ -5358,8 +5691,8 @@ pub(crate) fn available_actions(
     if matches!(viewer, InstanceRole::Owner) {
         actions.push(RowAction::ChangeRole);
     }
+    actions.push(RowAction::Anonymize);
     actions.push(RowAction::Delete);
-    actions.push(RowAction::Purge);
     actions
 }
 
@@ -5380,8 +5713,8 @@ fn self_row_actions(viewer: InstanceRole, lifecycle: UserLifecycle) -> Vec<RowAc
     if matches!(viewer, InstanceRole::Owner) {
         actions.push(RowAction::ChangeRole);
     }
+    actions.push(RowAction::Anonymize);
     actions.push(RowAction::Delete);
-    actions.push(RowAction::Purge);
     actions
 }
 
@@ -5440,22 +5773,18 @@ fn render_action_item(
                 "Change role…"
             }
         },
-        // RowAction::Delete = soft delete (anonymize). The kebab
-        // label calls it "Anonymize…" so operators understand it
-        // keeps shared content under an anonymized account. The
-        // internal `Delete` enum + `/delete` URL keep their names;
-        // only the visible label differs.
-        RowAction::Delete => html! {
+        // Anonymize — keeps shared content under an anonymized (redacted)
+        // account.
+        RowAction::Anonymize => html! {
             button type="button" class="row-action-item row-action-danger"
-                   data-open-modal=(format!("/members/{id}/modal/delete")) {
+                   data-open-modal=(format!("/members/{id}/modal/anonymize")) {
                 "Anonymize…"
             }
         },
-        // RowAction::Purge = hard delete (full removal). The kebab
-        // label calls it "Delete…" — the terminal, total action.
-        RowAction::Purge => html! {
+        // Delete — the terminal, total action: physically removes the row.
+        RowAction::Delete => html! {
             button type="button" class="row-action-item row-action-danger"
-                   data-open-modal=(format!("/members/{id}/modal/purge")) {
+                   data-open-modal=(format!("/members/{id}/modal/delete")) {
                 "Delete…"
             }
         },
@@ -5471,8 +5800,8 @@ fn render_locked_item(action: RowAction) -> Markup {
         RowAction::Deactivate => ("Deactivate", false),
         RowAction::Reactivate => ("Reactivate", false),
         RowAction::ChangeRole => ("Change role…", false),
-        RowAction::Delete => ("Anonymize…", true),
-        RowAction::Purge => ("Delete…", true),
+        RowAction::Anonymize => ("Anonymize…", true),
+        RowAction::Delete => ("Delete…", true),
     };
     let class = if danger {
         "row-action-item row-action-locked row-action-danger"
@@ -5786,22 +6115,21 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
             // separately once the operator picks Owner. See
             // REAUTH_CHAIN_JS.
         },
-        // RowAction::Delete = soft delete, surfaced as "Anonymize".
-        // Account row stays so any non-orphaned content (comments on
-        // shared docs, shared list ownership, etc.) keeps its byline;
-        // just the person's identity is scrubbed. Centered chrome +
-        // danger-red feature icon so the destructive nature is
+        // RowAction::Anonymize — the account row stays so any non-orphaned
+        // content (comments on shared docs, shared list ownership, etc.)
+        // keeps its byline; just the person's identity is scrubbed. Centered
+        // chrome + danger-red feature icon so the destructive nature is
         // immediately visible.
-        RowAction::Delete => html! {
-            dialog id=(format!("dlg-delete-{id}"))
+        RowAction::Anonymize => html! {
+            dialog id=(format!("dlg-anonymize-{id}"))
                    class="action-dialog action-dialog-centered" {
-                form id=(format!("form-delete-{id}"))
-                     method="post" action=(format!("/members/{id}/delete")) {
+                form id=(format!("form-anonymize-{id}"))
+                     method="post" action=(format!("/members/{id}/anonymize")) {
                     div class="dialog-header" {
                         div class="dialog-icon dialog-icon-danger" {
                             // Incognito glyph (not trash) — the row is
                             // *anonymized*, not deleted. Trash is reserved
-                            // for the Purge modal below.
+                            // for the Delete modal below.
                             (incognito_icon())
                         }
                         button type="button" class="dialog-close" data-close-dialog
@@ -5820,12 +6148,12 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                         (alert_circle_icon())
                         span { "This action is permanent and cannot be undone." }
                     }
-                    (confirm_name_field(id, name, "delete"))
+                    (confirm_name_field(id, name, "anonymize"))
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
                         button type="button" class="btn-danger"
-                               data-reauth-confirm=(format!("form-delete-{id}"))
+                               data-reauth-confirm=(format!("form-anonymize-{id}"))
                                disabled {
                             "Anonymize"
                         }
@@ -5833,16 +6161,15 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                 }
             }
         },
-        // RowAction::Purge = hard delete, surfaced as "Delete". The
-        // account and every piece of content it created is dropped,
-        // even if other members were collaborating on that content.
-        // Heavier hammer than Anonymize; same chrome so the two read
-        // as a pair, same alert because both are terminal.
-        RowAction::Purge => html! {
-            dialog id=(format!("dlg-purge-{id}"))
+        // RowAction::Delete = full removal. The account and every piece of
+        // content it created is dropped, even if other members were
+        // collaborating on that content. Heavier hammer than Anonymize; same
+        // chrome so the two read as a pair, same alert because both are terminal.
+        RowAction::Delete => html! {
+            dialog id=(format!("dlg-delete-{id}"))
                    class="action-dialog action-dialog-centered" {
-                form id=(format!("form-purge-{id}"))
-                     method="post" action=(format!("/members/{id}/purge")) {
+                form id=(format!("form-delete-{id}"))
+                     method="post" action=(format!("/members/{id}/delete")) {
                     div class="dialog-header" {
                         div class="dialog-icon dialog-icon-danger" {
                             (trash_icon())
@@ -5864,12 +6191,12 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                         (alert_circle_icon())
                         span { "This action is permanent and cannot be undone." }
                     }
-                    (confirm_name_field(id, name, "purge"))
+                    (confirm_name_field(id, name, "delete"))
                     (csrf_input(csrf_token))
                     div class="dialog-actions" {
                         button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
                         button type="button" class="btn-danger"
-                               data-reauth-confirm=(format!("form-purge-{id}"))
+                               data-reauth-confirm=(format!("form-delete-{id}"))
                                disabled {
                             "Delete"
                         }
@@ -5891,6 +6218,806 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
 fn render_banner(_banner: &MembersBanner<'_>) -> Markup {
     html! {}
 }
+
+// ── Events (audit log) page ───────────────────────────────────────────────
+
+/// Audit-log viewer state passed to [`events_page`] — the active search/filter
+/// plus everything needed to render the toolbar and the pagination bar.
+pub struct EventsView<'a> {
+    /// Current free-text search (empty = none).
+    pub search: &'a str,
+    /// Current event-type filter (empty = all types).
+    pub type_filter: &'a str,
+    /// Distinct event types present in the log — populates the filter select.
+    pub types: &'a [String],
+    pub pagination: PaginationState,
+}
+
+/// Admin/Owner-only audit-log viewer. Read-only table of events, newest first,
+/// with a search + event-type filter (the toolbar) and an offset pagination bar
+/// pinned at the foot (the same component as Members). Rows open a detail modal.
+/// Wide chrome so the details column has room.
+pub fn events_page(
+    ctx: &ChromeContext,
+    events: &[audit::AuditEvent],
+    now: chrono::DateTime<chrono::Utc>,
+    view: &EventsView<'_>,
+) -> Markup {
+    let filtering = !view.search.is_empty() || !view.type_filter.is_empty();
+    let content = html! {
+        (events_toolbar(view))
+        @if events.is_empty() {
+            div class="card" {
+                p class="muted" {
+                    @if filtering { "No events match these filters." }
+                    @else { "No events recorded yet." }
+                }
+            }
+        } @else {
+            table class="users-table events-table" {
+                thead {
+                    tr {
+                        th class="col-time" { "Time" }
+                        th class="col-actor" { "Actor" }
+                        th class="col-event" { "Event" }
+                        th class="col-details" { "Details" }
+                    }
+                }
+                tbody {
+                    @for ev in events {
+                        (event_row(ev, now))
+                    }
+                }
+            }
+        }
+        // Pagination always renders (even at one page) so the foot of the page
+        // stays put as rows come and go — same behaviour as Members.
+        (events_pagination_bar(view.pagination, view.search, view.type_filter))
+    };
+    shell_app_wide(ctx, "Events", PageId::Events, content)
+}
+
+/// Search + event-type filter bar. A single GET form so Enter (or Apply)
+/// submits both and resets to page 1; `rows` rides a hidden input so the
+/// current page size survives a search.
+fn events_toolbar(view: &EventsView<'_>) -> Markup {
+    html! {
+        form method="get" action="/events" class="users-toolbar events-toolbar" {
+            input type="search" name="q" value=(view.search) class="users-search"
+                  placeholder="Search events…" autocomplete="off" aria-label="Search events";
+            select name="type" class="settings-select events-type-select"
+                   aria-label="Filter by event type" {
+                option value="" selected[view.type_filter.is_empty()] { "All event types" }
+                @for t in view.types {
+                    option value=(t) selected[t.as_str() == view.type_filter] {
+                        (humanize_event_type(t))
+                    }
+                }
+            }
+            input type="hidden" name="rows" value=(view.pagination.rows_per_page);
+            button type="submit" class="btn-secondary" { "Apply" }
+        }
+    }
+}
+
+/// One audit-event row: relative time (absolute in the tooltip), actor (or
+/// "System" for actor-less events), the humanized event type (raw type in the
+/// tooltip), and a compact key/value rendering of the event data.
+fn event_row(ev: &audit::AuditEvent, now: chrono::DateTime<chrono::Utc>) -> Markup {
+    let absolute = ev.occurred_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    html! {
+        // Whole row opens the detail modal (handled by the shell's
+        // `data-open-modal` delegate → `#modal-host`).
+        tr class="events-row" data-open-modal=(format!("/events/{}/modal", ev.seqno)) {
+            td class="col-time" title=(absolute) { (relative_time(ev.occurred_at, now)) }
+            td class="col-actor" {
+                @match &ev.actor_display_name {
+                    Some(name) => (name),
+                    None => span class="event-actor-system" { "System" },
+                }
+            }
+            td class="col-event" title=(ev.event_type) { (humanize_event_type(&ev.event_type)) }
+            td class="col-details" { (event_details(&ev.event_data)) }
+        }
+    }
+}
+
+/// Turn a snake_case event type into a sentence, e.g. `instance_settings_updated`
+/// → "Instance settings updated". Event types are ASCII identifiers.
+fn humanize_event_type(event_type: &str) -> String {
+    let mut s = event_type.replace('_', " ");
+    if let Some(first) = s.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    s
+}
+
+/// Compact, single-line rendering of an event's `event_data`. Flat objects
+/// (the common case) render as `key: value · key: value`; anything else falls
+/// back to a dash.
+fn event_details(data: &serde_json::Value) -> Markup {
+    match data.as_object() {
+        Some(map) if !map.is_empty() => html! {
+            span class="event-meta" {
+                @for (i, (key, value)) in map.iter().enumerate() {
+                    @if i > 0 { " · " }
+                    span class="event-meta-key" { (key) ": " }
+                    (value_compact(value))
+                }
+            }
+        },
+        _ => html! { span class="muted-dash" { "—" } },
+    }
+}
+
+/// Render a JSON value compactly for the details cell — strings unquoted,
+/// scalars as-is, nested arrays/objects as compact JSON.
+fn value_compact(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Offset pagination bar at the foot of the Events table — the same chrome as
+/// the Members bar (editable "Page X of N", step + number controls, rows-per-
+/// page dropdown), but its links carry the events query (`q` / `type` / `rows`).
+fn events_pagination_bar(state: PaginationState, search: &str, type_filter: &str) -> Markup {
+    let cur = state.current_page;
+    let total = state.total_pages;
+    let rows = state.rows_per_page;
+    let at_first = cur <= 1;
+    let at_last = cur >= total;
+    let prev_page = cur.saturating_sub(1).max(1);
+    let next_page = (cur + 1).min(total);
+
+    let step = |page: u32, disabled: bool, label: &str, icon: Markup| -> Markup {
+        let aria = format!("Go to {label} page");
+        if disabled {
+            html! {
+                span class="pagination-step pagination-step-disabled"
+                     aria-label=(aria) aria-disabled="true" { (icon) }
+            }
+        } else {
+            let href = events_url(search, type_filter, page, rows);
+            html! { a class="pagination-step" href=(href) aria-label=(aria) { (icon) } }
+        }
+    };
+    let number = |page: u32, active: bool| -> Markup {
+        if active {
+            html! {
+                span class="pagination-number pagination-number-active"
+                     aria-current="page" { (page) }
+            }
+        } else {
+            let href = events_url(search, type_filter, page, rows);
+            html! { a class="pagination-number" href=(href) { (page) } }
+        }
+    };
+
+    html! {
+        nav class="pagination-bar" aria-label="Pagination" {
+            form method="get" action="/events" class="pagination-jump" {
+                label class="pagination-jump-label" for="page-jump" { "Page" }
+                input type="number" id="page-jump" name="page" class="pagination-jump-input"
+                      value=(cur) min="1" max=(total);
+                span class="pagination-jump-of" { "of " (total) }
+                input type="hidden" name="q" value=(search);
+                input type="hidden" name="type" value=(type_filter);
+                input type="hidden" name="rows" value=(rows);
+            }
+            div class="pagination-numbers" {
+                (step(1, at_first, "first", chevron_double_left_icon()))
+                (step(prev_page, at_first, "previous", chevron_left_icon()))
+                @for item in page_items(cur, total) {
+                    @match item {
+                        PageItem::Number(n) => (number(n, n == cur)),
+                        PageItem::Ellipsis => span class="pagination-ellipsis" aria-hidden="true" { "…" },
+                    }
+                }
+                (step(next_page, at_last, "next", chevron_right_icon()))
+                (step(total, at_last, "last", chevron_double_right_icon()))
+            }
+            div class="pagination-rows" {
+                span class="pagination-rows-label" { "Rows per page" }
+                details class="filter-menu pagination-rows-menu" {
+                    summary class="filter-trigger pagination-rows-trigger" {
+                        span class="filter-trigger-value" { (rows) }
+                        (chevron_down_icon())
+                    }
+                    div class="filter-menu-list" {
+                        @for option in ROWS_PER_PAGE_OPTIONS {
+                            @let active = *option == rows;
+                            @let class = if active {
+                                "filter-menu-item filter-menu-item-active"
+                            } else {
+                                "filter-menu-item"
+                            };
+                            @let href = events_url(search, type_filter, 1, *option);
+                            a class=(class) href=(href) {
+                                span { (option) }
+                                @if active { (check_small_icon()) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build a `/events?…` URL preserving the active search + type filter.
+fn events_url(search: &str, type_filter: &str, page: u32, rows: u32) -> String {
+    let mut url = format!("/events?page={page}&rows={rows}");
+    if !search.is_empty() {
+        url.push_str(&format!("&q={}", query_encode(search)));
+    }
+    if !type_filter.is_empty() {
+        url.push_str(&format!("&type={}", query_encode(type_filter)));
+    }
+    url
+}
+
+/// Percent-encode a query-string value (RFC 3986 unreserved set kept literal).
+fn query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Detail modal for one audit event — the full `event_data` (pretty JSON) plus
+/// the chain fields (seqno + prev_hash/hash hex), fetched on demand into
+/// `#modal-host` when a row is clicked. Read-only; no actions.
+pub fn event_detail_modal(ev: &audit::AuditEvent) -> Markup {
+    let pretty =
+        serde_json::to_string_pretty(&ev.event_data).unwrap_or_else(|_| ev.event_data.to_string());
+    let absolute = ev.occurred_at.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string();
+    html! {
+        dialog id="dlg-event-detail" class="action-dialog" {
+            div class="dialog-header" {
+                h2 { "Event #" (ev.seqno) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            div class="event-detail" {
+                (detail_pair("Time", html! { (absolute) }))
+                (detail_pair("Actor", html! {
+                    @match &ev.actor_display_name {
+                        Some(name) => (name),
+                        None => span class="event-actor-system" { "System" },
+                    }
+                    @if let Some(id) = ev.actor_user_id {
+                        span class="event-detail-sub" { " · " (id) }
+                    }
+                }))
+                (detail_pair("Event", html! {
+                    (humanize_event_type(&ev.event_type))
+                    span class="event-detail-sub" { " · " (ev.event_type) }
+                }))
+                @if let Some(app) = &ev.app_id {
+                    (detail_pair("App", html! { (app) }))
+                }
+            }
+            div class="event-detail-block" {
+                span class="event-detail-label" { "Data" }
+                pre class="event-detail-json" { (pretty) }
+            }
+            div class="event-detail-block" {
+                span class="event-detail-label" { "Chain" }
+                div class="event-hash-row" {
+                    span class="event-hash-key" { "seqno" }
+                    span class="event-hash-val" { (ev.seqno) }
+                }
+                div class="event-hash-row" {
+                    span class="event-hash-key" { "prev_hash" }
+                    span class="event-hash-val" { (hex_encode(&ev.prev_hash)) }
+                }
+                div class="event-hash-row" {
+                    span class="event-hash-key" { "hash" }
+                    span class="event-hash-val" { (hex_encode(&ev.hash)) }
+                }
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn" data-close-dialog { "Close" }
+            }
+        }
+    }
+}
+
+/// One label/value row in the event detail modal's summary block.
+fn detail_pair(label: &str, value: Markup) -> Markup {
+    html! {
+        div class="event-detail-pair" {
+            span class="event-detail-label" { (label) }
+            span class="event-detail-value" { (value) }
+        }
+    }
+}
+
+/// Lowercase hex of a byte slice (chain hashes).
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// List glyph for the Events nav entry. Stroke uses `currentColor`.
+fn events_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            line x1="8" y1="6" x2="21" y2="6" {}
+            line x1="8" y1="12" x2="21" y2="12" {}
+            line x1="8" y1="18" x2="21" y2="18" {}
+            line x1="3" y1="6" x2="3.01" y2="6" {}
+            line x1="3" y1="12" x2="3.01" y2="12" {}
+            line x1="3" y1="18" x2="3.01" y2="18" {}
+        }
+    }
+}
+
+// ── Owner Settings page ───────────────────────────────────────────────────
+
+/// Owner-only instance configuration page. Two sections: instance identity
+/// (display name) and email/notifications (mode + SMTP). The notifications
+/// save is reauth-gated (it carries credentials); identity is CSRF-only. Both
+/// apply live — the handlers swap the hot-reloadable `AppState` cells.
+pub fn settings_page(
+    ctx: &ChromeContext,
+    notifications: &hearth::config::NotificationsConfig,
+    smtp_password_set: bool,
+    recovery_created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Markup {
+    let content = html! {
+        (settings_identity_section(ctx))
+        hr class="settings-divider";
+        (settings_notifications_section(ctx, notifications, smtp_password_set))
+        hr class="settings-divider";
+        (settings_recovery_section(recovery_created_at))
+        hr class="settings-divider";
+        (settings_danger_section())
+        script { (maud::PreEscaped(SETTINGS_SMTP_TOGGLE_JS)) }
+    };
+    shell_app_wide(ctx, "Settings", PageId::Settings, content)
+}
+
+/// Instance-identity section: the display-name override. CSRF-only (no
+/// credentials change), submitted via htmx; the handler redirects back with a
+/// toast so the re-rendered sidebar brand reflects the new name immediately.
+fn settings_identity_section(ctx: &ChromeContext) -> Markup {
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" { (settings_icon()) }
+                div {
+                    h3 { "Instance" }
+                    p class="settings-section-tagline" {
+                        "The name shown in the sidebar and on page titles."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                form id="form-settings-identity"
+                     class="settings-row"
+                     hx-post="/settings/identity"
+                     hx-swap="none" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row-label" {
+                        label for="settings-instance-name" { "Display name" }
+                        p class="settings-row-hint" {
+                            "Up to 64 characters. Leaving it blank restores the "
+                            "configured default."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        input type="text" id="settings-instance-name"
+                              name="instance_name" value=(ctx.instance_name.as_str())
+                              maxlength="64" autocomplete="off";
+                        button type="submit" class="btn-secondary" { "Save" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Email / notifications section: mode select + SMTP fields. Reauth-gated — the
+/// Save button (in the header) drives `REAUTH_CHAIN_JS` via `data-reauth-confirm`,
+/// which re-posts the form over htmx after a step-up. The password field is
+/// write-only (`smtp_password`, never the literal `password` the chain strips)
+/// and shows "saved" vs "not set" without revealing the secret.
+fn settings_notifications_section(
+    ctx: &ChromeContext,
+    notifications: &hearth::config::NotificationsConfig,
+    smtp_password_set: bool,
+) -> Markup {
+    use hearth::config::{NotificationsConfig, SmtpTls};
+    let smtp = match notifications {
+        NotificationsConfig::Smtp(s) => Some(s),
+        _ => None,
+    };
+    let mode = match notifications {
+        NotificationsConfig::Disabled => "disabled",
+        NotificationsConfig::Log => "log",
+        NotificationsConfig::Smtp(_) => "smtp",
+    };
+    let port = smtp.map(|s| s.port).unwrap_or(587);
+    let port_str = port.to_string();
+    let tls_val = match smtp.map(|s| s.tls) {
+        Some(SmtpTls::Implicit) => "implicit",
+        Some(SmtpTls::None) => "none",
+        _ => "starttls",
+    };
+    let host = smtp.map(|s| s.host.as_str()).unwrap_or_default();
+    let username = smtp.map(|s| s.username.as_str()).unwrap_or_default();
+    let from_email = smtp.map(|s| s.from_email.as_str()).unwrap_or_default();
+    let from_name = smtp.and_then(|s| s.from_name.as_deref()).unwrap_or_default();
+    let pw_placeholder = if smtp_password_set {
+        "Saved — leave blank to keep"
+    } else {
+        "SMTP password"
+    };
+    let smtp_hidden = mode != "smtp";
+
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header settings-section-header-actions" {
+                div class="settings-section-heading" {
+                    span class="settings-section-icon" aria-hidden="true" { (mail_icon()) }
+                    div {
+                        h3 { "Email" }
+                        p class="settings-section-tagline" {
+                            "How the instance sends mail — invitations and "
+                            "account notifications."
+                        }
+                    }
+                }
+                // Carries credentials → reauth-gated. The button references the
+                // form by id; REAUTH_CHAIN_JS re-posts it after the step-up.
+                button type="button" class="btn-secondary"
+                       data-reauth-confirm="form-settings-notifications" {
+                    "Save email settings"
+                }
+            }
+            div class="settings-section-body" {
+                form id="form-settings-notifications"
+                     method="post" action="/settings/notifications" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row" {
+                        div class="settings-row-label" {
+                            label for="settings-notifications-mode" { "Delivery mode" }
+                            p class="settings-row-hint" {
+                                "Disabled sends nothing. Log records without "
+                                "sending. SMTP delivers real email."
+                            }
+                        }
+                        div class="settings-row-control" {
+                            select name="mode" id="settings-notifications-mode"
+                                   class="settings-select" {
+                                option value="disabled" selected[mode == "disabled"] {
+                                    "Disabled"
+                                }
+                                option value="log" selected[mode == "log"] { "Log only" }
+                                option value="smtp" selected[mode == "smtp"] { "SMTP" }
+                            }
+                        }
+                    }
+                    div data-smtp-fields hidden[smtp_hidden] {
+                        (settings_text_row("settings-smtp-host", "smtp_host",
+                            "SMTP host", "text", host, "mail.example.com"))
+                        (settings_text_row("settings-smtp-port", "smtp_port",
+                            "Port", "number", &port_str, "587"))
+                        div class="settings-row" {
+                            div class="settings-row-label" {
+                                label for="settings-smtp-tls" { "Encryption" }
+                            }
+                            div class="settings-row-control" {
+                                select name="smtp_tls" id="settings-smtp-tls"
+                                       class="settings-select" {
+                                    option value="starttls" selected[tls_val == "starttls"] {
+                                        "STARTTLS"
+                                    }
+                                    option value="implicit" selected[tls_val == "implicit"] {
+                                        "Implicit TLS"
+                                    }
+                                    option value="none" selected[tls_val == "none"] { "None" }
+                                }
+                            }
+                        }
+                        (settings_text_row("settings-smtp-username", "smtp_username",
+                            "Username", "text", username, "user@example.com"))
+                        div class="settings-row" {
+                            div class="settings-row-label" {
+                                label for="settings-smtp-password" { "Password" }
+                                p class="settings-row-hint" {
+                                    "Stored encrypted. Leave blank to keep the "
+                                    "current password."
+                                }
+                            }
+                            div class="settings-row-control" {
+                                input type="password" id="settings-smtp-password"
+                                      name="smtp_password" placeholder=(pw_placeholder)
+                                      autocomplete="off";
+                            }
+                        }
+                        (settings_text_row("settings-smtp-from-email", "smtp_from_email",
+                            "From address", "email", from_email, "noreply@example.com"))
+                        (settings_text_row("settings-smtp-from-name", "smtp_from_name",
+                            "From name", "text", from_name, "Sylva Hearth"))
+                    }
+                }
+
+                // Sends through the *saved* notifier (configure → save → test),
+                // not unsaved form values. CSRF-only; reports the result inline.
+                form class="settings-row"
+                     hx-post="/settings/notifications/test" hx-swap="none" {
+                    (csrf_input(ctx.csrf_token))
+                    div class="settings-row-label" {
+                        label { "Test delivery" }
+                        p class="settings-row-hint" {
+                            "Sends a test message to your address using the saved "
+                            "settings."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        button type="submit" class="btn-secondary" {
+                            "Send test email"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Danger zone: the Owner can permanently close the whole instance. Mirrors
+/// the account-close section's restrained-red styling; the button opens the
+/// confirm dialog fetched from `/modals/settings/shutdown`.
+fn settings_danger_section() -> Markup {
+    html! {
+        section class="settings-section settings-section-danger" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" { (trash_icon()) }
+                div {
+                    h3 { "Close this server" }
+                    p class="settings-section-tagline" {
+                        "Permanently shut down the whole instance and erase all of \
+                         its data, for everyone."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                div class="settings-danger-row" {
+                    p class="settings-row-hint" {
+                        "Every account and everything created on this server is "
+                        "removed, the server is closed for all members, and this "
+                        "cannot be undone — the same teardown as the last member "
+                        "deleting their account. Use it only to decommission the "
+                        "instance."
+                    }
+                    div class="settings-row-actions" {
+                        button type="button" class="btn-danger-ghost"
+                               data-open-modal="/modals/settings/shutdown" {
+                            "Close this server"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Confirm dialog for closing the whole server — fetched into `#modal-host`
+/// from `/modals/settings/shutdown`. Two gates before the button enables (an
+/// "I understand" checkbox + typing the server's name, wired by
+/// `ACCOUNT_CLOSE_GATE_JS`), then the **critical** re-auth
+/// (`data-reauth-critical`) always re-prompts before the scorch runs.
+pub fn settings_shutdown_modal(ctx: &ChromeContext) -> Markup {
+    let name = ctx.instance_name.as_str();
+    html! {
+        dialog id="dlg-settings-shutdown" class="action-dialog action-dialog-centered" {
+            form id="form-settings-shutdown" method="post" action="/settings/shutdown" {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-danger" { (trash_icon()) }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" {
+                        (close_icon())
+                    }
+                }
+                h2 class="dialog-center-title" { "Close this server" }
+                p class="dialog-description dialog-center-text" {
+                    "This permanently shuts down " strong { (name) } " and erases "
+                    "every account and all data on it. Everyone is signed out and "
+                    "the server shows a closed page from now on."
+                }
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { "This wipes all data for everyone and cannot be undone." }
+                }
+                (csrf_input(ctx.csrf_token))
+                label class="confirm-checkbox-field" {
+                    input type="checkbox" class="member-checkbox" data-close-ack;
+                    span { "I understand this permanently closes the server for all members." }
+                }
+                div class="field confirm-name-field" {
+                    label for="confirm-shutdown-name" {
+                        "Type the server name " strong { "\"" (name) "\"" } " to confirm"
+                    }
+                    input type="text" id="confirm-shutdown-name" data-close-email=(name)
+                          autocomplete="off" spellcheck="false" autocapitalize="off";
+                }
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn-danger"
+                           data-reauth-confirm="form-settings-shutdown"
+                           data-reauth-critical
+                           disabled {
+                        "Close this server"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Server recovery-code section: shows when the active code was last generated
+/// and an Owner-only "Rotate" trigger. Rotating needs the current code (the
+/// proof of possession), collected in the modal.
+fn settings_recovery_section(created_at: Option<chrono::DateTime<chrono::Utc>>) -> Markup {
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" { (key_icon()) }
+                div {
+                    h3 { "Server recovery code" }
+                    p class="settings-section-tagline" {
+                        "The break-glass key: it unlocks owner recovery and forcing "
+                        "owner changes past the veto window. Rotate it if it may be "
+                        "exposed."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                div class="settings-row" {
+                    div class="settings-row-label" {
+                        @match created_at {
+                            Some(at) => {
+                                span { "Active code generated " (at.format("%b %-d, %Y").to_string()) "." }
+                            }
+                            None => span { "No active recovery code." }
+                        }
+                        p class="settings-row-hint" {
+                            "Rotating shows the new code once and immediately "
+                            "invalidates the old one."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        button type="button" class="btn-secondary"
+                               data-open-modal="/modals/settings/recovery-code" {
+                            "Rotate recovery code"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Confirm dialog for rotating the server recovery code — fetched into
+/// `#modal-host` from `/modals/settings/recovery-code`. The form posts the
+/// current code; the response swaps the dialog content in place: the new code
+/// (shown once) on success, or the form with an inline error on a wrong code.
+pub fn recovery_rotate_modal(ctx: &ChromeContext) -> Markup {
+    html! {
+        dialog id="dlg-recovery-rotate" class="action-dialog action-dialog-centered" {
+            div id="recovery-rotate-content" {
+                (recovery_rotate_form(ctx.csrf_token, None))
+            }
+        }
+    }
+}
+
+/// The rotate form fragment (also re-rendered with `error` set when the
+/// supplied current code didn't match).
+pub fn recovery_rotate_form(csrf_token: &str, error: Option<&str>) -> Markup {
+    html! {
+        form id="form-recovery-rotate"
+             hx-post="/settings/recovery-code/rotate"
+             hx-target="#recovery-rotate-content" hx-swap="innerHTML" {
+            div class="dialog-header" {
+                div class="dialog-icon" { (key_icon()) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            h2 class="dialog-center-title" { "Rotate the server recovery code" }
+            p class="dialog-description dialog-center-text" {
+                "This generates a new server recovery code and immediately "
+                "invalidates the current one. Enter the current code to confirm."
+            }
+            @if let Some(err) = error {
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { (err) }
+                }
+            }
+            (csrf_input(csrf_token))
+            div class="field" {
+                label for="rotate-current-code" { "Current recovery code" }
+                input type="text" id="rotate-current-code" name="current_code"
+                      autocomplete="off" spellcheck="false" autocapitalize="off"
+                      placeholder="XXXX-XXXX-XXXX-…" required;
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                button type="submit" class="btn-danger" { "Rotate code" }
+            }
+        }
+    }
+}
+
+/// One label+input row for the SMTP form.
+fn settings_text_row(
+    id: &str,
+    name: &str,
+    label_text: &str,
+    input_type: &str,
+    value: &str,
+    placeholder: &str,
+) -> Markup {
+    html! {
+        div class="settings-row" {
+            div class="settings-row-label" {
+                label for=(id) { (label_text) }
+            }
+            div class="settings-row-control" {
+                input type=(input_type) id=(id) name=(name) value=(value)
+                      placeholder=(placeholder) autocomplete="off";
+            }
+        }
+    }
+}
+
+/// Envelope glyph for the Email section header. Stroke uses `currentColor`.
+fn mail_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            rect x="2" y="4" width="20" height="16" rx="2" {}
+            path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" {}
+        }
+    }
+}
+
+/// Toggles the SMTP field block based on the delivery-mode select, on load +
+/// change, so the credential fields only show when mode is SMTP.
+const SETTINGS_SMTP_TOGGLE_JS: &str = r#"
+(function() {
+  var sel = document.querySelector('select[name="mode"]');
+  var fields = document.querySelector('[data-smtp-fields]');
+  if (!sel || !fields) return;
+  function sync() { fields.hidden = (sel.value !== 'smtp'); }
+  sel.addEventListener('change', sync);
+  sync();
+})();
+"#;
 
 /// Kind of toast — drives the icon + colour palette. Three flavours:
 ///
@@ -6002,10 +7129,9 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
         // the 72h window if no one vetoes) is destructive — the
         // operator should still feel the weight of having queued it.
         //
-        // Token names match the UI vocabulary: "anonymized" = the
-        // soft-delete (which keeps shared content), "deleted" = the
-        // hard-delete (full removal). Backend routes + audit events
-        // keep their original names.
+        // "anonymized" keeps shared content under a redacted tombstone;
+        // "deleted" is the full physical removal. The vocabulary is now
+        // consistent end-to-end (routes, audit events, enums all match).
         "anonymized" => (
             ToastKind::Error,
             "Account anonymized",
@@ -6238,8 +7364,8 @@ fn pending_empty_state() -> Markup {
             }
             h2 { "Nothing pending" }
             p {
-                "Owner-on-Owner deactivations, deletes, purges, and role "
-                "changes wait here for 72 hours so any Owner can veto. "
+                "Owner-on-Owner deactivations, anonymizations, deletes, and "
+                "role changes wait here for 72 hours so any Owner can veto. "
                 "When something gets queued, it shows up on this page."
             }
         }
@@ -6288,6 +7414,12 @@ fn pending_active_row(
                 button type="button" class="btn-secondary"
                        data-open-modal=(format!("/pending/{}/modal/veto", row.id)) {
                     "Veto"
+                }
+                // Break-glass: force the action through now (bypass the veto
+                // window) with the server recovery code.
+                button type="button" class="btn-danger-ghost"
+                       data-open-modal=(format!("/pending/{}/modal/force-apply", row.id)) {
+                    "Force apply"
                 }
             }
         }
@@ -6444,6 +7576,77 @@ pub(crate) fn veto_pending_dialog(
     }
 }
 
+/// Confirm dialog for force-applying a pending transition with the server
+/// recovery code — fetched into `#modal-host` from
+/// `/pending/{id}/modal/force-apply`. Wraps the form in a swappable content
+/// div so a wrong code can re-render inline.
+pub(crate) fn force_apply_dialog(
+    transition_id: uuid::Uuid,
+    target_name: &str,
+    action_label: &str,
+    csrf_token: &str,
+) -> Markup {
+    html! {
+        dialog id=(format!("dlg-force-apply-{transition_id}"))
+               class="action-dialog action-dialog-centered" {
+            div id=(format!("force-apply-content-{transition_id}")) {
+                (force_apply_form(transition_id, target_name, action_label, csrf_token, None))
+            }
+        }
+    }
+}
+
+/// The force-apply form fragment (re-rendered with `error` when the supplied
+/// recovery code didn't match). Posts the recovery code; the response either
+/// redirects to `/pending` (success / already-resolved) or swaps this fragment
+/// back in with the error.
+pub(crate) fn force_apply_form(
+    transition_id: uuid::Uuid,
+    target_name: &str,
+    action_label: &str,
+    csrf_token: &str,
+    error: Option<&str>,
+) -> Markup {
+    html! {
+        form id=(format!("form-force-apply-{transition_id}"))
+             hx-post=(format!("/pending/{transition_id}/force-apply"))
+             hx-target=(format!("#force-apply-content-{transition_id}"))
+             hx-swap="innerHTML" {
+            div class="dialog-header" {
+                div class="dialog-icon dialog-icon-danger" { (alert_circle_icon()) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            h2 class="dialog-center-title" { "Force this action through?" }
+            p class="dialog-description dialog-center-text" {
+                "Applies the pending " strong { (action_label) } " on "
+                strong { (target_name) } " immediately, bypassing the 72-hour "
+                "veto window — the target can no longer veto it. Use this only to "
+                "remove an owner who's lost access or gone rogue. It can't be undone."
+            }
+            @if let Some(err) = error {
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { (err) }
+                }
+            }
+            (csrf_input(csrf_token))
+            div class="field" {
+                label for=(format!("force-code-{transition_id}")) {
+                    "Server recovery code"
+                }
+                input type="text" id=(format!("force-code-{transition_id}"))
+                      name="recovery_code" autocomplete="off" spellcheck="false"
+                      autocapitalize="off" placeholder="XXXX-XXXX-XXXX-…" required;
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                button type="submit" class="btn-danger" { "Force apply" }
+            }
+        }
+    }
+}
+
 /// Human-readable verb for a pending transition. Lifecycle kinds
 /// render as the action name; role-change kinds render as
 /// "Promote to Owner", "Demote to Member", etc., based on the
@@ -6452,11 +7655,8 @@ pub(crate) fn pending_action_label(row: &pending::TransitionRow) -> String {
     use pending::TransitionKind;
     match row.kind {
         TransitionKind::Deactivate => "Deactivate".to_string(),
-        // Soft-delete is surfaced as "Anonymize" in the UI; the
-        // internal `TransitionKind::SoftDelete` enum keeps its name.
-        // Hard-delete is surfaced as "Delete".
-        TransitionKind::SoftDelete => "Anonymize".to_string(),
-        TransitionKind::HardDelete => "Delete".to_string(),
+        TransitionKind::Anonymize => "Anonymize".to_string(),
+        TransitionKind::Delete => "Delete".to_string(),
         TransitionKind::RoleChange => match row.role_payload() {
             Ok(payload) => match payload.to_role {
                 InstanceRole::Owner => "Promote to Owner".to_string(),

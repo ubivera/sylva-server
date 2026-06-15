@@ -29,6 +29,7 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 subtle = { workspace = true }
+arc-swap = { workspace = true }
 rand = { workspace = true }
 webauthn-rs = { workspace = true }
 url = { workspace = true }
@@ -46,6 +47,7 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 web = { path = "../web" }
+arc-swap = { workspace = true }
 
 [[test]]
 name = "integration"

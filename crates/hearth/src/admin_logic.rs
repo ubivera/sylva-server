@@ -14,10 +14,9 @@ pub enum Outcome {
     /// The action ran in a single transaction. `target` carries the
     /// most useful snapshot for the action — **post-action** for
     /// `deactivate` / `reactivate` / `change_role` (so JSON callers see
-    /// the new lifecycle/role), **pre-action** for `soft_delete` /
-    /// `hard_delete` (the post-action record has redacted PII so the
-    /// original `display_name` and `email` would be unusable for banner
-    /// messaging).
+    /// the new lifecycle/role), **pre-action** for `anonymize` / `delete`
+    /// (anonymize redacts the row and delete removes it, so the post-action
+    /// record's `display_name` / `email` would be unusable for messaging).
     Applied { target: User },
     /// The action created a `pending.transitions` row instead of
     /// applying. Caller (web/JSON) renders the row to the user.
@@ -107,7 +106,7 @@ pub async fn perform_deactivate(
     match target.lifecycle {
         UserLifecycle::Active => {}
         UserLifecycle::Deactivated => return Err(LifecycleError::Conflict("already_deactivated")),
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+        UserLifecycle::Anonymized => {
             return Err(LifecycleError::NotFound);
         }
         UserLifecycle::PendingInvite => return Err(LifecycleError::Conflict("not_active")),
@@ -142,7 +141,7 @@ pub async fn perform_reactivate(
     match target.lifecycle {
         UserLifecycle::Deactivated => {}
         UserLifecycle::Active => return Err(LifecycleError::Conflict("already_active")),
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+        UserLifecycle::Anonymized => {
             return Err(LifecycleError::NotFound);
         }
         UserLifecycle::PendingInvite => return Err(LifecycleError::Conflict("not_deactivated")),
@@ -174,10 +173,10 @@ pub async fn perform_reactivate(
     result.map_err(LifecycleError::Internal)
 }
 
-/// Active/Deactivated → SoftDeleted. Revokes sessions, deletes
-/// credentials, redacts PII. Owner-on-Owner routes through pending
-/// unless `bypass_code` is supplied.
-pub async fn perform_soft_delete(
+/// Active/Deactivated → Anonymized. Revokes sessions, deletes
+/// credentials, redacts PII (keeps the tombstone row). Owner-on-Owner
+/// routes through pending unless `bypass_code` is supplied.
+pub async fn perform_anonymize(
     state: &AppState,
     admin: &AdminUser,
     target_id: Uuid,
@@ -187,7 +186,7 @@ pub async fn perform_soft_delete(
 
     match target.lifecycle {
         UserLifecycle::Active | UserLifecycle::Deactivated => {}
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => {
+        UserLifecycle::Anonymized => {
             return Err(LifecycleError::NotFound);
         }
         UserLifecycle::PendingInvite => return Err(LifecycleError::Conflict("not_active")),
@@ -200,20 +199,21 @@ pub async fn perform_soft_delete(
                 state,
                 admin,
                 &target,
-                notifications::LifecycleAction::SoftDelete,
+                notifications::LifecycleAction::Anonymize,
             )
             .await?;
             return Ok(Outcome::Pending(row));
         }
     };
 
-    apply_soft_delete(state, admin, target, bypass_code_id).await
+    apply_anonymize(state, admin, target, bypass_code_id).await
 }
 
-/// Active/Deactivated/SoftDeleted → HardDeleted. Same row-level effect
-/// as soft_delete today; once the apps platform lands, this also drops
-/// all the user's content. Owner-on-Owner routes through pending.
-pub async fn perform_hard_delete(
+/// Active/Deactivated/Anonymized → physically removed. Deletes the user
+/// row outright (the genuine "leave no trace" delete); `auth.*` rows + any
+/// invitations they created cascade away. Owner-on-Owner routes through
+/// pending.
+pub async fn perform_delete(
     state: &AppState,
     admin: &AdminUser,
     target_id: Uuid,
@@ -222,8 +222,7 @@ pub async fn perform_hard_delete(
     let target = resolve_lifecycle_target(state, admin, target_id).await?;
 
     match target.lifecycle {
-        UserLifecycle::Active | UserLifecycle::Deactivated | UserLifecycle::SoftDeleted => {}
-        UserLifecycle::HardDeleted => return Err(LifecycleError::NotFound),
+        UserLifecycle::Active | UserLifecycle::Deactivated | UserLifecycle::Anonymized => {}
         UserLifecycle::PendingInvite => return Err(LifecycleError::Conflict("not_active")),
     }
 
@@ -234,14 +233,14 @@ pub async fn perform_hard_delete(
                 state,
                 admin,
                 &target,
-                notifications::LifecycleAction::HardDelete,
+                notifications::LifecycleAction::Delete,
             )
             .await?;
             return Ok(Outcome::Pending(row));
         }
     };
 
-    apply_hard_delete(state, admin, target, bypass_code_id).await
+    apply_delete(state, admin, target, bypass_code_id).await
 }
 
 /// Owner-only. Change a user's `instance_role`. Owner→Owner transitions
@@ -271,7 +270,7 @@ pub async fn perform_change_role(
 
     match target.lifecycle {
         UserLifecycle::Active | UserLifecycle::Deactivated => {}
-        UserLifecycle::SoftDeleted | UserLifecycle::HardDeleted => return Err(RoleError::NotFound),
+        UserLifecycle::Anonymized => return Err(RoleError::NotFound),
         UserLifecycle::PendingInvite => return Err(RoleError::NotActive),
     }
 
@@ -453,7 +452,7 @@ async fn apply_deactivate(
     Ok(Outcome::Applied { target: updated })
 }
 
-async fn apply_soft_delete(
+async fn apply_anonymize(
     state: &AppState,
     admin: &AdminUser,
     target: User,
@@ -467,7 +466,7 @@ async fn apply_soft_delete(
     let result: anyhow::Result<()> = async {
         let mut tx = state.db.begin().await?;
         let (_redacted, original_email) =
-            UserRepository::soft_delete(&mut tx, target_user_id).await?;
+            UserRepository::anonymize(&mut tx, target_user_id).await?;
         let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
         auth::delete_credentials(&mut tx, target_user_id).await?;
 
@@ -481,7 +480,7 @@ async fn apply_soft_delete(
                     "code_id": code_id,
                     "used_by": actor.user_id.0,
                     "target_user_id": target_user_id.0,
-                    "action": "soft_delete",
+                    "action": "anonymize",
                 }),
             )
             .await?;
@@ -495,7 +494,7 @@ async fn apply_soft_delete(
         if bypass_code_id.is_some() {
             event_data["via"] = serde_json::Value::String("recovery_bypass".into());
         }
-        audit::append(&mut tx, Some(&actor), None, "user_deleted", event_data).await?;
+        audit::append(&mut tx, Some(&actor), None, "account_anonymized", event_data).await?;
 
         if bypass_code_id.is_some() {
             notifications::enqueue(
@@ -504,7 +503,7 @@ async fn apply_soft_delete(
                     recipient_email: original_email.clone(),
                     target_display_name: target_display_name.clone(),
                     initiator_display_name: initiator_display_name.clone(),
-                    action: notifications::LifecycleAction::SoftDelete,
+                    action: notifications::LifecycleAction::Anonymize,
                     via_recovery_bypass: true,
                     transition_id: None,
                 },
@@ -521,7 +520,7 @@ async fn apply_soft_delete(
     Ok(Outcome::Applied { target })
 }
 
-async fn apply_hard_delete(
+async fn apply_delete(
     state: &AppState,
     admin: &AdminUser,
     target: User,
@@ -529,16 +528,14 @@ async fn apply_hard_delete(
 ) -> Result<Outcome, LifecycleError> {
     let actor = admin.actor();
     let target_user_id = target.id;
+    // Captured before the delete so the notification still has a recipient.
+    let target_email = target.email.clone();
     let target_display_name = target.display_name.clone();
     let initiator_display_name = admin.0.user.display_name.clone();
     let prior_lifecycle = target.lifecycle;
 
     let result: anyhow::Result<()> = async {
         let mut tx = state.db.begin().await?;
-        let (_redacted, original_email) =
-            UserRepository::hard_delete(&mut tx, target_user_id).await?;
-        let revoked = SessionRepository::revoke_all_for_user(&mut tx, target_user_id).await?;
-        auth::delete_credentials(&mut tx, target_user_id).await?;
 
         if let Some(code_id) = bypass_code_id {
             audit::append(
@@ -550,7 +547,7 @@ async fn apply_hard_delete(
                     "code_id": code_id,
                     "used_by": actor.user_id.0,
                     "target_user_id": target_user_id.0,
-                    "action": "hard_delete",
+                    "action": "delete",
                 }),
             )
             .await?;
@@ -558,23 +555,27 @@ async fn apply_hard_delete(
 
         let mut event_data = serde_json::json!({
             "target_user_id": target_user_id.0,
-            "redacted_from_email": original_email,
             "prior_lifecycle": prior_lifecycle,
-            "sessions_revoked": revoked,
         });
         if bypass_code_id.is_some() {
             event_data["via"] = serde_json::Value::String("recovery_bypass".into());
         }
-        audit::append(&mut tx, Some(&actor), None, "user_purged", event_data).await?;
+        // Append the deletion event *before* the row vanishes — `audit.events`
+        // carries no FK to the user, so the hash chain stays valid.
+        audit::append(&mut tx, Some(&actor), None, "account_deleted", event_data).await?;
+
+        // True removal: the user row goes and every `auth.*` row (sessions,
+        // credentials, factors) + invitations they created cascade with it.
+        UserRepository::hard_remove(&mut tx, target_user_id).await?;
 
         if bypass_code_id.is_some() {
             notifications::enqueue(
                 &mut tx,
                 notifications::Notification::PendingLifecycleApplied {
-                    recipient_email: original_email.clone(),
+                    recipient_email: target_email.clone(),
                     target_display_name: target_display_name.clone(),
                     initiator_display_name: initiator_display_name.clone(),
-                    action: notifications::LifecycleAction::HardDelete,
+                    action: notifications::LifecycleAction::Delete,
                     via_recovery_bypass: true,
                     transition_id: None,
                 },
@@ -694,8 +695,8 @@ async fn enqueue_pending_lifecycle(
 
     let event_type = match action {
         notifications::LifecycleAction::Deactivate => "pending_deactivate_initiated",
-        notifications::LifecycleAction::SoftDelete => "pending_soft_delete_initiated",
-        notifications::LifecycleAction::HardDelete => "pending_hard_delete_initiated",
+        notifications::LifecycleAction::Anonymize => "pending_anonymize_initiated",
+        notifications::LifecycleAction::Delete => "pending_delete_initiated",
     };
 
     // Reviewer cohort = every active Owner except the initiator + the

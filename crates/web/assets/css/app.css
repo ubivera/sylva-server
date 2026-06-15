@@ -3,6 +3,10 @@
    No build step, no preprocessor. */
 
 :root {
+    /* Tells the browser to render native controls (select popups,
+       scrollbars, date pickers) in the active theme. Mirrored per-theme
+       below so the dropdown option list isn't a bright flash in dark mode. */
+    color-scheme: light;
     --color-bg: #fafafa;
     --color-surface: #ffffff;
     --color-surface-alt: #f4f4f5;
@@ -55,6 +59,7 @@
 
 @media (prefers-color-scheme: dark) {
     :root {
+        color-scheme: dark;
         /* Page bg lifted from near-black to a medium-dark gray so cards
            and surfaces can read as either inset (darker) or floating
            (lighter) without losing legibility. Popovers/menus use the
@@ -106,6 +111,7 @@
    elsewhere only adjust accent colours that read fine in either
    mode, so we don't bother mirroring them here. */
 :root[data-theme="dark"] {
+    color-scheme: dark;
     --color-bg: #1f1f21;
     --color-surface: #26262a;
     --color-surface-alt: #2f2f33;
@@ -131,6 +137,7 @@
     --color-primary-soft: #4A338E;
 }
 :root[data-theme="light"] {
+    color-scheme: light;
     --color-bg: #fafafa;
     --color-surface: #ffffff;
     --color-surface-alt: #f4f4f5;
@@ -533,8 +540,13 @@ a.nav-link.active .nav-link-icon {
 .col-pending-initiator { width: 14rem; }
 .col-pending-remaining { width: 10rem; }
 .col-pending-actions {
-    width: 8rem;
+    width: 13rem;
     text-align: right;
+    white-space: nowrap;
+}
+/* Veto + Force apply sit inline, right-aligned, with a gap between them. */
+.col-pending-actions button + button {
+    margin-left: var(--space-sm);
 }
 
 /* Empty state — shown when the pending queue is clear. Centered
@@ -1807,6 +1819,85 @@ p.muted {
 }
 .users-table tbody tr:last-child td { border-bottom: none; }
 .users-table tbody tr:hover td { background: var(--color-sidebar-hover); }
+
+/* Events (audit log) table — reuses the .users-table chrome with its own
+   column widths + a compact monospace details cell. */
+.events-table td { vertical-align: top; }
+.events-table .col-time {
+    width: 11rem;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+.events-table .col-actor { width: 12rem; }
+.events-table .col-event { width: 14rem; }
+.events-table .event-actor-system { color: var(--color-text-faint); font-style: italic; }
+.events-table .event-meta {
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    word-break: break-word;
+}
+.events-table .event-meta-key { color: var(--color-text-faint); }
+/* Events toolbar (search + event-type filter) above the table. */
+.events-toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+}
+.events-toolbar .events-type-select { width: auto; min-width: 12rem; }
+/* Rows are clickable — they open the detail modal. */
+.events-table .events-row { cursor: pointer; }
+
+/* Event detail modal: read-only summary + pretty JSON + chain hashes. */
+.event-detail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin: var(--space-md) 0;
+}
+.event-detail-pair { display: flex; gap: var(--space-md); font-size: 0.9rem; }
+.event-detail-label {
+    color: var(--color-text-muted);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.event-detail-pair .event-detail-label { flex: 0 0 5rem; }
+.event-detail-value { color: var(--color-text); word-break: break-word; }
+.event-detail-sub {
+    color: var(--color-text-faint);
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+}
+.event-detail-block { margin-top: var(--space-md); }
+.event-detail-block .event-detail-label { display: block; margin-bottom: var(--space-xs); }
+.event-detail-json {
+    margin: 0;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--color-popover);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    color: var(--color-text);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 16rem;
+    overflow: auto;
+}
+.event-hash-row {
+    display: flex;
+    gap: var(--space-md);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.6;
+}
+.event-hash-key { flex: 0 0 5rem; color: var(--color-text-faint); }
+.event-hash-val { color: var(--color-text-muted); word-break: break-all; }
 
 .users-table .col-date {
     text-align: right;
@@ -3704,10 +3795,86 @@ dialog.action-dialog.action-dialog-large[open] {
     outline: 2px solid var(--color-primary);
     outline-offset: -2px;
 }
+/* Delivery-mode dropdown — matches the text inputs in the same column.
+   The native option popup follows the per-theme `color-scheme` set on
+   `:root`, so it renders dark in dark mode instead of a bright flash. */
+.settings-select {
+    width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--color-popover);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    font: inherit;
+    cursor: pointer;
+}
+.settings-select:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -2px;
+}
 .settings-row-actions {
     display: flex;
     justify-content: flex-end;
     gap: var(--space-sm);
+}
+
+/* Data Control "danger zone" — the self-service Anonymize / Delete sections.
+   A restrained red accent (tinted border + red section icon) sets them apart
+   from the neutral settings sections above without shouting. */
+.settings-section-danger {
+    border-color: rgba(197, 48, 48, 0.35);
+}
+.settings-section-danger .settings-section-icon {
+    color: var(--color-error);
+}
+/* Explainer + trigger button stacked, button left-aligned under the text. */
+.settings-danger-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    align-items: flex-start;
+}
+/* "You're the last owner — transfer first" note shown in place of an active
+   trigger when closing is blocked. Warm-grey, sits between the hint and the
+   disabled button. */
+.settings-row-note {
+    margin: 0;
+    padding: var(--space-sm) var(--space-md);
+    background: rgba(197, 48, 48, 0.06);
+    border: 1px solid rgba(197, 48, 48, 0.25);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    font-size: 0.8rem;
+    line-height: 1.45;
+}
+
+/* Ghost/outline danger button — the section trigger that opens the confirm
+   dialog. Quieter than the solid `.btn-danger` used as the final confirm
+   inside that dialog, so the panel doesn't read as a wall of red while still
+   signalling a destructive path. */
+.btn-danger-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: 0.5rem 0.875rem;
+    background: transparent;
+    color: var(--color-error);
+    border: 1px solid rgba(197, 48, 48, 0.45);
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 500;
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.btn-danger-ghost:hover {
+    background: rgba(197, 48, 48, 0.08);
+    border-color: var(--color-error);
+}
+.btn-danger-ghost:focus-visible {
+    outline: none;
+    border-color: var(--color-error);
+    box-shadow: 0 0 0 4px rgba(197, 48, 48, 0.25);
 }
 
 /* Horizontal hairline between two rows inside the same section

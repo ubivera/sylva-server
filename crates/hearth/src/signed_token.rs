@@ -27,6 +27,13 @@ pub const PURPOSE_MFA_PENDING: &str = "mfa-pending";
 /// Purpose tag for the step-up "recently reauthenticated" sudo grant that
 /// unlocks sensitive actions for a short window.
 pub const PURPOSE_REAUTH: &str = "reauth";
+/// Purpose tag for a *critical* step-up grant that gates irreversible
+/// account actions (self anonymize / delete). Distinct from
+/// [`PURPOSE_REAUTH`] so an ordinary fresh sudo grant can never satisfy
+/// these actions — they must always re-prove a factor, ignoring the
+/// 5-minute sudo window. Minted only by a forced re-auth and carried in a
+/// separate, short-lived cookie.
+pub const PURPOSE_REAUTH_CRITICAL: &str = "reauth-critical";
 
 /// Sign a token binding `user_id` to `expires_at` (unix seconds) under
 /// `purpose`. Format: `{user_id}.{expires_at}.{hex(mac)}`.
@@ -110,6 +117,22 @@ mod tests {
         assert_eq!(verify(&SECRET, PURPOSE_REAUTH, &grant, 9_999), Some(uid));
         assert_eq!(verify(&SECRET, PURPOSE_MFA_PENDING, &grant, 9_999), None);
         assert_eq!(verify(&SECRET, PURPOSE_RECOVERY_RESET, &grant, 9_999), None);
+    }
+
+    #[test]
+    fn critical_reauth_purpose_is_isolated() {
+        // A normal sudo grant must NOT satisfy a critical-reauth gate, and
+        // vice versa — this is what makes irreversible actions always
+        // re-prompt regardless of the ordinary 5-minute sudo window.
+        let uid = Uuid::new_v4();
+        let normal = sign(&SECRET, PURPOSE_REAUTH, uid, 10_000);
+        let critical = sign(&SECRET, PURPOSE_REAUTH_CRITICAL, uid, 10_000);
+        assert_eq!(verify(&SECRET, PURPOSE_REAUTH_CRITICAL, &normal, 9_999), None);
+        assert_eq!(verify(&SECRET, PURPOSE_REAUTH, &critical, 9_999), None);
+        assert_eq!(
+            verify(&SECRET, PURPOSE_REAUTH_CRITICAL, &critical, 9_999),
+            Some(uid)
+        );
     }
 
     #[test]

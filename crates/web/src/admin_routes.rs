@@ -189,8 +189,44 @@ pub async fn reactivate_member(
     }
 }
 
-/// `POST /members/{id}/delete` — soft delete (terminal "account removed").
-/// Requires re-auth.
+/// `POST /members/{id}/anonymize` — anonymize (terminal "account closed":
+/// redact PII, keep the tombstone). Requires re-auth.
+pub async fn anonymize_member(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    headers: HeaderMap,
+    Path(target_id): Path<Uuid>,
+    Form(form): Form<LifecycleActionForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    let admin = match require_admin(auth) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let htmx = is_htmx(&headers);
+    if let Err(resp) =
+        crate::routes::require_sudo(&state, &headers, admin.0.user.id)
+    {
+        return resp;
+    }
+    match admin_logic::perform_anonymize(&state, &admin, target_id, None).await {
+        Ok(Outcome::Applied { target }) => redirect_with_action_toast(
+            "/members",
+            htmx,
+            "anonymized",
+            Some(&target.display_name),
+        ),
+        Ok(Outcome::Pending(_)) => {
+            redirect_with_action_toast("/members", htmx, "pending_anonymize", None)
+        }
+        Err(e) => lifecycle_error_to_response(e, htmx),
+    }
+}
+
+/// `POST /members/{id}/delete` — delete (physically remove the row + cascade
+/// all their data). Requires re-auth.
 pub async fn delete_member(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
@@ -211,47 +247,7 @@ pub async fn delete_member(
     {
         return resp;
     }
-    // The route + the admin_logic function use "delete" / "soft_delete"
-    // naming; the toast token differs because the UI surfaces this
-    // action as "Anonymize".
-    match admin_logic::perform_soft_delete(&state, &admin, target_id, None).await {
-        Ok(Outcome::Applied { target }) => redirect_with_action_toast(
-            "/members",
-            htmx,
-            "anonymized",
-            Some(&target.display_name),
-        ),
-        Ok(Outcome::Pending(_)) => {
-            redirect_with_action_toast("/members", htmx, "pending_anonymize", None)
-        }
-        Err(e) => lifecycle_error_to_response(e, htmx),
-    }
-}
-
-/// `POST /members/{id}/purge` — hard delete (full purge).
-pub async fn purge_member(
-    State(state): State<AppState>,
-    BrowserAuth(auth): BrowserAuth,
-    headers: HeaderMap,
-    Path(target_id): Path<Uuid>,
-    Form(form): Form<LifecycleActionForm>,
-) -> Response {
-    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
-        return resp;
-    }
-    let admin = match require_admin(auth) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let htmx = is_htmx(&headers);
-    if let Err(resp) =
-        crate::routes::require_sudo(&state, &headers, admin.0.user.id)
-    {
-        return resp;
-    }
-    // The backend uses "purge" / "hard_delete" naming; the toast token
-    // differs because the UI surfaces this action as "Delete".
-    match admin_logic::perform_hard_delete(&state, &admin, target_id, None).await {
+    match admin_logic::perform_delete(&state, &admin, target_id, None).await {
         Ok(Outcome::Applied { target }) => redirect_with_action_toast(
             "/members",
             htmx,
@@ -366,7 +362,7 @@ pub async fn invite_form(
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &auth.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -406,7 +402,7 @@ pub async fn invite_submit(
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
     let pending_count = pending_count_for(&state, admin.0.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &admin.0.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -611,7 +607,7 @@ pub async fn reissue_invitation(
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
     let pending_count = pending_count_for(&state, admin.0.user.instance_role).await;
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &admin.0.user,
         csrf_token: &csrf_token,
         pending_count,
@@ -788,7 +784,7 @@ pub async fn invite_modal_fragment(
     };
     let csrf_token = csrf::compute_token(&state.csrf_secret, admin.0.session_id);
     let ctx = views::ChromeContext {
-        instance_name: &state.instance_name,
+        instance_name: state.instance_name.load_full(),
         user: &admin.0.user,
         csrf_token: &csrf_token,
         pending_count: None,
