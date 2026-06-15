@@ -1,4 +1,5 @@
 pub mod admin_routes;
+pub mod apps_routes;
 pub mod events_routes;
 pub mod pending_routes;
 pub mod routes;
@@ -175,6 +176,9 @@ pub fn ui_router(state: AppState) -> Router {
             "/pending/{id}/force-apply",
             post(pending_routes::force_apply_pending),
         )
+        // Owner-only registered-apps admin page (read-only list + resource
+        // counts). Role is enforced in the handler.
+        .route("/apps", get(apps_routes::apps_page))
         // Owner-only instance settings (page + identity / notifications saves +
         // a test-send). Role is enforced in each handler.
         .route("/settings", get(settings_routes::settings_page))

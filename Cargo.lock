@@ -3424,6 +3424,7 @@ dependencies = [
  "identity",
  "maud",
  "pending",
+ "platform",
  "qrcode",
  "serde",
  "serde_json",

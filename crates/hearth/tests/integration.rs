@@ -12,6 +12,8 @@ mod common;
 mod account;
 #[path = "integration/admin.rs"]
 mod admin;
+#[path = "integration/apps.rs"]
+mod apps;
 #[path = "integration/audit_chain.rs"]
 mod audit_chain;
 #[path = "integration/auth.rs"]

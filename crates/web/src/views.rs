@@ -63,6 +63,7 @@ pub enum PageId {
     Members,
     Events,
     Pending,
+    Apps,
     Settings,
 }
 
@@ -1108,10 +1109,16 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                         events_icon(),
                     ))
                 }
-                // Owner-only: instance configuration. Admins manage users;
-                // Owners configure the instance. Defense-in-depth — `/settings`
-                // re-checks the role server-side.
+                // Owner-only: registered apps + instance configuration. Admins
+                // manage users; Owners manage the platform + instance.
+                // Defense-in-depth — both pages re-check the role server-side.
                 @if is_owner(ctx.user.instance_role) {
+                    (nav_link(
+                        "/apps",
+                        "Apps",
+                        current == PageId::Apps,
+                        apps_icon(),
+                    ))
                     (nav_link(
                         "/settings",
                         "Settings",
@@ -6569,6 +6576,114 @@ fn events_icon() -> Markup {
             line x1="3" y1="18" x2="3.01" y2="18" {}
         }
     }
+}
+
+/// Four-tile grid glyph for the Apps nav entry.
+fn apps_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            rect x="3" y="3" width="7" height="7" rx="1" {}
+            rect x="14" y="3" width="7" height="7" rx="1" {}
+            rect x="14" y="14" width="7" height="7" rx="1" {}
+            rect x="3" y="14" width="7" height="7" rx="1" {}
+        }
+    }
+}
+
+// ── Owner Apps admin page ─────────────────────────────────────────────────
+
+/// Owner-only registered-apps page (CP1 — read-only). One row per app in
+/// `platform.registered_apps` with a live count of the (non-deleted) resources
+/// it stores. Registration happens over the platform gRPC API; lifecycle
+/// controls (enable/disable, uninstall) and a resource browser land in later
+/// checkpoints. Wide chrome so the columns have room.
+pub fn apps_page(
+    ctx: &ChromeContext,
+    apps: &[platform::registry::AppListItem],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let content = html! {
+        p class="muted apps-lead" {
+            "Apps that have registered on this instance and the encrypted resources they store. "
+            "Registration happens over the platform gRPC API; this view is read-only for now."
+        }
+        @if apps.is_empty() {
+            div class="card" {
+                p class="muted" { "No apps have registered yet." }
+            }
+        } @else {
+            table class="users-table apps-table" {
+                thead {
+                    tr {
+                        th class="col-app" { "App" }
+                        th class="col-publisher" { "Publisher" }
+                        th class="col-status" { "Status" }
+                        th class="col-types" { "Resource types" }
+                        th class="col-count" { "Resources" }
+                        th class="col-registered" { "Registered" }
+                    }
+                }
+                tbody {
+                    @for app in apps {
+                        (app_row(app, now))
+                    }
+                }
+            }
+        }
+    };
+    shell_app_wide(ctx, "Apps", PageId::Apps, content)
+}
+
+/// One registered-app row: name + identifier stacked, publisher, status pill,
+/// declared resource-type chips, the live resource count, and when it first
+/// registered (absolute time in the tooltip).
+fn app_row(app: &platform::registry::AppListItem, now: chrono::DateTime<chrono::Utc>) -> Markup {
+    let registered = app.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    html! {
+        tr {
+            td class="col-app" {
+                div class="user-row-text" {
+                    span class="user-name" { (app.display_name) }
+                    span class="user-email" { (app.app_identifier) }
+                }
+            }
+            td class="col-publisher" { (app.publisher) }
+            td class="col-status" { (app_status_badge(&app.status)) }
+            td class="col-types" {
+                @if app.resource_types.is_empty() {
+                    span class="muted-dash" { "—" }
+                } @else {
+                    span class="app-types" {
+                        @for t in &app.resource_types {
+                            span class="app-type-chip" { (t) }
+                        }
+                    }
+                }
+            }
+            td class="col-count" { (app.resource_count) }
+            td class="col-registered" title=(registered) { (relative_time(app.created_at, now)) }
+        }
+    }
+}
+
+/// Status pill for an app: "enabled" reuses the green `.status-active` badge,
+/// anything else (e.g. "disabled") the muted `.status-deactivated` one. Label
+/// is the raw status with a leading capital.
+fn app_status_badge(status: &str) -> Markup {
+    let class = if status == "enabled" {
+        "status-badge status-active"
+    } else {
+        "status-badge status-deactivated"
+    };
+    let mut label = status.to_string();
+    if let Some(first) = label.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    html! { span class=(class) { (label) } }
 }
 
 // ── Owner Settings page ───────────────────────────────────────────────────

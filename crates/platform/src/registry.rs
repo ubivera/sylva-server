@@ -44,6 +44,22 @@ pub struct TrustedPublisherRow {
     pub public_key: Vec<u8>,
 }
 
+/// A registered app plus a live count of the (non-deleted) resources it stores.
+/// Powers the Owner admin Apps page; omits `app_public_key` (not displayed).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AppListItem {
+    pub id: Uuid,
+    pub app_identifier: String,
+    pub display_name: String,
+    pub publisher: String,
+    pub schema_version: i32,
+    pub resource_types: Vec<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub resource_count: i64,
+}
+
 const APP_COLS: &str = "id, app_identifier, display_name, publisher, app_public_key, \
      schema_version, resource_types, status, created_at, updated_at";
 
@@ -167,6 +183,25 @@ where
         .bind(app_identifier)
         .fetch_optional(db)
         .await
+}
+
+/// List every registered app with a live count of its non-deleted resources,
+/// ordered by identifier. For the Owner admin Apps page.
+pub async fn list_apps_with_counts<'e, E>(db: E) -> Result<Vec<AppListItem>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, AppListItem>(
+        "SELECT a.id, a.app_identifier, a.display_name, a.publisher, a.schema_version,
+                a.resource_types, a.status, a.created_at, a.updated_at,
+                COUNT(r.id) FILTER (WHERE r.deleted_at IS NULL) AS resource_count
+         FROM platform.registered_apps a
+         LEFT JOIN platform.resources r ON r.app_id = a.id
+         GROUP BY a.id
+         ORDER BY a.app_identifier",
+    )
+    .fetch_all(db)
+    .await
 }
 
 /// Insert or update an app registration (keyed on `app_identifier`). A
