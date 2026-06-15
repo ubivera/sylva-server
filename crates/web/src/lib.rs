@@ -150,6 +150,10 @@ pub fn ui_router(state: AppState) -> Router {
         )
         .route("/modals/invite", get(admin_routes::invite_modal_fragment))
         .route("/pending/{id}/modal/veto", get(admin_routes::veto_modal))
+        .route(
+            "/pending/{id}/modal/force-apply",
+            get(pending_routes::force_apply_modal),
+        )
         .route("/members/{id}/deactivate", post(admin_routes::deactivate_member))
         .route("/members/{id}/reactivate", post(admin_routes::reactivate_member))
         .route("/members/{id}/anonymize", post(admin_routes::anonymize_member))
@@ -166,6 +170,11 @@ pub fn ui_router(state: AppState) -> Router {
             "/pending/{id}/veto",
             post(pending_routes::veto_pending),
         )
+        // Break-glass: force a pending action through with the recovery code.
+        .route(
+            "/pending/{id}/force-apply",
+            post(pending_routes::force_apply_pending),
+        )
         // Owner-only instance settings (page + identity / notifications saves +
         // a test-send). Role is enforced in each handler.
         .route("/settings", get(settings_routes::settings_page))
@@ -180,6 +189,16 @@ pub fn ui_router(state: AppState) -> Router {
         .route(
             "/settings/notifications/test",
             post(settings_routes::settings_test_email),
+        )
+        // Server recovery code: metadata in the settings page + rotate (verify
+        // the current code, mint a new one shown once).
+        .route(
+            "/modals/settings/recovery-code",
+            get(settings_routes::recovery_rotate_modal),
+        )
+        .route(
+            "/settings/recovery-code/rotate",
+            post(settings_routes::recovery_rotate_submit),
         )
         // Owner force-close (scorch + close the whole instance). Critical-reauth
         // gated; the confirm dialog is fetched into `#modal-host` on demand.

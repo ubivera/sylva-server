@@ -6581,11 +6581,14 @@ pub fn settings_page(
     ctx: &ChromeContext,
     notifications: &hearth::config::NotificationsConfig,
     smtp_password_set: bool,
+    recovery_created_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Markup {
     let content = html! {
         (settings_identity_section(ctx))
         hr class="settings-divider";
         (settings_notifications_section(ctx, notifications, smtp_password_set))
+        hr class="settings-divider";
+        (settings_recovery_section(recovery_created_at))
         hr class="settings-divider";
         (settings_danger_section())
         script { (maud::PreEscaped(SETTINGS_SMTP_TOGGLE_JS)) }
@@ -6867,6 +6870,101 @@ pub fn settings_shutdown_modal(ctx: &ChromeContext) -> Markup {
                         "Close this server"
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Server recovery-code section: shows when the active code was last generated
+/// and an Owner-only "Rotate" trigger. Rotating needs the current code (the
+/// proof of possession), collected in the modal.
+fn settings_recovery_section(created_at: Option<chrono::DateTime<chrono::Utc>>) -> Markup {
+    html! {
+        section class="settings-section" {
+            div class="settings-section-header" {
+                span class="settings-section-icon" aria-hidden="true" { (key_icon()) }
+                div {
+                    h3 { "Server recovery code" }
+                    p class="settings-section-tagline" {
+                        "The break-glass key: it unlocks owner recovery and forcing "
+                        "owner changes past the veto window. Rotate it if it may be "
+                        "exposed."
+                    }
+                }
+            }
+            div class="settings-section-body" {
+                div class="settings-row" {
+                    div class="settings-row-label" {
+                        @match created_at {
+                            Some(at) => {
+                                span { "Active code generated " (at.format("%b %-d, %Y").to_string()) "." }
+                            }
+                            None => span { "No active recovery code." }
+                        }
+                        p class="settings-row-hint" {
+                            "Rotating shows the new code once and immediately "
+                            "invalidates the old one."
+                        }
+                    }
+                    div class="settings-row-control" {
+                        button type="button" class="btn-secondary"
+                               data-open-modal="/modals/settings/recovery-code" {
+                            "Rotate recovery code"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Confirm dialog for rotating the server recovery code — fetched into
+/// `#modal-host` from `/modals/settings/recovery-code`. The form posts the
+/// current code; the response swaps the dialog content in place: the new code
+/// (shown once) on success, or the form with an inline error on a wrong code.
+pub fn recovery_rotate_modal(ctx: &ChromeContext) -> Markup {
+    html! {
+        dialog id="dlg-recovery-rotate" class="action-dialog action-dialog-centered" {
+            div id="recovery-rotate-content" {
+                (recovery_rotate_form(ctx.csrf_token, None))
+            }
+        }
+    }
+}
+
+/// The rotate form fragment (also re-rendered with `error` set when the
+/// supplied current code didn't match).
+pub fn recovery_rotate_form(csrf_token: &str, error: Option<&str>) -> Markup {
+    html! {
+        form id="form-recovery-rotate"
+             hx-post="/settings/recovery-code/rotate"
+             hx-target="#recovery-rotate-content" hx-swap="innerHTML" {
+            div class="dialog-header" {
+                div class="dialog-icon" { (key_icon()) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            h2 class="dialog-center-title" { "Rotate the server recovery code" }
+            p class="dialog-description dialog-center-text" {
+                "This generates a new server recovery code and immediately "
+                "invalidates the current one. Enter the current code to confirm."
+            }
+            @if let Some(err) = error {
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { (err) }
+                }
+            }
+            (csrf_input(csrf_token))
+            div class="field" {
+                label for="rotate-current-code" { "Current recovery code" }
+                input type="text" id="rotate-current-code" name="current_code"
+                      autocomplete="off" spellcheck="false" autocapitalize="off"
+                      placeholder="XXXX-XXXX-XXXX-…" required;
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                button type="submit" class="btn-danger" { "Rotate code" }
             }
         }
     }
@@ -7317,6 +7415,12 @@ fn pending_active_row(
                        data-open-modal=(format!("/pending/{}/modal/veto", row.id)) {
                     "Veto"
                 }
+                // Break-glass: force the action through now (bypass the veto
+                // window) with the server recovery code.
+                button type="button" class="btn-danger-ghost"
+                       data-open-modal=(format!("/pending/{}/modal/force-apply", row.id)) {
+                    "Force apply"
+                }
             }
         }
     }
@@ -7467,6 +7571,77 @@ pub(crate) fn veto_pending_dialog(
                         "Veto"
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Confirm dialog for force-applying a pending transition with the server
+/// recovery code — fetched into `#modal-host` from
+/// `/pending/{id}/modal/force-apply`. Wraps the form in a swappable content
+/// div so a wrong code can re-render inline.
+pub(crate) fn force_apply_dialog(
+    transition_id: uuid::Uuid,
+    target_name: &str,
+    action_label: &str,
+    csrf_token: &str,
+) -> Markup {
+    html! {
+        dialog id=(format!("dlg-force-apply-{transition_id}"))
+               class="action-dialog action-dialog-centered" {
+            div id=(format!("force-apply-content-{transition_id}")) {
+                (force_apply_form(transition_id, target_name, action_label, csrf_token, None))
+            }
+        }
+    }
+}
+
+/// The force-apply form fragment (re-rendered with `error` when the supplied
+/// recovery code didn't match). Posts the recovery code; the response either
+/// redirects to `/pending` (success / already-resolved) or swaps this fragment
+/// back in with the error.
+pub(crate) fn force_apply_form(
+    transition_id: uuid::Uuid,
+    target_name: &str,
+    action_label: &str,
+    csrf_token: &str,
+    error: Option<&str>,
+) -> Markup {
+    html! {
+        form id=(format!("form-force-apply-{transition_id}"))
+             hx-post=(format!("/pending/{transition_id}/force-apply"))
+             hx-target=(format!("#force-apply-content-{transition_id}"))
+             hx-swap="innerHTML" {
+            div class="dialog-header" {
+                div class="dialog-icon dialog-icon-danger" { (alert_circle_icon()) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            h2 class="dialog-center-title" { "Force this action through?" }
+            p class="dialog-description dialog-center-text" {
+                "Applies the pending " strong { (action_label) } " on "
+                strong { (target_name) } " immediately, bypassing the 72-hour "
+                "veto window — the target can no longer veto it. Use this only to "
+                "remove an owner who's lost access or gone rogue. It can't be undone."
+            }
+            @if let Some(err) = error {
+                div class="dialog-alert dialog-alert-danger" role="alert" {
+                    (alert_circle_icon())
+                    span { (err) }
+                }
+            }
+            (csrf_input(csrf_token))
+            div class="field" {
+                label for=(format!("force-code-{transition_id}")) {
+                    "Server recovery code"
+                }
+                input type="text" id=(format!("force-code-{transition_id}"))
+                      name="recovery_code" autocomplete="off" spellcheck="false"
+                      autocapitalize="off" placeholder="XXXX-XXXX-XXXX-…" required;
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                button type="submit" class="btn-danger" { "Force apply" }
             }
         }
     }

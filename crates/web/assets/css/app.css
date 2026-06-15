@@ -540,8 +540,13 @@ a.nav-link.active .nav-link-icon {
 .col-pending-initiator { width: 14rem; }
 .col-pending-remaining { width: 10rem; }
 .col-pending-actions {
-    width: 8rem;
+    width: 13rem;
     text-align: right;
+    white-space: nowrap;
+}
+/* Veto + Force apply sit inline, right-aligned, with a gap between them. */
+.col-pending-actions button + button {
+    margin-left: var(--space-sm);
 }
 
 /* Empty state — shown when the pending queue is clear. Centered

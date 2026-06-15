@@ -49,6 +49,11 @@ pub async fn settings_page(
     let pw_set = hearth::instance::smtp_password_is_set(&state.db)
         .await
         .unwrap_or(false);
+    let recovery_created_at = auth::recovery_code::active_metadata(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.created_at);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let pending_count = pending_count_for(&state, auth.user.instance_role).await;
     let ctx = views::ChromeContext {
@@ -57,7 +62,8 @@ pub async fn settings_page(
         csrf_token: &csrf_token,
         pending_count,
     };
-    Html(views::settings_page(&ctx, &eff.notifications, pw_set).into_string()).into_response()
+    Html(views::settings_page(&ctx, &eff.notifications, pw_set, recovery_created_at).into_string())
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -296,6 +302,93 @@ pub async fn settings_shutdown_submit(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
     account_closed_response(&state, "/")
+}
+
+/// `GET /modals/settings/recovery-code` — the rotate-recovery-code dialog.
+pub async fn recovery_rotate_modal(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+) -> Response {
+    if auth.user.instance_role != InstanceRole::Owner {
+        return error_response(StatusCode::FORBIDDEN, "Owners only.");
+    }
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+    let ctx = views::ChromeContext {
+        instance_name: state.instance_name.load_full(),
+        user: &auth.user,
+        csrf_token: &csrf_token,
+        pending_count: None,
+    };
+    Html(views::recovery_rotate_modal(&ctx).into_string()).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RecoveryRotateForm {
+    pub csrf_token: String,
+    #[serde(default)]
+    pub current_code: String,
+}
+
+/// `POST /settings/recovery-code/rotate` — verify the current server recovery
+/// code, mint a new one, invalidate the old. Owner-only. Returns a dialog
+/// fragment: the new code (shown once) on success, or the form with an inline
+/// error on a wrong current code.
+pub async fn recovery_rotate_submit(
+    State(state): State<AppState>,
+    BrowserAuth(auth): BrowserAuth,
+    Form(form): Form<RecoveryRotateForm>,
+) -> Response {
+    if let Err(resp) = check_csrf_token(&state, auth.session_id, &form.csrf_token) {
+        return resp;
+    }
+    if auth.user.instance_role != InstanceRole::Owner {
+        return error_response(StatusCode::FORBIDDEN, "Owners only.");
+    }
+    let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
+
+    let new_raw = auth::recovery_code::generate_code();
+    let actor = audit::Actor {
+        user_id: auth.user.id,
+        display_name: auth.user.display_name.clone(),
+    };
+    let result: anyhow::Result<bool> = async {
+        let mut tx = state.db.begin().await?;
+        let rotated =
+            auth::recovery_code::rotate(&mut tx, &form.current_code, &new_raw, auth.user.id).await?;
+        let Some((new_id, previous_id)) = rotated else {
+            return Ok(false); // wrong current code — nothing changed
+        };
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "recovery_code_rotated",
+            serde_json::json!({
+                "new_code_id": new_id,
+                "previous_code_id": previous_id,
+                "via": "settings",
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    .await;
+
+    match result {
+        Ok(true) => {
+            Html(views::recovery_code_modal_content(&new_raw).into_string()).into_response()
+        }
+        Ok(false) => Html(
+            views::recovery_rotate_form(&csrf_token, Some("That current code is not valid."))
+                .into_string(),
+        )
+        .into_response(),
+        Err(err) => {
+            tracing::error!(?err, "rotating server recovery code");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
+        }
+    }
 }
 
 /// Redirect back to `/settings` with a green success toast.
