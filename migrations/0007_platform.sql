@@ -12,6 +12,11 @@
 -- FK is added after that table is created below — CP3b).
 CREATE SCHEMA IF NOT EXISTS platform;
 
+-- Monotonic change clock for incremental sync (StreamChanges). Every resource
+-- create/update/delete stamps a fresh value; clients sync by "change_seq >
+-- cursor". A shared sequence (not per-row) gives a single ordered timeline.
+CREATE SEQUENCE platform.resource_change_seq;
+
 CREATE TABLE platform.resources (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     -- Owning app — FK to platform.registered_apps(id) added below (that table
@@ -36,6 +41,9 @@ CREATE TABLE platform.resources (
     last_modified_by   UUID NOT NULL,                    -- snapshot (owner-scoped: == owner)
     schema_version     INTEGER NOT NULL,
 
+    -- Sync clock: bumped on every create/update/delete (incl. tombstoning).
+    change_seq         BIGINT NOT NULL DEFAULT nextval('platform.resource_change_seq'),
+
     -- An app's own id for a (type) is unique within that app.
     UNIQUE (app_id, resource_type, app_resource_id)
 );
@@ -47,6 +55,9 @@ CREATE INDEX resources_app_type_listing
     ON platform.resources (app_id, resource_type, updated_at DESC);
 CREATE INDEX resources_tombstones
     ON platform.resources (deleted_at) WHERE deleted_at IS NOT NULL;
+-- Covers the StreamChanges sync query: owner + app, ordered by change_seq.
+CREATE INDEX resources_sync
+    ON platform.resources (owner_user_id, app_id, change_seq);
 
 -- App registration (CP3). Publishers the Owner trusts (their Ed25519 verifying
 -- key); apps are signed with a trusted publisher's key so only trusted apps can

@@ -10,8 +10,8 @@ use identity::InstanceRole;
 use platform::registry::{self, AppDeclaration};
 use proto::platform::v1::{
     AppIdentifier, CreateResourceRequest, Empty, ListResourcesRequest, RegisterAppRequest,
-    ResourceId, UpdateResourceRequest, platform_client::PlatformClient,
-    resources_client::ResourcesClient,
+    Resource, ResourceId, StreamChangesRequest, UpdateResourceRequest,
+    platform_client::PlatformClient, resources_client::ResourcesClient,
 };
 
 use crate::common::TestApp;
@@ -546,6 +546,219 @@ async fn create_resource_requires_registered_enabled_app_and_declared_type() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    let _ = shutdown.send(true);
+}
+
+/// Drain a `StreamChanges` server-stream to completion (catch-up mode).
+async fn collect_changes(
+    client: &mut ResourcesClient<tonic::transport::Channel>,
+    token: &str,
+    req: StreamChangesRequest,
+) -> Vec<Resource> {
+    let mut stream = client.stream_changes(authed(token, req)).await.unwrap().into_inner();
+    let mut out = Vec::new();
+    while let Some(msg) = stream.message().await.unwrap() {
+        out.push(msg);
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_changes_catch_up_includes_updates_and_tombstones() {
+    let app = TestApp::new().await;
+    app.seed_user("owner@test.local", "Olive", "pw", InstanceRole::Member)
+        .await;
+    let token = app.login("owner@test.local", "pw").await;
+    let app_id = seed_app(&app).await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = ResourcesClient::connect(format!("http://{addr}")).await.unwrap();
+
+    let mk = |blob: &[u8]| CreateResourceRequest {
+        app_id: app_id.clone(),
+        resource_type: "task".into(),
+        app_resource_id: uuid::Uuid::new_v4().to_string(),
+        parent_resource_id: None,
+        content_blob: blob.to_vec(),
+        content_signature: b"s".to_vec(),
+        schema_version: 1,
+    };
+    let r1 = client.create_resource(authed(&token, mk(b"v1"))).await.unwrap().into_inner();
+    let r2 = client.create_resource(authed(&token, mk(b"x"))).await.unwrap().into_inner();
+    client
+        .update_resource(authed(
+            &token,
+            UpdateResourceRequest {
+                id: r1.id.clone(),
+                parent_resource_id: None,
+                content_blob: b"v2".to_vec(),
+                content_signature: b"s2".to_vec(),
+                schema_version: 2,
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .delete_resource(authed(&token, ResourceId { id: r2.id.clone() }))
+        .await
+        .unwrap();
+
+    // Catch up from the beginning: one row per resource (latest state), ordered
+    // by change_seq — the updated r1, then the tombstoned r2.
+    let changes = collect_changes(
+        &mut client,
+        &token,
+        StreamChangesRequest {
+            app_id: app_id.clone(),
+            resource_type: String::new(),
+            since_cursor: 0,
+            limit: 0,
+        },
+    )
+    .await;
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].id, r1.id);
+    assert_eq!(changes[0].content_blob, b"v2".to_vec(), "latest content, not the create");
+    assert_eq!(changes[1].id, r2.id);
+    assert!(changes[1].deleted_at.is_some(), "the delete streams as a tombstone");
+    assert!(
+        changes[1].change_seq > changes[0].change_seq && changes[0].change_seq > 0,
+        "monotonic change_seq ordering"
+    );
+
+    // The cursor is exhausted — nothing newer.
+    let cursor = changes[1].change_seq;
+    let none = collect_changes(
+        &mut client,
+        &token,
+        StreamChangesRequest {
+            app_id: app_id.clone(),
+            resource_type: String::new(),
+            since_cursor: cursor,
+            limit: 0,
+        },
+    )
+    .await;
+    assert!(none.is_empty(), "no changes past the latest cursor");
+
+    // A fresh edit shows up incrementally from that cursor.
+    client
+        .update_resource(authed(
+            &token,
+            UpdateResourceRequest {
+                id: r1.id.clone(),
+                parent_resource_id: None,
+                content_blob: b"v3".to_vec(),
+                content_signature: b"s3".to_vec(),
+                schema_version: 3,
+            },
+        ))
+        .await
+        .unwrap();
+    let next = collect_changes(
+        &mut client,
+        &token,
+        StreamChangesRequest {
+            app_id,
+            resource_type: String::new(),
+            since_cursor: cursor,
+            limit: 0,
+        },
+    )
+    .await;
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].id, r1.id);
+    assert_eq!(next[0].content_blob, b"v3".to_vec());
+    assert!(next[0].change_seq > cursor);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_changes_is_owner_scoped_filtered_and_authed() {
+    let app = TestApp::new().await;
+    let alice = app
+        .seed_user("a@test.local", "Alice", "pw", InstanceRole::Member)
+        .await;
+    app.seed_user("b@test.local", "Bob", "pw", InstanceRole::Member)
+        .await;
+    let tok_a = app.login("a@test.local", "pw").await;
+    let tok_b = app.login("b@test.local", "pw").await;
+    let app_id = seed_app(&app).await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = ResourcesClient::connect(format!("http://{addr}")).await.unwrap();
+
+    let mk = |rt: &str| CreateResourceRequest {
+        app_id: app_id.clone(),
+        resource_type: rt.into(),
+        app_resource_id: uuid::Uuid::new_v4().to_string(),
+        parent_resource_id: None,
+        content_blob: b"x".to_vec(),
+        content_signature: b"s".to_vec(),
+        schema_version: 1,
+    };
+    client.create_resource(authed(&tok_a, mk("task"))).await.unwrap();
+    client.create_resource(authed(&tok_a, mk("project"))).await.unwrap();
+    client.create_resource(authed(&tok_b, mk("task"))).await.unwrap();
+
+    // A's feed has only A's two resources.
+    let a_all = collect_changes(
+        &mut client,
+        &tok_a,
+        StreamChangesRequest {
+            app_id: app_id.clone(),
+            resource_type: String::new(),
+            since_cursor: 0,
+            limit: 0,
+        },
+    )
+    .await;
+    assert_eq!(a_all.len(), 2);
+    assert!(
+        a_all.iter().all(|r| r.owner_user_id == alice.id.0.to_string()),
+        "owner-scoped feed"
+    );
+
+    // Type filter.
+    let a_tasks = collect_changes(
+        &mut client,
+        &tok_a,
+        StreamChangesRequest {
+            app_id: app_id.clone(),
+            resource_type: "task".into(),
+            since_cursor: 0,
+            limit: 0,
+        },
+    )
+    .await;
+    assert_eq!(a_tasks.len(), 1);
+    assert_eq!(a_tasks[0].resource_type, "task");
+
+    // B's feed has only B's one.
+    let b_all = collect_changes(
+        &mut client,
+        &tok_b,
+        StreamChangesRequest {
+            app_id: app_id.clone(),
+            resource_type: String::new(),
+            since_cursor: 0,
+            limit: 0,
+        },
+    )
+    .await;
+    assert_eq!(b_all.len(), 1);
+
+    // The stream is auth-gated like every RPC.
+    let err = client
+        .stream_changes(tonic::Request::new(StreamChangesRequest {
+            app_id,
+            resource_type: String::new(),
+            since_cursor: 0,
+            limit: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
     let _ = shutdown.send(true);
 }

@@ -13,7 +13,7 @@ use uuid::Uuid;
 /// in one place.
 const COLS: &str = "id, app_id, resource_type, app_resource_id, parent_resource_id, \
      owner_user_id, created_at, updated_at, deleted_at, content_blob, \
-     content_signature, last_modified_by, schema_version";
+     content_signature, last_modified_by, schema_version, change_seq";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ResourceRow {
@@ -30,6 +30,7 @@ pub struct ResourceRow {
     pub content_signature: Vec<u8>,
     pub last_modified_by: Uuid,
     pub schema_version: i32,
+    pub change_seq: i64,
 }
 
 /// A resource as seen by the **Owner admin** browser — cross-owner (not
@@ -141,7 +142,8 @@ impl ResourceRepository {
         let sql = format!(
             "UPDATE platform.resources
              SET content_blob = $3, content_signature = $4, schema_version = $5,
-                 parent_resource_id = $6, last_modified_by = $2, updated_at = now()
+                 parent_resource_id = $6, last_modified_by = $2, updated_at = now(),
+                 change_seq = nextval('platform.resource_change_seq')
              WHERE id = $1 AND owner_user_id = $2 AND deleted_at IS NULL
              RETURNING {COLS}"
         );
@@ -160,7 +162,9 @@ impl ResourceRepository {
     /// affected (false = not found / not owned / already deleted).
     pub async fn soft_delete_owned(&self, id: Uuid, owner: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "UPDATE platform.resources SET deleted_at = now(), updated_at = now()
+            "UPDATE platform.resources
+             SET deleted_at = now(), updated_at = now(),
+                 change_seq = nextval('platform.resource_change_seq')
              WHERE id = $1 AND owner_user_id = $2 AND deleted_at IS NULL",
         )
         .bind(id)
@@ -211,6 +215,36 @@ impl ResourceRepository {
         .await?;
 
         Ok((rows, total))
+    }
+
+    /// Owner-scoped incremental sync: every resource (including tombstones —
+    /// `deleted_at` set) whose `change_seq` exceeds `since_cursor`, oldest change
+    /// first, capped at `limit`. The caller streams these and persists the max
+    /// `change_seq` seen as the next cursor. An optional `resource_type` narrows
+    /// the feed.
+    pub async fn list_changes(
+        &self,
+        app_id: Uuid,
+        resource_type: Option<&str>,
+        owner: Uuid,
+        since_cursor: i64,
+        limit: i64,
+    ) -> Result<Vec<ResourceRow>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {COLS} FROM platform.resources
+             WHERE owner_user_id = $1 AND app_id = $2 AND change_seq > $3
+               AND ($4::text IS NULL OR resource_type = $4)
+             ORDER BY change_seq ASC
+             LIMIT $5"
+        );
+        sqlx::query_as::<_, ResourceRow>(&sql)
+            .bind(owner)
+            .bind(app_id)
+            .bind(since_cursor)
+            .bind(resource_type)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
     }
 }
 

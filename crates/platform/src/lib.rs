@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use proto::platform::v1::{
     AppIdentifier, AppRegistration, CreateResourceRequest, Empty, ListResourcesRequest,
-    ListResourcesResponse, RegisterAppRequest, Resource, ResourceId, UpdateResourceRequest,
-    WhoAmIResponse,
+    ListResourcesResponse, RegisterAppRequest, Resource, ResourceId, StreamChangesRequest,
+    UpdateResourceRequest, WhoAmIResponse,
     platform_server::{Platform, PlatformServer},
     resources_server::{Resources, ResourcesServer},
 };
@@ -217,6 +217,8 @@ pub fn platform_server(ctx: PlatformContext) -> PlatformServer<PlatformService> 
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const MAX_LIST_LIMIT: u32 = 200;
+const DEFAULT_CHANGES_LIMIT: u32 = 500;
+const MAX_CHANGES_LIMIT: u32 = 2000;
 
 /// The `Resources` gRPC service. Every RPC authenticates the caller (the
 /// owner), then scopes the storage op to that owner — a resource owned by
@@ -359,6 +361,48 @@ impl Resources for ResourcesService {
             Err(err) => Err(internal(&err, "list_resources")),
         }
     }
+
+    type StreamChangesStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Resource, Status>> + Send>>;
+
+    /// Owner-scoped incremental sync. Streams every resource (including
+    /// tombstones) whose `change_seq` exceeds `since_cursor`, oldest first, then
+    /// completes — a bounded catch-up batch. The client persists the max
+    /// `change_seq` it sees and re-calls with it until a call yields nothing.
+    async fn stream_changes(
+        &self,
+        request: Request<StreamChangesRequest>,
+    ) -> Result<Response<Self::StreamChangesStream>, Status> {
+        let owner = authenticate(&self.ctx, request.metadata()).await?.user.id.0;
+        let req = request.into_inner();
+        let app_id = parse_uuid(&req.app_id, "app_id")?;
+        let resource_type = if req.resource_type.trim().is_empty() {
+            None
+        } else {
+            Some(req.resource_type)
+        };
+        // u64 cursor → i64 column; a value past i64::MAX just means "nothing newer".
+        let since = i64::try_from(req.since_cursor).unwrap_or(i64::MAX);
+        let limit = clamp_changes_limit(req.limit);
+        let rows = self
+            .ctx
+            .resources
+            .list_changes(app_id, resource_type.as_deref(), owner, since, limit)
+            .await
+            .map_err(|err| internal(&err, "stream_changes"))?;
+        let items: Vec<Result<Resource, Status>> =
+            rows.into_iter().map(|row| Ok(to_proto(row))).collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(items))))
+    }
+}
+
+fn clamp_changes_limit(requested: u32) -> i64 {
+    let n = if requested == 0 {
+        DEFAULT_CHANGES_LIMIT
+    } else {
+        requested.min(MAX_CHANGES_LIMIT)
+    };
+    i64::from(n)
 }
 
 /// Build the tonic service wrapper for the `Resources` service.
@@ -408,6 +452,7 @@ fn to_proto(row: resources::ResourceRow) -> Resource {
         content_signature: row.content_signature,
         last_modified_by: row.last_modified_by.to_string(),
         schema_version: row.schema_version,
+        change_seq: u64::try_from(row.change_seq).unwrap_or(0),
     }
 }
 

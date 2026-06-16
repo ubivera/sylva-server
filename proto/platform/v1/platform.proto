@@ -70,6 +70,9 @@ message Resource {
   bytes content_signature = 11;
   string last_modified_by = 12;
   int32 schema_version = 13;
+  // Monotonic per-resource change sequence, bumped on every create/update/
+  // delete. Clients persist the max they've seen and pass it as a sync cursor.
+  uint64 change_seq = 14;
 }
 
 message CreateResourceRequest {
@@ -107,13 +110,26 @@ message ListResourcesResponse {
   uint32 total = 2;                       // total matching (ignoring limit/offset)
 }
 
+// Owner-scoped incremental sync. Emits every resource (including tombstones —
+// `deleted_at` set) whose `change_seq` exceeds `since_cursor`, oldest change
+// first. The client persists the max `change_seq` it applies and passes it back
+// as `since_cursor` next time. One call returns a bounded catch-up batch; the
+// client re-calls with the new cursor until a call yields nothing.
+message StreamChangesRequest {
+  string app_id = 1;
+  string resource_type = 2;               // optional filter; empty = all types
+  uint64 since_cursor = 3;                 // exclusive; 0 = from the beginning
+  uint32 limit = 4;                        // 0 -> server default
+}
+
 // CP2 storage API. All operations are owner-scoped: the caller is the owner,
-// and a resource owned by someone else is invisible (NotFound). Sharing/ReBAC
-// + a change-stream (sync) are later checkpoints.
+// and a resource owned by someone else is invisible (NotFound). `StreamChanges`
+// (CP-sync) is the incremental-sync feed; resource sharing/ReBAC is later.
 service Resources {
   rpc CreateResource(CreateResourceRequest) returns (Resource);
   rpc ReadResource(ResourceId) returns (Resource);
   rpc UpdateResource(UpdateResourceRequest) returns (Resource);
   rpc DeleteResource(ResourceId) returns (Empty);
   rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+  rpc StreamChanges(StreamChangesRequest) returns (stream Resource);
 }
