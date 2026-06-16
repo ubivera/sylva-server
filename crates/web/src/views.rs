@@ -63,6 +63,7 @@ pub enum PageId {
     Members,
     Events,
     Pending,
+    Apps,
     Settings,
 }
 
@@ -1108,10 +1109,16 @@ fn sidebar(ctx: &ChromeContext, current: PageId) -> Markup {
                         events_icon(),
                     ))
                 }
-                // Owner-only: instance configuration. Admins manage users;
-                // Owners configure the instance. Defense-in-depth — `/settings`
-                // re-checks the role server-side.
+                // Owner-only: registered apps + instance configuration. Admins
+                // manage users; Owners manage the platform + instance.
+                // Defense-in-depth — both pages re-check the role server-side.
                 @if is_owner(ctx.user.instance_role) {
+                    (nav_link(
+                        "/apps",
+                        "Apps",
+                        current == PageId::Apps,
+                        apps_icon(),
+                    ))
                     (nav_link(
                         "/settings",
                         "Settings",
@@ -6571,6 +6578,609 @@ fn events_icon() -> Markup {
     }
 }
 
+/// Four-tile grid glyph for the Apps nav entry.
+fn apps_icon() -> Markup {
+    html! {
+        svg xmlns="http://www.w3.org/2000/svg"
+            width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true" {
+            rect x="3" y="3" width="7" height="7" rx="1" {}
+            rect x="14" y="3" width="7" height="7" rx="1" {}
+            rect x="14" y="14" width="7" height="7" rx="1" {}
+            rect x="3" y="14" width="7" height="7" rx="1" {}
+        }
+    }
+}
+
+// ── Owner Apps admin page ─────────────────────────────────────────────────
+
+/// Owner-only registered-apps page (CP1 — read-only). One row per app in
+/// `platform.registered_apps` with a live count of the (non-deleted) resources
+/// it stores. Registration happens over the platform gRPC API; lifecycle
+/// controls (enable/disable, uninstall) and a resource browser land in later
+/// checkpoints. Wide chrome so the columns have room.
+pub fn apps_page(
+    ctx: &ChromeContext,
+    apps: &[platform::registry::AppListItem],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let content = html! {
+        p class="muted apps-lead" {
+            "Apps that have registered on this instance and the encrypted resources they store. "
+            "Registration happens over the platform gRPC API. "
+            a href="/apps/publishers" { "Manage trusted publishers →" }
+        }
+        @if apps.is_empty() {
+            div class="card" {
+                p class="muted" { "No apps have registered yet." }
+            }
+        } @else {
+            table class="users-table apps-table" {
+                thead {
+                    tr {
+                        th class="col-app" { "App" }
+                        th class="col-publisher" { "Publisher" }
+                        th class="col-status" { "Status" }
+                        th class="col-types" { "Resource types" }
+                        th class="col-count" { "Resources" }
+                        th class="col-registered" { "Registered" }
+                        th class="col-actions" aria-label="Actions" { "" }
+                    }
+                }
+                tbody {
+                    @for app in apps {
+                        (app_row(app, now))
+                    }
+                }
+            }
+        }
+    };
+    shell_app_wide(ctx, "Apps", PageId::Apps, content)
+}
+
+/// One registered-app row: name + identifier stacked, publisher, status pill,
+/// declared resource-type chips, the live resource count, and when it first
+/// registered (absolute time in the tooltip).
+fn app_row(app: &platform::registry::AppListItem, now: chrono::DateTime<chrono::Utc>) -> Markup {
+    let registered = app.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    html! {
+        tr {
+            td class="col-app" {
+                div class="user-row-text" {
+                    span class="user-name" { (app.display_name) }
+                    span class="user-email" { (app.app_identifier) }
+                }
+            }
+            td class="col-publisher" { (app.publisher) }
+            td class="col-status" { (app_status_badge(&app.status)) }
+            td class="col-types" {
+                @if app.resource_types.is_empty() {
+                    span class="muted-dash" { "—" }
+                } @else {
+                    span class="app-types" {
+                        @for t in &app.resource_types {
+                            span class="app-type-chip" { (t) }
+                        }
+                    }
+                }
+            }
+            td class="col-count" {
+                // Link through to the per-app resource browser when there's
+                // anything to see; a bare "0" stays plain.
+                @if app.resource_count > 0 {
+                    a href=(format!("/apps/{}/resources", app.id)) { (app.resource_count) }
+                } @else {
+                    (app.resource_count)
+                }
+            }
+            td class="col-registered" title=(registered) { (relative_time(app.created_at, now)) }
+            td class="col-actions" { (app_actions_kebab(app)) }
+        }
+    }
+}
+
+/// Per-row kebab for an app: the status toggle (Enable/Disable, whichever the
+/// current status allows) plus Uninstall. Each item opens its confirmation
+/// dialog on demand (`data-open-modal`), matching the Members-row pattern; the
+/// dialogs chain into the reauth modal and the handlers re-check the role +
+/// sudo grant, so the kebab is purely a convenience surface.
+fn app_actions_kebab(app: &platform::registry::AppListItem) -> Markup {
+    let id = app.id;
+    html! {
+        details class="row-actions" {
+            summary class="row-actions-trigger" aria-label="Row actions" {
+                span aria-hidden="true" { "⋮" }
+            }
+            div class="row-actions-menu" {
+                @if app.status == "enabled" {
+                    button type="button" class="row-action-item"
+                           data-open-modal=(format!("/apps/{id}/modal/disable")) {
+                        "Disable app…"
+                    }
+                } @else {
+                    button type="button" class="row-action-item"
+                           data-open-modal=(format!("/apps/{id}/modal/enable")) {
+                        "Enable app…"
+                    }
+                }
+                button type="button" class="row-action-item row-action-danger"
+                       data-open-modal=(format!("/apps/{id}/modal/uninstall")) {
+                    "Uninstall app…"
+                }
+            }
+        }
+    }
+}
+
+/// Confirmation dialog for an app lifecycle action (`enable` / `disable` /
+/// `uninstall`). Fetched on demand into `#modal-host`; the primary button
+/// chains into the shared reauth modal (`data-reauth-confirm`). `resource_count`
+/// is only used by the uninstall copy. Returns `None` for unknown segments.
+pub(crate) fn app_action_dialog(
+    seg: &str,
+    app: &platform::registry::RegisteredAppRow,
+    resource_count: i64,
+    csrf_token: &str,
+) -> Option<Markup> {
+    let id = app.id;
+    let name = &app.display_name;
+    match seg {
+        "disable" => Some(html! {
+            dialog id=(format!("dlg-app-disable-{id}"))
+                   class="action-dialog action-dialog-centered" {
+                form id=(format!("form-app-disable-{id}"))
+                     method="post" action=(format!("/apps/{id}/disable")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-warning" { (shield_icon()) }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" { (close_icon()) }
+                    }
+                    h2 { "Disable " (name) "?" }
+                    p class="dialog-description" {
+                        strong { (name) } " will be blocked from creating or modifying "
+                        "resources until you re-enable it. Existing data is kept, and the "
+                        "app stays registered."
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="button" class="btn"
+                               data-reauth-confirm=(format!("form-app-disable-{id}")) {
+                            "Disable app"
+                        }
+                    }
+                }
+            }
+        }),
+        "enable" => Some(html! {
+            dialog id=(format!("dlg-app-enable-{id}"))
+                   class="action-dialog action-dialog-centered" {
+                form id=(format!("form-app-enable-{id}"))
+                     method="post" action=(format!("/apps/{id}/enable")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-shield" { (shield_icon()) }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" { (close_icon()) }
+                    }
+                    h2 { "Enable " (name) "?" }
+                    p class="dialog-description" {
+                        "Re-enables " strong { (name) } " to create and modify resources again."
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="button" class="btn"
+                               data-reauth-confirm=(format!("form-app-enable-{id}")) {
+                            "Enable app"
+                        }
+                    }
+                }
+            }
+        }),
+        "uninstall" => Some(html! {
+            dialog id=(format!("dlg-app-uninstall-{id}"))
+                   class="action-dialog action-dialog-centered" {
+                form id=(format!("form-app-uninstall-{id}"))
+                     method="post" action=(format!("/apps/{id}/uninstall")) {
+                    div class="dialog-header" {
+                        div class="dialog-icon dialog-icon-danger" { (trash_icon()) }
+                        button type="button" class="dialog-close" data-close-dialog
+                               aria-label="Close" { (close_icon()) }
+                    }
+                    h2 { "Uninstall " (name) "?" }
+                    p class="dialog-description" {
+                        "Permanently removes " strong { (name) } ", its registration, and "
+                        @if resource_count == 1 {
+                            "the " strong { "1 resource" } " it stores"
+                        } @else {
+                            "all " strong { (resource_count) " resources" } " it stores"
+                        }
+                        ". This can't be undone."
+                    }
+                    (csrf_input(csrf_token))
+                    div class="dialog-actions" {
+                        button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                        button type="button" class="btn-danger"
+                               data-reauth-confirm=(format!("form-app-uninstall-{id}")) {
+                            "Uninstall app"
+                        }
+                    }
+                }
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Status pill for an app: "enabled" reuses the green `.status-active` badge,
+/// anything else (e.g. "disabled") the muted `.status-deactivated` one. Label
+/// is the raw status with a leading capital.
+fn app_status_badge(status: &str) -> Markup {
+    let class = if status == "enabled" {
+        "status-badge status-active"
+    } else {
+        "status-badge status-deactivated"
+    };
+    let mut label = status.to_string();
+    if let Some(first) = label.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    html! { span class=(class) { (label) } }
+}
+
+// ── Owner Apps → resource browser (CP3) ────────────────────────────────────
+
+/// State for the per-app resource browser.
+pub struct AppResourcesView<'a> {
+    pub app: &'a platform::registry::RegisteredAppRow,
+    pub rows: &'a [platform::resources::AdminResourceRow],
+    /// Total matching the filters (may exceed the rendered page).
+    pub total: i64,
+    /// The newest-N cap applied to the listing.
+    pub cap: i64,
+    pub type_filter: &'a str,
+    pub search: &'a str,
+    pub include_deleted: bool,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+/// Owner-only per-app resource browser. Lists an app's stored resources (all
+/// owners) with type / resource-ID / include-deleted filters; rows open a
+/// metadata detail modal that offers a permanent delete. Capped at the newest
+/// `cap`; the GUID search reaches any single resource regardless of position.
+pub fn app_resources_page(ctx: &ChromeContext, v: &AppResourcesView<'_>) -> Markup {
+    let filtering = !v.search.is_empty() || !v.type_filter.is_empty() || v.include_deleted;
+    let truncated = v.total > v.rows.len() as i64;
+    let content = html! {
+        p class="muted apps-lead" {
+            "Resources stored by " strong { (v.app.display_name) } " ("
+            (v.app.app_identifier) "). Content is encrypted — the server only sees "
+            "metadata. " a href="/apps" { "← Back to Apps" }
+        }
+        (app_resources_toolbar(v))
+        @if v.rows.is_empty() {
+            div class="card" {
+                p class="muted" {
+                    @if filtering { "No resources match these filters." }
+                    @else { "This app hasn't stored any resources yet." }
+                }
+            }
+        } @else {
+            table class="users-table apps-table resources-table" {
+                thead {
+                    tr {
+                        th class="col-rtype" { "Type" }
+                        th class="col-rid" { "Resource ID" }
+                        th class="col-owner" { "Owner" }
+                        th class="col-size" { "Size" }
+                        th class="col-updated" { "Updated" }
+                        th class="col-rstatus" { "Status" }
+                    }
+                }
+                tbody {
+                    @for r in v.rows {
+                        (app_resource_row(v.app.id, r, v.now))
+                    }
+                }
+            }
+            p class="muted resources-count" {
+                "Showing " (v.rows.len()) " of " (v.total)
+                @if v.total == 1 { " resource." } @else { " resources." }
+                @if truncated {
+                    " Newest " (v.cap) " shown — narrow with the filters above to reach the rest."
+                }
+            }
+        }
+    };
+    shell_app_wide(ctx, "Resources", PageId::Apps, content)
+}
+
+/// Type / resource-ID / include-deleted filter bar. A single GET form so Enter
+/// or Apply submits all three.
+fn app_resources_toolbar(v: &AppResourcesView<'_>) -> Markup {
+    html! {
+        form method="get" action=(format!("/apps/{}/resources", v.app.id))
+             class="users-toolbar events-toolbar" {
+            input type="search" name="q" value=(v.search) class="users-search"
+                  placeholder="Resource ID (UUID)…" autocomplete="off"
+                  aria-label="Search by resource ID";
+            select name="type" class="settings-select events-type-select"
+                   aria-label="Filter by resource type" {
+                option value="" selected[v.type_filter.is_empty()] { "All types" }
+                @for t in &v.app.resource_types {
+                    option value=(t) selected[t.as_str() == v.type_filter] { (t) }
+                }
+            }
+            label class="resources-include-deleted" {
+                input type="checkbox" name="deleted" value="1" checked[v.include_deleted];
+                " Include deleted"
+            }
+            button type="submit" class="btn-secondary" { "Apply" }
+        }
+    }
+}
+
+/// One resource row — opens the detail modal on click (the shell's
+/// `data-open-modal` delegate). The `app_resource_id` (the app's own GUID) is
+/// the operator-facing identifier shown in the cell.
+fn app_resource_row(
+    app_id: uuid::Uuid,
+    r: &platform::resources::AdminResourceRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let updated_abs = r.updated_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    html! {
+        tr class="events-row"
+           data-open-modal=(format!("/apps/{app_id}/resources/{}/modal", r.id)) {
+            td class="col-rtype" { span class="app-type-chip" { (r.resource_type) } }
+            td class="col-rid" { code class="resource-id" { (r.app_resource_id) } }
+            td class="col-owner" {
+                @match &r.owner_display_name {
+                    Some(n) => (n),
+                    None => span class="muted-dash" { "—" },
+                }
+            }
+            td class="col-size" { (format_bytes(r.content_len)) }
+            td class="col-updated" title=(updated_abs) { (relative_time(r.updated_at, now)) }
+            td class="col-rstatus" {
+                @if r.deleted_at.is_some() {
+                    span class="status-badge status-deleted" { "Deleted" }
+                } @else {
+                    span class="status-badge status-active" { "Live" }
+                }
+            }
+        }
+    }
+}
+
+/// Read-only metadata detail for one resource, plus a permanent-delete action
+/// (chains into the reauth modal). The encrypted blob is never shown — only its
+/// size — because the server can't read it.
+pub(crate) fn app_resource_detail_modal(
+    app_id: uuid::Uuid,
+    r: &platform::resources::AdminResourceRow,
+    csrf_token: &str,
+) -> Markup {
+    let pair = |label: &str, value: Markup| -> Markup {
+        html! {
+            div class="event-detail-pair" {
+                span class="event-detail-label" { (label) }
+                span class="event-detail-value" { (value) }
+            }
+        }
+    };
+    let owner = r.owner_display_name.clone().unwrap_or_else(|| "—".to_string());
+    html! {
+        dialog id="dlg-resource-detail" class="action-dialog action-dialog-centered" {
+            div class="dialog-header" {
+                div class="dialog-icon dialog-icon-shield" { (apps_icon()) }
+                button type="button" class="dialog-close" data-close-dialog
+                       aria-label="Close" { (close_icon()) }
+            }
+            h2 { "Resource" }
+            div class="event-detail" {
+                (pair("Type", html! { span class="app-type-chip" { (r.resource_type) } }))
+                (pair("Resource ID", html! { code { (r.app_resource_id) } }))
+                (pair("Server ID", html! { code { (r.id) } }))
+                (pair("Owner", html! { (owner) }))
+                (pair("Parent", match r.parent_resource_id {
+                    Some(p) => html! { code { (p) } },
+                    None => html! { span class="muted-dash" { "—" } },
+                }))
+                (pair("Schema version", html! { (r.schema_version) }))
+                (pair("Content", html! {
+                    (format_bytes(r.content_len)) " · encrypted (not shown)"
+                }))
+                (pair("Signature", html! { (format_bytes(r.signature_len)) }))
+                (pair("Created", html! { (r.created_at.format("%Y-%m-%d %H:%M:%S UTC")) }))
+                (pair("Updated", html! { (r.updated_at.format("%Y-%m-%d %H:%M:%S UTC")) }))
+                @if let Some(d) = r.deleted_at {
+                    (pair("Deleted", html! { (d.format("%Y-%m-%d %H:%M:%S UTC")) }))
+                }
+            }
+            p class="dialog-description resource-delete-note" {
+                "Deleting purges this resource entirely — its owner and their "
+                "other devices won't receive a tombstone. This can't be undone."
+            }
+            // The reauth-confirm button (below) submits this form by id.
+            form id="form-resource-delete" method="post"
+                 action=(format!("/apps/{app_id}/resources/{}/delete", r.id)) {
+                (csrf_input(csrf_token))
+            }
+            div class="dialog-actions" {
+                button type="button" class="btn-secondary" data-close-dialog { "Close" }
+                button type="button" class="btn-danger"
+                       data-reauth-confirm="form-resource-delete" {
+                    "Delete permanently"
+                }
+            }
+        }
+    }
+}
+
+/// Human byte size for a resource's blob/signature length.
+fn format_bytes(n: i32) -> String {
+    let n = f64::from(n.max(0));
+    if n < 1024.0 {
+        format!("{} B", n as i64)
+    } else if n < 1024.0 * 1024.0 {
+        format!("{:.1} KB", n / 1024.0)
+    } else {
+        format!("{:.1} MB", n / (1024.0 * 1024.0))
+    }
+}
+
+// ── Owner Apps → trusted publishers (CP4) ──────────────────────────────────
+
+/// Owner-only trusted-publisher management. An inline add form (name + hex key,
+/// chained into the reauth modal) over a table of current publishers, each with
+/// a Remove action. Wide chrome to match the rest of the Apps surface.
+pub fn trusted_publishers_page(
+    ctx: &ChromeContext,
+    publishers: &[platform::registry::TrustedPublisherListItem],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let content = html! {
+        p class="muted apps-lead" {
+            "Publishers whose Ed25519 key may sign app registrations on this instance. "
+            "Removing one doesn't affect already-registered apps. "
+            a href="/apps" { "← Back to Apps" }
+        }
+        div class="card publisher-add-card" {
+            h2 { "Add a trusted publisher" }
+            form id="form-add-publisher" method="post" action="/apps/publishers" {
+                (csrf_input(ctx.csrf_token))
+                div class="field" {
+                    label for="pub-name" { "Publisher" }
+                    input type="text" name="publisher" id="pub-name" required
+                          autocomplete="off" placeholder="e.g. Ubivera, LLC";
+                }
+                div class="field" {
+                    label for="pub-key" {
+                        "Public key " span class="muted" { "(64-character hex Ed25519)" }
+                    }
+                    input type="text" name="public_key" id="pub-key" required
+                          autocomplete="off" spellcheck="false"
+                          class="publisher-key-input" placeholder="0123abcd…";
+                }
+                div class="dialog-actions" {
+                    button type="button" class="btn" data-reauth-confirm="form-add-publisher" {
+                        "Add publisher"
+                    }
+                }
+            }
+        }
+        @if publishers.is_empty() {
+            div class="card" {
+                p class="muted" {
+                    "No trusted publishers yet. Add one above before any app can register."
+                }
+            }
+        } @else {
+            table class="users-table apps-table publishers-table" {
+                thead {
+                    tr {
+                        th class="col-pub" { "Publisher" }
+                        th class="col-key" { "Public key" }
+                        th class="col-addedby" { "Added by" }
+                        th class="col-added" { "Added" }
+                        th class="col-actions" aria-label="Actions" { "" }
+                    }
+                }
+                tbody {
+                    @for p in publishers {
+                        (publisher_row(p, now))
+                    }
+                }
+            }
+        }
+    };
+    shell_app_wide(ctx, "Trusted publishers", PageId::Apps, content)
+}
+
+/// One trusted-publisher row: name, the key (short hex, full value in the
+/// tooltip), who added it + when, and a Remove kebab.
+fn publisher_row(
+    p: &platform::registry::TrustedPublisherListItem,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Markup {
+    let key_hex = hex_encode(&p.public_key);
+    let added_abs = p.added_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let remove_url = format!(
+        "/apps/publishers/remove-modal?publisher={}",
+        query_encode(&p.publisher)
+    );
+    html! {
+        tr {
+            td class="col-pub" { (p.publisher) }
+            td class="col-key" { code class="resource-id" title=(key_hex) { (key_short(&key_hex)) } }
+            td class="col-addedby" {
+                @match &p.added_by_name {
+                    Some(n) => (n),
+                    None => span class="muted-dash" { "—" },
+                }
+            }
+            td class="col-added" title=(added_abs) { (relative_time(p.added_at, now)) }
+            td class="col-actions" {
+                details class="row-actions" {
+                    summary class="row-actions-trigger" aria-label="Row actions" {
+                        span aria-hidden="true" { "⋮" }
+                    }
+                    div class="row-actions-menu" {
+                        button type="button" class="row-action-item row-action-danger"
+                               data-open-modal=(remove_url) {
+                            "Remove…"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Remove-publisher confirmation (chains into reauth). Carries the publisher
+/// name in a hidden field — the PK is the name, so the POST identifies it that
+/// way rather than via a path segment (names contain spaces/commas).
+pub(crate) fn remove_publisher_dialog(publisher: &str, csrf_token: &str) -> Markup {
+    html! {
+        dialog id="dlg-remove-publisher" class="action-dialog action-dialog-centered" {
+            form id="form-remove-publisher" method="post" action="/apps/publishers/remove" {
+                div class="dialog-header" {
+                    div class="dialog-icon dialog-icon-warning" { (shield_icon()) }
+                    button type="button" class="dialog-close" data-close-dialog
+                           aria-label="Close" { (close_icon()) }
+                }
+                h2 { "Remove " (publisher) "?" }
+                p class="dialog-description" {
+                    "Apps signed by " strong { (publisher) } " won't be able to register from "
+                    "now on. Already-registered apps keep working, and you can add the "
+                    "publisher back any time."
+                }
+                (csrf_input(csrf_token))
+                input type="hidden" name="publisher" value=(publisher);
+                div class="dialog-actions" {
+                    button type="button" class="btn-secondary" data-close-dialog { "Cancel" }
+                    button type="button" class="btn-danger"
+                           data-reauth-confirm="form-remove-publisher" {
+                        "Remove publisher"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Truncate a long hex string to `head…tail` for table display.
+fn key_short(hex: &str) -> String {
+    if hex.len() > 20 {
+        format!("{}…{}", &hex[..12], &hex[hex.len() - 6..])
+    } else {
+        hex.to_string()
+    }
+}
+
 // ── Owner Settings page ───────────────────────────────────────────────────
 
 /// Owner-only instance configuration page. Two sections: instance identity
@@ -7178,6 +7788,38 @@ pub fn toast_for_action(action: &str, target: Option<&str>) -> Option<Toast> {
             "Your password has been updated. Other devices were signed out.".to_string(),
         ),
 
+        // Apps admin (Owner) — app lifecycle. `name` is the app's display name.
+        "app_enabled" => (
+            ToastKind::Success,
+            "App enabled",
+            format!("{name} can create and modify resources again."),
+        ),
+        "app_disabled" => (
+            ToastKind::Info,
+            "App disabled",
+            format!("{name} can no longer create or modify resources. Its data is kept."),
+        ),
+        "app_uninstalled" => (
+            ToastKind::Error,
+            "App uninstalled",
+            format!("{name} and all of its stored data have been removed."),
+        ),
+        "resource_deleted" => (
+            ToastKind::Error,
+            "Resource deleted",
+            "The resource was permanently removed.".to_string(),
+        ),
+        "publisher_added" => (
+            ToastKind::Success,
+            "Publisher added",
+            format!("{name} can now sign app registrations."),
+        ),
+        "publisher_removed" => (
+            ToastKind::Info,
+            "Publisher removed",
+            format!("{name} can no longer sign new app registrations."),
+        ),
+
         _ => return None,
     };
     Some(Toast::new(kind, title, message))
@@ -7245,6 +7887,12 @@ fn error_banner_message(error: &str) -> &'static str {
         "not_pending" => {
             "That action is no longer pending. Another Owner may have just resolved it."
         }
+        // Apps admin.
+        "app_not_found" => "That app is no longer registered.",
+        "resource_not_found" => "That resource no longer exists.",
+        "publisher_name_required" => "Enter a publisher name.",
+        "invalid_publisher_key" => "Enter a 64-character hex Ed25519 public key.",
+        "publisher_not_found" => "That publisher is no longer in the list.",
         _ => "Something went wrong.",
     }
 }

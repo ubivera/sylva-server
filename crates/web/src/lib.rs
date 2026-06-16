@@ -1,4 +1,5 @@
 pub mod admin_routes;
+pub mod apps_routes;
 pub mod events_routes;
 pub mod pending_routes;
 pub mod routes;
@@ -174,6 +175,45 @@ pub fn ui_router(state: AppState) -> Router {
         .route(
             "/pending/{id}/force-apply",
             post(pending_routes::force_apply_pending),
+        )
+        // Owner-only registered-apps admin: read-only list + resource counts,
+        // plus lifecycle (enable/disable, uninstall). Role is enforced in each
+        // handler; the action dialogs chain into the shared reauth modal.
+        .route("/apps", get(apps_routes::apps_page))
+        .route(
+            "/apps/{id}/modal/{action}",
+            get(apps_routes::app_action_modal),
+        )
+        .route("/apps/{id}/enable", post(apps_routes::enable_app))
+        .route("/apps/{id}/disable", post(apps_routes::disable_app))
+        .route("/apps/{id}/uninstall", post(apps_routes::uninstall_app))
+        // Per-app resource browser: list/filter, a metadata detail modal, and a
+        // permanent delete-by-id. Owner-only (enforced in each handler).
+        .route(
+            "/apps/{id}/resources",
+            get(apps_routes::app_resources_page),
+        )
+        .route(
+            "/apps/{id}/resources/{rid}/modal",
+            get(apps_routes::app_resource_modal),
+        )
+        .route(
+            "/apps/{id}/resources/{rid}/delete",
+            post(apps_routes::delete_resource),
+        )
+        // Trusted-publisher management (the Ed25519 allow-list that gates app
+        // registration). Owner-only; add/remove are CSRF + reauth gated.
+        .route(
+            "/apps/publishers",
+            get(apps_routes::publishers_page).post(apps_routes::add_publisher),
+        )
+        .route(
+            "/apps/publishers/remove-modal",
+            get(apps_routes::remove_publisher_modal),
+        )
+        .route(
+            "/apps/publishers/remove",
+            post(apps_routes::remove_publisher),
         )
         // Owner-only instance settings (page + identity / notifications saves +
         // a test-send). Role is enforced in each handler.

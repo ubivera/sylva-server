@@ -40,6 +40,7 @@ auth = { path = "../auth" }
 authz = { path = "../authz" }
 notifications = { path = "../notifications" }
 pending = { path = "../pending" }
+platform = { path = "../platform" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
@@ -48,6 +49,10 @@ windows-sys = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 web = { path = "../web" }
 arc-swap = { workspace = true }
+proto = { path = "../proto" }
+platform = { path = "../platform" }
+tonic = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [[test]]
 name = "integration"

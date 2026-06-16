@@ -12,6 +12,8 @@ mod common;
 mod account;
 #[path = "integration/admin.rs"]
 mod admin;
+#[path = "integration/apps.rs"]
+mod apps;
 #[path = "integration/audit_chain.rs"]
 mod audit_chain;
 #[path = "integration/auth.rs"]
@@ -22,6 +24,8 @@ mod events;
 mod notifications;
 #[path = "integration/pending_transitions.rs"]
 mod pending_transitions;
+#[path = "integration/platform_grpc.rs"]
+mod platform_grpc;
 #[path = "integration/recovery.rs"]
 mod recovery;
 #[path = "integration/settings.rs"]
