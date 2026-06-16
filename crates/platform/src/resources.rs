@@ -32,6 +32,36 @@ pub struct ResourceRow {
     pub schema_version: i32,
 }
 
+/// A resource as seen by the **Owner admin** browser — cross-owner (not
+/// owner-scoped) and joined to the owner's display name. Carries only the
+/// `content_blob`/`content_signature` byte lengths, never the bytes (the server
+/// can't read them and the listing shouldn't haul them around).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AdminResourceRow {
+    pub id: Uuid,
+    pub resource_type: String,
+    pub app_resource_id: Uuid,
+    pub parent_resource_id: Option<Uuid>,
+    pub owner_user_id: Uuid,
+    pub owner_display_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub content_len: i32,
+    pub signature_len: i32,
+    pub schema_version: i32,
+}
+
+/// Key fields of a hard-deleted resource, for the audit event.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DeletedResource {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub resource_type: String,
+    pub app_resource_id: Uuid,
+    pub owner_user_id: Uuid,
+}
+
 /// Fields for creating a resource. `owner_user_id` is the authenticated caller;
 /// `last_modified_by` is set equal to it on create (owner-scoped).
 pub struct NewResource {
@@ -182,4 +212,107 @@ impl ResourceRepository {
 
         Ok((rows, total))
     }
+}
+
+// ── Owner admin (cross-owner) queries ──────────────────────────────────────
+//
+// These power the Owner admin resource browser. Unlike the owner-scoped repo
+// methods above, they span *all* owners for an app — the operator is doing data
+// governance, not acting as a resource owner.
+
+/// Columns for the admin views: metadata + the owner's display name (joined) +
+/// the blob/signature byte lengths (never the bytes themselves).
+const ADMIN_COLS: &str = "r.id, r.resource_type, r.app_resource_id, r.parent_resource_id, \
+     r.owner_user_id, u.display_name AS owner_display_name, r.created_at, r.updated_at, \
+     r.deleted_at, octet_length(r.content_blob) AS content_len, \
+     octet_length(r.content_signature) AS signature_len, r.schema_version";
+
+/// List an app's resources (all owners), newest first, capped at `limit`.
+/// `resource_type` and `guid` (matching either the server id or the app's own
+/// `app_resource_id`) are optional exact filters; tombstones are hidden unless
+/// `include_deleted`. Returns the page plus the total matching count.
+pub async fn admin_list(
+    pool: &PgPool,
+    app_id: Uuid,
+    resource_type: Option<&str>,
+    guid: Option<Uuid>,
+    include_deleted: bool,
+    limit: i64,
+) -> Result<(Vec<AdminResourceRow>, i64), sqlx::Error> {
+    let list_sql = format!(
+        "SELECT {ADMIN_COLS}
+         FROM platform.resources r
+         LEFT JOIN identity.users u ON u.id = r.owner_user_id
+         WHERE r.app_id = $1
+           AND ($2 OR r.deleted_at IS NULL)
+           AND ($3::text IS NULL OR r.resource_type = $3)
+           AND ($4::uuid IS NULL OR r.id = $4 OR r.app_resource_id = $4)
+         ORDER BY r.updated_at DESC
+         LIMIT $5"
+    );
+    let rows = sqlx::query_as::<_, AdminResourceRow>(&list_sql)
+        .bind(app_id)
+        .bind(include_deleted)
+        .bind(resource_type)
+        .bind(guid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM platform.resources r
+         WHERE r.app_id = $1
+           AND ($2 OR r.deleted_at IS NULL)
+           AND ($3::text IS NULL OR r.resource_type = $3)
+           AND ($4::uuid IS NULL OR r.id = $4 OR r.app_resource_id = $4)",
+    )
+    .bind(app_id)
+    .bind(include_deleted)
+    .bind(resource_type)
+    .bind(guid)
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total))
+}
+
+/// Fetch one resource for the admin detail view, scoped to `app_id` (so a
+/// resource id under the wrong app's URL is not found).
+pub async fn admin_get(
+    pool: &PgPool,
+    app_id: Uuid,
+    id: Uuid,
+) -> Result<Option<AdminResourceRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {ADMIN_COLS}
+         FROM platform.resources r
+         LEFT JOIN identity.users u ON u.id = r.owner_user_id
+         WHERE r.id = $1 AND r.app_id = $2"
+    );
+    sqlx::query_as::<_, AdminResourceRow>(&sql)
+        .bind(id)
+        .bind(app_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Permanently delete one resource (app-scoped). This is a **hard** delete —
+/// the row is removed, not tombstoned (the operator is purging data, distinct
+/// from an app's own soft delete). Executor-generic so the caller runs it in a
+/// transaction with the audit event. Returns the deleted row's key fields, or
+/// `None` if no such resource exists under that app.
+pub async fn admin_hard_delete<'e, E>(
+    db: E,
+    app_id: Uuid,
+    id: Uuid,
+) -> Result<Option<DeletedResource>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, DeletedResource>(
+        "DELETE FROM platform.resources WHERE id = $1 AND app_id = $2
+         RETURNING id, app_id, resource_type, app_resource_id, owner_user_id",
+    )
+    .bind(id)
+    .bind(app_id)
+    .fetch_optional(db)
+    .await
 }

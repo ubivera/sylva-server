@@ -44,6 +44,15 @@ pub struct TrustedPublisherRow {
     pub public_key: Vec<u8>,
 }
 
+/// A trusted publisher as shown in the Owner admin list — joined to who added it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TrustedPublisherListItem {
+    pub publisher: String,
+    pub public_key: Vec<u8>,
+    pub added_by_name: Option<String>,
+    pub added_at: DateTime<Utc>,
+}
+
 /// A registered app plus a live count of the (non-deleted) resources it stores.
 /// Powers the Owner admin Apps page; omits `app_public_key` (not displayed).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -134,6 +143,38 @@ where
     .await
 }
 
+/// List trusted publishers (with who added each), ordered by name. For the
+/// Owner admin publishers page.
+pub async fn list_trusted_publishers<'e, E>(
+    db: E,
+) -> Result<Vec<TrustedPublisherListItem>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, TrustedPublisherListItem>(
+        "SELECT p.publisher, p.public_key, u.display_name AS added_by_name, p.added_at
+         FROM platform.trusted_publishers p
+         LEFT JOIN identity.users u ON u.id = p.added_by
+         ORDER BY p.publisher",
+    )
+    .fetch_all(db)
+    .await
+}
+
+/// Remove a trusted publisher. Returns whether a row was deleted. Existing
+/// `registered_apps` rows are unaffected (their `publisher` is a plain column,
+/// not an FK) — removal only blocks *future* registrations citing this name.
+pub async fn remove_trusted_publisher<'e, E>(db: E, publisher: &str) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let result = sqlx::query("DELETE FROM platform.trusted_publishers WHERE publisher = $1")
+        .bind(publisher)
+        .execute(db)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Add (or replace) a trusted publisher's key.
 pub async fn add_trusted_publisher<'e, E>(
     db: E,
@@ -202,6 +243,55 @@ where
     )
     .fetch_all(db)
     .await
+}
+
+/// Set an app's `status` (e.g. `"enabled"` / `"disabled"`), bumping
+/// `updated_at`. Returns the updated row, or `None` if no app has that id.
+pub async fn set_app_status<'e, E>(
+    db: E,
+    id: Uuid,
+    status: &str,
+) -> Result<Option<RegisteredAppRow>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let sql = format!(
+        "UPDATE platform.registered_apps SET status = $2, updated_at = now()
+         WHERE id = $1 RETURNING {APP_COLS}"
+    );
+    sqlx::query_as::<_, RegisteredAppRow>(&sql)
+        .bind(id)
+        .bind(status)
+        .fetch_optional(db)
+        .await
+}
+
+/// Delete an app registration; its resources cascade-delete via the
+/// `resources.app_id` FK. Returns the deleted row (for audit / UX), or `None`
+/// if no app had that id.
+pub async fn delete_app<'e, E>(db: E, id: Uuid) -> Result<Option<RegisteredAppRow>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let sql = format!("DELETE FROM platform.registered_apps WHERE id = $1 RETURNING {APP_COLS}");
+    sqlx::query_as::<_, RegisteredAppRow>(&sql)
+        .bind(id)
+        .fetch_optional(db)
+        .await
+}
+
+/// Count an app's non-deleted resources (for the uninstall confirmation).
+pub async fn count_app_resources<'e, E>(db: E, app_id: Uuid) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM platform.resources WHERE app_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(app_id)
+    .fetch_one(db)
+    .await?;
+    Ok(n)
 }
 
 /// Insert or update an app registration (keyed on `app_identifier`). A

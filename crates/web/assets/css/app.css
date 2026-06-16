@@ -1931,6 +1931,47 @@ p.muted {
     font-size: 0.74rem;
 }
 
+/* Per-app resource browser (CP3). Rows are clickable (open the detail modal). */
+.resources-table .col-rtype { width: 8rem; }
+.resources-table .col-owner { width: 12rem; }
+.resources-table .col-size { width: 6rem; color: var(--color-text-muted); }
+.resources-table .col-updated {
+    width: 9rem;
+    white-space: nowrap;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+}
+.resources-table .col-rstatus { width: 6rem; }
+.resources-table .resource-id,
+.event-detail-value code {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--color-text-muted);
+    word-break: break-all;
+}
+.resources-include-deleted {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+.resources-count { margin-top: var(--space-md); }
+.resource-delete-note { margin-top: var(--space-md); }
+
+/* Trusted-publishers admin (CP4). */
+.publisher-add-card { max-width: 40rem; margin-bottom: var(--space-lg); }
+.publisher-key-input { font-family: var(--font-mono); }
+.publishers-table .col-pub { width: 16rem; }
+.publishers-table .col-addedby { width: 12rem; }
+.publishers-table .col-added {
+    width: 9rem;
+    white-space: nowrap;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+}
+
 .users-table .col-date {
     text-align: right;
     white-space: nowrap;
