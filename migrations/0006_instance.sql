@@ -25,6 +25,14 @@ CREATE TABLE hearth_meta.instance (
     smtp_password_enc   BYTEA NULL,
     smtp_from_email     TEXT NULL,
     smtp_from_name      TEXT NULL,
+    -- Server identity keypair (Ed25519) — the native-client trust anchor that
+    -- Sylva Hub TOFU-pins (see docs/design/hub.md). Generated at first-run
+    -- (Phase 2); the private key is sealed with the instance `secret_key`
+    -- (XChaCha20-Poly1305), like `smtp_password_enc`. NULL until generated. It
+    -- lives on this scorch-surviving singleton so the server keeps its identity
+    -- across a close/reopen.
+    server_identity_public   BYTEA NULL,
+    server_identity_priv_enc BYTEA NULL,
     CONSTRAINT instance_singleton CHECK (id)
 );
 
