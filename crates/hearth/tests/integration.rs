@@ -10,14 +10,20 @@ mod common;
 
 #[path = "integration/account.rs"]
 mod account;
+#[path = "integration/account_grpc.rs"]
+mod account_grpc;
 #[path = "integration/admin.rs"]
 mod admin;
 #[path = "integration/apps.rs"]
 mod apps;
 #[path = "integration/audit_chain.rs"]
 mod audit_chain;
+#[path = "integration/discovery.rs"]
+mod discovery;
 #[path = "integration/auth.rs"]
 mod auth;
+#[path = "integration/enrollment.rs"]
+mod enrollment;
 #[path = "integration/events.rs"]
 mod events;
 #[path = "integration/notifications.rs"]

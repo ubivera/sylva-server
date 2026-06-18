@@ -31,6 +31,7 @@ hmac = { workspace = true }
 subtle = { workspace = true }
 arc-swap = { workspace = true }
 rand = { workspace = true }
+ed25519-dalek = { workspace = true }
 webauthn-rs = { workspace = true }
 url = { workspace = true }
 
@@ -52,7 +53,6 @@ arc-swap = { workspace = true }
 proto = { path = "../proto" }
 platform = { path = "../platform" }
 tonic = { workspace = true }
-ed25519-dalek = { workspace = true }
 
 [[test]]
 name = "integration"

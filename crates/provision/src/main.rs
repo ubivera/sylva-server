@@ -1,22 +1,21 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::print_stdout)]
 
+//! `provision` — one-time instance **infrastructure** init.
+//!
+//! Since the Sylva Hub pivot the first **Owner** is created by the Hub
+//! (`Account.Bootstrap`), which carries the client-generated end-to-end crypto
+//! the server only ever stores as ciphertext. `provision` no longer creates a
+//! user; it initializes the infra that should exist before the first sign-in:
+//! migrations, the server identity keypair, and the break-glass server recovery
+//! code.
+
 use std::fs;
-use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
-use audit::Actor;
-use hearth::{config::Config, db, postgres::PostgresProcess};
-use identity::UserId;
-use uuid::Uuid;
-
-struct Args {
-    email: String,
-    display_name: String,
-    password: String,
-}
+use hearth::{config::Config, db, instance, postgres::PostgresProcess};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -32,9 +31,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let args = parse_args()?;
-    let config = Config::from_env()?;
+    if std::env::args().skip(1).any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
 
+    let config = Config::from_env()?;
     eprintln!("provision: workspace data dir = {}", config.data_dir.display());
 
     refuse_if_postgres_running(&config)?;
@@ -47,7 +49,7 @@ async fn run() -> Result<()> {
     .await
     .context("starting bundled postgres")?;
 
-    let result = provision_owner(&config, &args).await;
+    let result = init_infrastructure(&config).await;
 
     if let Err(err) = postgres.stop().await {
         tracing::warn!(?err, "error stopping postgres");
@@ -56,111 +58,72 @@ async fn run() -> Result<()> {
     result?;
 
     eprintln!();
-    eprintln!("Provisioned Owner: {} ({})", args.email, args.display_name);
-    eprintln!("Run `cargo run --bin hearth` to start the server.");
+    eprintln!("Infrastructure initialized (migrations + server identity + recovery code).");
+    eprintln!("Create the first Owner from Sylva Hub — it calls Account.Bootstrap with");
+    eprintln!("client-generated keys. Then run `cargo run --bin hearth` to start the server.");
     Ok(())
 }
 
-async fn provision_owner(config: &Config, args: &Args) -> Result<()> {
+/// Infra-only bootstrap: migrations, the server identity keypair, and the
+/// break-glass server recovery code. No Owner is created here.
+async fn init_infrastructure(config: &Config) -> Result<()> {
     let pool = db::connect(&config.postgres_url).await?;
     db::run_migrations(&pool).await?;
     tracing::info!("migrations up to date");
 
-    let (existing,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM identity.users")
+    // The recovery code is what `provision` uniquely creates, so its presence
+    // is our "already initialized" guard — re-running is refused.
+    let (codes,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM auth.recovery_codes")
         .fetch_one(&pool)
         .await
-        .context("counting existing users")?;
-    if existing > 0 {
+        .context("counting existing recovery codes")?;
+    if codes > 0 {
         pool.close().await;
         bail!(
-            "identity.users already has {existing} row(s).\n\
-             provision is for the first Owner only - use the eventual web admin to create more users.\n\
-             To start over, run `cargo run --bin clean`."
+            "instance infrastructure is already initialized ({codes} recovery code(s) present).\n\
+             Rotate the server recovery code via POST /admin/server/recovery-code/rotate,\n\
+             or run `cargo run --bin clean` to start over."
         );
     }
 
-    let password_hash =
-        auth::hash_password(&args.password).map_err(|err| anyhow::anyhow!("hashing password: {err}"))?;
+    // Server identity keypair (idempotent — serve() would otherwise generate it
+    // on first start). Sealed with the instance secret key.
+    let secret_key = config.load_secret_key()?;
+    instance::ensure_server_identity(&pool, &secret_key)
+        .await
+        .context("generating server identity key")?;
+    tracing::info!("server identity key ready");
 
-    let mut tx = pool.begin().await?;
-
-    let user_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO identity.users (email, display_name, lifecycle, instance_role) \
-         VALUES ($1, $2, 'active', 'owner') \
-         RETURNING id",
-    )
-    .bind(&args.email)
-    .bind(&args.display_name)
-    .fetch_one(&mut *tx)
-    .await
-    .context("inserting user")?;
-
-    sqlx::query(
-        "INSERT INTO auth.credentials (user_id, password_hash) \
-         VALUES ($1, $2)",
-    )
-    .bind(user_id)
-    .bind(&password_hash)
-    .execute(&mut *tx)
-    .await
-    .context("inserting credentials")?;
-
-    let actor = Actor {
-        user_id: UserId::new(user_id),
-        display_name: args.display_name.clone(),
-    };
-    audit::append(
-        &mut tx,
-        Some(&actor),
-        None,
-        "owner_provisioned",
-        serde_json::json!({
-            "email": args.email,
-            "display_name": args.display_name,
-        }),
-    )
-    .await
-    .context("emitting owner_provisioned audit event")?;
-
-    // Generate the initial server recovery code. Owner saves this offline;
-    // it's the bypass credential for the Owner-on-Owner veto window. See
-    // docs/dev/hearth-owner-protection.md.
+    // Break-glass server recovery code — the Owner-on-Owner veto bypass. Minted
+    // as a system event (no owner exists yet); the first Owner inherits it and
+    // can rotate it later. See docs/dev/hearth-owner-protection.md.
     let recovery_code = auth::recovery_code::generate_code();
-    let code_id = auth::recovery_code::bootstrap(
-        &mut tx,
-        &recovery_code,
-        Some(UserId::new(user_id)),
-    )
-    .await
-    .context("bootstrapping recovery code")?;
+    let mut tx = pool.begin().await?;
+    let code_id = auth::recovery_code::bootstrap(&mut tx, &recovery_code, None)
+        .await
+        .context("bootstrapping recovery code")?;
     audit::append(
         &mut tx,
-        Some(&actor),
+        None,
         None,
         "recovery_code_generated",
-        serde_json::json!({
-            "code_id": code_id,
-            "by_user_id": user_id,
-        }),
+        serde_json::json!({ "code_id": code_id, "by": "provision" }),
     )
     .await
     .context("emitting recovery_code_generated audit event")?;
-
     tx.commit().await.context("committing transaction")?;
     pool.close().await;
 
-    tracing::info!(%user_id, email = %args.email, "provisioned owner");
     eprintln!();
     eprintln!("====================================================================");
     eprintln!("  SERVER RECOVERY CODE  (SAVE THIS NOW — IT WILL NOT BE SHOWN AGAIN)");
     eprintln!("====================================================================");
     eprintln!("  {recovery_code}");
     eprintln!("====================================================================");
-    eprintln!("  This code bypasses the Owner-on-Owner veto window for emergency");
-    eprintln!("  cleanup. Store it offline (password manager / paper safe). You can");
-    eprintln!("  rotate it later via POST /admin/server/recovery-code/rotate.");
+    eprintln!("  Break-glass credential: bypasses the Owner-on-Owner veto window for");
+    eprintln!("  emergency cleanup. Store it offline (password manager / paper safe).");
+    eprintln!("  Rotate later via POST /admin/server/recovery-code/rotate.");
     eprintln!("====================================================================");
-    eprintln!();
     Ok(())
 }
 
@@ -211,71 +174,15 @@ fn pid_is_running(pid: u32) -> bool {
     }
 }
 
-fn parse_args() -> Result<Args> {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        std::process::exit(0);
-    }
-
-    let mut email: Option<String> = None;
-    let mut display_name: Option<String> = None;
-    let mut password: Option<String> = None;
-
-    let mut it = raw.into_iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--email" => email = it.next(),
-            "--display-name" => display_name = it.next(),
-            "--password" => password = it.next(),
-            other => bail!("unknown argument: {other}\nRun with --help for usage."),
-        }
-    }
-
-    let email = email.ok_or_else(|| anyhow::anyhow!("--email is required"))?;
-    let display_name =
-        display_name.ok_or_else(|| anyhow::anyhow!("--display-name is required"))?;
-
-    let password = match password {
-        Some(p) => p,
-        None => match std::env::var("HEARTH_PROVISION_PASSWORD") {
-            Ok(p) => p,
-            Err(_) => read_password_from_stdin()?,
-        },
-    };
-
-    if password.is_empty() {
-        bail!("password is empty");
-    }
-
-    Ok(Args {
-        email,
-        display_name,
-        password,
-    })
-}
-
-fn read_password_from_stdin() -> Result<String> {
-    eprint!("Password: ");
-    io::stderr().flush()?;
-    let mut buf = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut buf)
-        .context("reading password from stdin")?;
-    Ok(buf.trim_end_matches(['\n', '\r']).to_string())
-}
-
 fn print_help() {
-    eprintln!("Usage: provision --email <email> --display-name <name> [--password <pw>]");
+    eprintln!("Usage: provision");
     eprintln!();
-    eprintln!("Creates the first Owner user. Refuses if any user already exists.");
-    eprintln!("Stop hearth first (Ctrl+C) before running provision.");
+    eprintln!("Initializes instance infrastructure: runs migrations, generates the server");
+    eprintln!("identity keypair, and mints the break-glass server recovery code. Refuses if");
+    eprintln!("a recovery code already exists (instance already initialized).");
     eprintln!();
-    eprintln!("Password source priority:");
-    eprintln!("  1. --password argument (warning: appears in shell history)");
-    eprintln!("  2. HEARTH_PROVISION_PASSWORD env var");
-    eprintln!("  3. stdin (echoes on interactive terminals - pipe or use env var to avoid)");
+    eprintln!("The first Owner is NOT created here — create it from Sylva Hub, which calls");
+    eprintln!("Account.Bootstrap. Stop hearth first (Ctrl+C) before running provision.");
 }
 
 fn init_tracing() {

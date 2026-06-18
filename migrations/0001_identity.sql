@@ -51,3 +51,61 @@ CREATE TABLE identity.invitations (
 CREATE UNIQUE INDEX invitations_token_hash_uniq ON identity.invitations (token_hash);
 CREATE INDEX invitations_email_lower_idx        ON identity.invitations (email_lower);
 CREATE INDEX invitations_invited_by_idx         ON identity.invitations (invited_by_user_id);
+
+-- ── Sylva Hub: device-enrollment / E2E key material (see docs/design/hub.md) ──
+-- These tables are populated by the Hub's account creation + enrollment flows
+-- (Phase 2+). A user with no `user_keys` row simply has no E2E key material yet;
+-- nothing here is wired into the existing account-creation paths.
+
+-- Per-user cryptographic material. 1:1 with users; a row exists only once the
+-- user's keys have been provisioned (client-side) by `Account.Bootstrap` / invite.
+-- The server stores public keys + ciphertext only — never plaintext keys.
+CREATE TABLE identity.user_keys (
+    user_id                 UUID PRIMARY KEY REFERENCES identity.users(id) ON DELETE CASCADE,
+    x25519_public           BYTEA NOT NULL,   -- receives wrapped content keys
+    ed25519_public          BYTEA NOT NULL,   -- signature verification
+    x25519_private_wrapped  BYTEA NOT NULL,   -- private key wrapped by the master key
+    ed25519_private_wrapped BYTEA NOT NULL,   -- private key wrapped by the master key
+    -- The ONLY server-side copy of the master key, wrapped by KEK =
+    -- Argon2id(password, secret_key) — the 1Password-style two-secret derivation.
+    -- Both the password and the Secret Key are always required to unwrap it.
+    master_key_wrapped      BYTEA NOT NULL,
+    kdf_salt                BYTEA NOT NULL,
+    -- Argon2id m/t/p for client re-derivation. Opaque to the server (TEXT, not
+    -- JSONB) — the server never interprets it, just stores + returns it.
+    kdf_params              TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The machine plane (thin in slice 1; full management plane is slice 2). One
+-- machine hosts many per-OS-user enrollments.
+CREATE TABLE identity.machines (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    label              TEXT NOT NULL,
+    platform           TEXT NOT NULL,                                   -- ios|android|windows|macos
+    claimed_by_user_id UUID NULL REFERENCES identity.users(id) ON DELETE SET NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at       TIMESTAMPTZ NULL
+);
+
+-- A user-scoped device enrollment: the user's keys bound to a device (and OS
+-- user). The master key lives in that OS user's keychain; only the public key is
+-- stored here. `master_key_wrapped` (to this device's key) is the slice-2
+-- propagation copy; in slice 1 the key arrives via bootstrap / re-unwrap.
+CREATE TABLE identity.devices (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id            UUID NOT NULL REFERENCES identity.users(id) ON DELETE CASCADE,
+    machine_id         UUID NULL REFERENCES identity.machines(id) ON DELETE SET NULL,
+    device_label       TEXT NOT NULL,
+    platform           TEXT NOT NULL,
+    device_public_key  BYTEA NOT NULL,                                  -- X25519 device pubkey
+    master_key_wrapped BYTEA NULL,                                      -- wrapped to device_public_key (slice 2)
+    push_token_enc     BYTEA NULL,                                      -- sealed; slice 2+
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at       TIMESTAMPTZ NULL,
+    revoked_at         TIMESTAMPTZ NULL
+);
+
+CREATE INDEX devices_by_user    ON identity.devices (user_id);
+CREATE INDEX devices_by_machine ON identity.devices (machine_id);

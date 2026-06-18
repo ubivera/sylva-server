@@ -60,6 +60,11 @@ pub struct AppState {
     /// flipped when a close empties the instance, so the closed-page
     /// middleware never hits the DB on the hot path. See [`crate::instance`].
     pub instance_closed: Arc<AtomicBool>,
+    /// The server's Ed25519 identity keypair — the trust anchor native clients
+    /// (Sylva Hub) TOFU-pin. Loaded/generated at startup; used to sign the
+    /// public discovery response. See [`crate::instance::ServerIdentity`] +
+    /// [`crate::discovery`].
+    pub server_identity: Arc<crate::instance::ServerIdentity>,
 }
 
 /// Build the JSON API router with state already applied. Returned with

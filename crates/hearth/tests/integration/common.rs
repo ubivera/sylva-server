@@ -263,6 +263,13 @@ impl TestApp {
         let notifier = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             notifications::NotifierImpl::Log,
         ));
+        // Generate this test instance's server identity (same path production
+        // uses), so the discovery endpoint signs with a real key.
+        let server_identity = std::sync::Arc::new(
+            hearth::instance::ensure_server_identity(&pool, &secret_key)
+                .await
+                .expect("generating test server identity"),
+        );
         let app_state = app::AppState {
             started_at: Instant::now(),
             db: pool.clone(),
@@ -294,6 +301,7 @@ impl TestApp {
             // Fresh per-test DB is never closed at construction; the close
             // handler flips this when a test empties the instance.
             instance_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            server_identity,
         };
         let health = axum::Router::new()
             .route(
@@ -301,10 +309,12 @@ impl TestApp {
                 axum::routing::get(hearth::health::handler),
             )
             .with_state(app_state.clone());
+        let discovery = hearth::discovery::router(app_state.clone());
         let router = Router::new()
             .nest("/api", app::api_router(app_state.clone()))
             .merge(web::ui_router(app_state))
-            .merge(health);
+            .merge(health)
+            .merge(discovery);
 
         let worker = notifications::Worker::new(pool.clone(), notifier.clone());
 
