@@ -23,18 +23,22 @@ use proto::platform::v1::{
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
+pub mod account;
 pub mod registry;
 pub mod resources;
 
-/// Shared context for the gRPC services. Each repository wraps the `PgPool`, so
-/// cloning is cheap. `secret_key` is unused by CP1's `WhoAmI` but threaded now
-/// for CP3 (app-key verification at registration).
+/// Shared context for the gRPC services (Platform, Resources, Account). Each
+/// repository wraps the `PgPool`, so cloning is cheap. `secret_key` is threaded
+/// for app-key verification at registration; `user_keys`/`devices` back the
+/// Account service's enrollment flow.
 #[derive(Clone)]
 pub struct PlatformContext {
     pub sessions: auth::SessionRepository,
     pub users: identity::UserRepository,
     pub resources: resources::ResourceRepository,
-    /// Pool for registry queries + audit transactions (app registration).
+    pub user_keys: identity::UserKeyRepository,
+    pub devices: identity::DeviceRepository,
+    /// Pool for registry queries + audit transactions (app registration, enrollment).
     pub pool: sqlx::PgPool,
     pub secret_key: Arc<[u8; 32]>,
 }
@@ -481,7 +485,8 @@ pub async fn serve_grpc(
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
         .add_service(platform_server(ctx.clone()))
-        .add_service(resources_server(ctx))
+        .add_service(resources_server(ctx.clone()))
+        .add_service(account::account_server(ctx))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
 }

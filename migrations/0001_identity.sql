@@ -71,7 +71,9 @@ CREATE TABLE identity.user_keys (
     -- Both the password and the Secret Key are always required to unwrap it.
     master_key_wrapped      BYTEA NOT NULL,
     kdf_salt                BYTEA NOT NULL,
-    kdf_params              JSONB NOT NULL,    -- Argon2id m/t/p for client re-derivation
+    -- Argon2id m/t/p for client re-derivation. Opaque to the server (TEXT, not
+    -- JSONB) — the server never interprets it, just stores + returns it.
+    kdf_params              TEXT NOT NULL,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );

@@ -14,6 +14,12 @@ pub enum IdentityError {
 
 pub type Result<T> = std::result::Result<T, IdentityError>;
 
+pub mod enrollment;
+pub use enrollment::{
+    Device, DeviceId, DeviceRepository, Machine, MachineId, MachineRepository, NewDevice,
+    UserKeyMaterial, UserKeyRepository,
+};
+
 /// Strongly-typed user identifier. Distinct nominal type prevents accidental
 /// mixing with the other UUID-keyed entities the design introduces later
 /// (DeviceId, ResourceId, GroupId).
@@ -121,6 +127,32 @@ pub struct UserRepository {
 impl UserRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Insert a new user row within the caller's transaction — the
+    /// registration / bootstrap flow (`Account.Bootstrap`, and later native
+    /// invite acceptance). Credentials (`auth`) and key material
+    /// (`identity.user_keys`) are written separately in the same transaction.
+    pub async fn create(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        email: &str,
+        display_name: &str,
+        instance_role: InstanceRole,
+        lifecycle: UserLifecycle,
+    ) -> Result<User> {
+        let user: User = sqlx::query_as(
+            "INSERT INTO identity.users (email, display_name, instance_role, lifecycle)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, email, display_name, lifecycle, instance_role, kind,
+                       locale, created_at, updated_at",
+        )
+        .bind(email)
+        .bind(display_name)
+        .bind(instance_role)
+        .bind(lifecycle)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(user)
     }
 
     pub async fn count(&self) -> Result<i64> {

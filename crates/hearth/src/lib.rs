@@ -156,6 +156,8 @@ async fn serve(
         sessions: sessions.clone(),
         users: users.clone(),
         resources: platform::resources::ResourceRepository::new(pool.clone()),
+        user_keys: identity::UserKeyRepository::new(pool.clone()),
+        devices: identity::DeviceRepository::new(pool.clone()),
         pool: pool.clone(),
         secret_key: secret_key.clone(),
     };

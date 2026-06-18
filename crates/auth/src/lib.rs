@@ -230,6 +230,39 @@ pub async fn delete_credentials(
     Ok(())
 }
 
+/// Insert a user's password verifier within the caller's transaction — the
+/// account-creation / bootstrap flow. One row per user (a duplicate surfaces
+/// as a `23505` unique violation for the caller to map).
+pub async fn create_credentials(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+    phc: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO auth.credentials (user_id, password_hash) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(phc)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// True when the user has at least one active second factor — a *verified*
+/// TOTP authenticator or any registered passkey. Used to gate post-password
+/// MFA. Mirrors `hearth::mfa::has_second_factor`, exposed here so the gRPC
+/// `Account` service — which can't depend on `hearth` — can check it.
+pub async fn has_second_factor(pool: &PgPool, user_id: UserId) -> Result<bool> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM auth.totp_credentials
+                  WHERE user_id = $1 AND verified_at IS NOT NULL)
+              + (SELECT COUNT(*) FROM auth.webauthn_credentials
+                  WHERE user_id = $1)",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
 /// Session lifetime: a flat 24-hour session. The design spec eventually
 /// wants a 15-minute access token + 90-day sliding refresh token.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::hours(24);
