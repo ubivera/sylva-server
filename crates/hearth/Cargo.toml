@@ -12,6 +12,12 @@ description = "Sylva Hearth API library (state, extractors, handlers for /api/*)
 name = "hearth"
 path = "src/lib.rs"
 
+[features]
+# Opt-in cross-stack end-to-end test (drives the real sylva-sdk client against a
+# live in-process server). Off by default, so the standard suite stays fully
+# decoupled from the SDK's build. Run: cargo test -p hearth --features e2e
+e2e = ["dep:sylva-sdk"]
+
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -42,6 +48,11 @@ authz = { path = "../authz" }
 notifications = { path = "../notifications" }
 pending = { path = "../pending" }
 platform = { path = "../platform" }
+
+# Optional, `e2e`-feature only: the real SDK client, to drive the cross-stack
+# end-to-end test (tests/integration/sdk_e2e.rs). A sibling path dep — present in
+# the standard workspace layout; the standard suite never pulls it.
+sylva-sdk = { path = "../../../sylva-sdk", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
