@@ -53,9 +53,23 @@ fn bootstrap_request() -> BootstrapRequest {
     }
 }
 
-/// Spin up the gRPC server on `127.0.0.1:0` against the test pool; returns the
-/// bound address + a shutdown sender.
+/// Spin up the gRPC server on `127.0.0.1:0` against the test pool with a
+/// generous (default) auth limiter; returns the bound address + a shutdown
+/// sender.
 async fn spawn_grpc(app: &TestApp) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
+    spawn_grpc_with_limiter(
+        app,
+        std::sync::Arc::new(auth::ratelimit::RateLimiter::auth_default()),
+    )
+    .await
+}
+
+/// As [`spawn_grpc`], but with a caller-supplied auth limiter so a test can use
+/// a tiny burst to exercise throttling deterministically.
+async fn spawn_grpc_with_limiter(
+    app: &TestApp,
+    auth_rate_limiter: std::sync::Arc<auth::ratelimit::RateLimiter>,
+) -> (std::net::SocketAddr, tokio::sync::watch::Sender<bool>) {
     let ctx = platform::PlatformContext {
         sessions: auth::SessionRepository::new(app.pool.clone()),
         users: identity::UserRepository::new(app.pool.clone()),
@@ -64,6 +78,8 @@ async fn spawn_grpc(app: &TestApp) -> (std::net::SocketAddr, tokio::sync::watch:
         devices: identity::DeviceRepository::new(app.pool.clone()),
         pool: app.pool.clone(),
         secret_key: std::sync::Arc::new([0u8; 32]),
+        auth_rate_limiter,
+        trust_proxy: false,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -393,6 +409,51 @@ async fn account_rpcs_require_auth() {
     for code in codes {
         assert_eq!(code, tonic::Code::Unauthenticated);
     }
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_is_rate_limited_per_ip() {
+    let app = TestApp::new().await;
+    // A tiny burst (3) with no refill makes throttling deterministic.
+    let limiter = std::sync::Arc::new(auth::ratelimit::RateLimiter::new(3, 0.0));
+    let (addr, shutdown) = spawn_grpc_with_limiter(&app, limiter).await;
+    let mut client = connect(addr).await;
+
+    // Bootstrap succeeds (success doesn't consume the bucket).
+    client
+        .bootstrap(tonic::Request::new(bootstrap_request()))
+        .await
+        .unwrap();
+
+    let wrong = || LoginRequest {
+        email: "owner@test.local".to_string(),
+        password: "wrong".to_string(),
+        mfa_challenge_token: String::new(),
+        mfa_response: Vec::new(),
+    };
+
+    // The burst of wrong-password attempts is rejected as unauthenticated.
+    for _ in 0..3 {
+        let err = client.login(tonic::Request::new(wrong())).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    // Once the bucket is drained, further attempts are throttled *before* the
+    // password is checked — so even the correct password is refused.
+    let err = client.login(tonic::Request::new(wrong())).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    let err = client
+        .login(tonic::Request::new(LoginRequest {
+            email: "owner@test.local".to_string(),
+            password: PW.to_string(),
+            mfa_challenge_token: String::new(),
+            mfa_response: Vec::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
 
     let _ = shutdown.send(true);
 }

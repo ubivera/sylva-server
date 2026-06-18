@@ -2,11 +2,11 @@
 //! (see `docs/design/hub.md`). Distinct from Platform/Resources: the Hub is core
 //! infrastructure, not a registered app.
 //!
-//! `Bootstrap` + `Login` are unauthenticated; the rest require a session token
-//! and are owner-scoped. Auth uses the Argon2id password verifier (over TLS);
-//! the master key is wrapped *client-side* under `KDF(password, secret_key)` —
-//! the server stores only the ciphertext it is handed. Peer-IP rate-limiting on
-//! the unauthenticated RPCs + the signed discovery endpoint land in 2c.
+//! `Bootstrap` + `Login` are unauthenticated (peer-IP rate-limited via
+//! [`crate::PlatformContext::auth_rate_limiter`]); the rest require a session
+//! token and are owner-scoped. Auth uses the Argon2id password verifier (over
+//! TLS); the master key is wrapped *client-side* under `KDF(password,
+//! secret_key)` — the server stores only the ciphertext it is handed.
 
 use identity::{
     Device, DeviceId, DeviceRepository, InstanceRole, MachineRepository, NewDevice, User, UserId,
@@ -34,6 +34,12 @@ impl Account for AccountService {
         &self,
         request: Request<BootstrapRequest>,
     ) -> Result<Response<ProtoSession>, Status> {
+        let client_key = rate_key(&request, self.ctx.trust_proxy);
+        if !self.ctx.auth_rate_limiter.allowed(&client_key) {
+            return Err(Status::resource_exhausted(
+                "too many attempts; try again later",
+            ));
+        }
         let req = request.into_inner();
         let email = req.email.trim().to_string();
         let display_name = req.display_name.trim().to_string();
@@ -58,6 +64,7 @@ impl Account for AccountService {
             .await
             .map_err(|err| internal(&err, "bootstrap:count"))?;
         if count > 0 {
+            self.ctx.auth_rate_limiter.record_failure(&client_key);
             return Err(Status::failed_precondition("an account already exists"));
         }
 
@@ -114,6 +121,12 @@ impl Account for AccountService {
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
+        let client_key = rate_key(&request, self.ctx.trust_proxy);
+        if !self.ctx.auth_rate_limiter.allowed(&client_key) {
+            return Err(Status::resource_exhausted(
+                "too many attempts; try again later",
+            ));
+        }
         let req = request.into_inner();
         if req.email.trim().is_empty() {
             return Err(Status::invalid_argument("email is required"));
@@ -139,7 +152,10 @@ impl Account for AccountService {
                     outcome: Some(login_response::Outcome::Session(session)),
                 }))
             }
-            Ok(Err(_)) => Err(Status::unauthenticated("invalid email or password")),
+            Ok(Err(_)) => {
+                self.ctx.auth_rate_limiter.record_failure(&client_key);
+                Err(Status::unauthenticated("invalid email or password"))
+            }
             Err(err) => Err(internal(&err, "login:verify")),
         }
     }
@@ -287,6 +303,24 @@ pub fn account_server(ctx: PlatformContext) -> AccountServer<AccountService> {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// The client-IP key for rate-limiting an unauthenticated RPC: the first
+/// `x-forwarded-for` hop when a proxy is trusted, else the socket peer IP
+/// (mirrors `hearth`'s REST `resolve_client_ip`). Falls back to `"direct"`.
+fn rate_key<T>(request: &Request<T>, trust_proxy: bool) -> String {
+    if trust_proxy
+        && let Some(value) = request.metadata().get("x-forwarded-for")
+        && let Ok(text) = value.to_str()
+        && let Some(first) = text.split(',').next()
+        && !first.trim().is_empty()
+    {
+        return first.trim().to_string();
+    }
+    request
+        .remote_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "direct".to_string())
+}
 
 fn actor_of(user: &User) -> audit::Actor {
     audit::Actor {

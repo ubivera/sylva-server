@@ -69,6 +69,8 @@ async fn spawn_grpc(app: &TestApp) -> (std::net::SocketAddr, tokio::sync::watch:
         devices: identity::DeviceRepository::new(app.pool.clone()),
         pool: app.pool.clone(),
         secret_key: std::sync::Arc::new([0u8; 32]),
+        auth_rate_limiter: std::sync::Arc::new(auth::ratelimit::RateLimiter::auth_default()),
+        trust_proxy: false,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

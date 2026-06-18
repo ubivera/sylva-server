@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod ratelimit;
 pub mod recovery_code;
 pub mod secretbox;
 pub mod totp;

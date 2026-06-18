@@ -41,6 +41,13 @@ pub struct PlatformContext {
     /// Pool for registry queries + audit transactions (app registration, enrollment).
     pub pool: sqlx::PgPool,
     pub secret_key: Arc<[u8; 32]>,
+    /// Per-client-IP throttle for the unauthenticated `Account` RPCs
+    /// (`Bootstrap` / `Login`). Shared with the REST auth limiter in production
+    /// so a brute-forcer is bounded across both surfaces. See [`account`].
+    pub auth_rate_limiter: Arc<auth::ratelimit::RateLimiter>,
+    /// Whether to trust `x-forwarded-for` gRPC metadata for the client-IP key
+    /// (set behind a reverse proxy); else key on the socket peer.
+    pub trust_proxy: bool,
 }
 
 /// The caller resolved from a request's bearer token.

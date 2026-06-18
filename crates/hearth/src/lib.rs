@@ -7,6 +7,7 @@ pub mod auth_routes;
 pub mod config;
 pub mod csrf;
 pub mod db;
+pub mod discovery;
 pub mod health;
 pub mod instance;
 #[cfg(windows)]
@@ -149,6 +150,17 @@ async fn serve(
         instance::load_closed(&pool).await.unwrap_or(false),
     ));
 
+    // Load (or, on first run, generate + persist) the server identity keypair —
+    // the trust anchor native clients pin and the key the discovery endpoint
+    // signs with.
+    let server_identity =
+        std::sync::Arc::new(instance::ensure_server_identity(&pool, &secret_key).await?);
+
+    // One auth limiter, shared by the REST auth endpoints and the gRPC
+    // `Account.Bootstrap`/`Login` RPCs — so a brute-forcer hitting the same IP
+    // across both surfaces is bounded by a single per-IP bucket.
+    let auth_rate_limiter = std::sync::Arc::new(rate_limit::RateLimiter::auth_default());
+
     // Context for the gRPC platform services — clones of the same repositories
     // the REST layer uses (cheap; each just wraps the pool). Built before the
     // AppState literal below moves the originals.
@@ -160,6 +172,8 @@ async fn serve(
         devices: identity::DeviceRepository::new(pool.clone()),
         pool: pool.clone(),
         secret_key: secret_key.clone(),
+        auth_rate_limiter: auth_rate_limiter.clone(),
+        trust_proxy: config.trust_proxy,
     };
 
     let state = app::AppState {
@@ -173,20 +187,26 @@ async fn serve(
         notifier,
         env_config: std::sync::Arc::new(config.clone()),
         csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
-        rate_limiter: std::sync::Arc::new(rate_limit::RateLimiter::auth_default()),
+        rate_limiter: auth_rate_limiter,
         secret_key,
         trust_proxy: config.trust_proxy,
         instance_closed,
+        server_identity,
     };
 
     let health = axum::Router::new()
         .route("/health", axum::routing::get(health::handler))
         .with_state(state.clone());
 
+    // Public, unauthenticated discovery — mounted at the root (like /health) so
+    // it bypasses the API prefix, auth, and the closed-instance page.
+    let discovery = discovery::router(state.clone());
+
     let router = axum::Router::new()
         .nest("/api", app::api_router(state.clone()))
         .merge(ui_router(state))
         .merge(health)
+        .merge(discovery)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr)

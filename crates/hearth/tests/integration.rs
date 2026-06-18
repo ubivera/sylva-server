@@ -18,6 +18,8 @@ mod admin;
 mod apps;
 #[path = "integration/audit_chain.rs"]
 mod audit_chain;
+#[path = "integration/discovery.rs"]
+mod discovery;
 #[path = "integration/auth.rs"]
 mod auth;
 #[path = "integration/enrollment.rs"]
