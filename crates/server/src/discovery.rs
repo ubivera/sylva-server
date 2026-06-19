@@ -1,4 +1,4 @@
-//! Public server discovery: `GET /.well-known/hearth-discovery`.
+//! Public server discovery: `GET /.well-known/sylva-discovery`.
 //!
 //! Unauthenticated and always available (no session, not gated by the
 //! closed-instance page) — it's the first call a native client (Sylva Hub)
@@ -33,7 +33,7 @@ const PAYLOAD_VERSION: u32 = 1;
 
 /// Domain-separation tag — keeps a discovery signature from ever being valid in
 /// another context that happens to sign similar bytes.
-const DOMAIN: &[u8] = b"sylva.hearth.discovery.v1";
+const DOMAIN: &[u8] = b"sylva.discovery.v1";
 
 /// Cap the echoed nonce so a caller can't make us sign an unbounded blob.
 const MAX_NONCE_LEN: usize = 256;
@@ -63,7 +63,7 @@ struct DiscoveryResponse {
 /// so it bypasses the API prefix, auth, and the closed-instance page.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/.well-known/hearth-discovery", get(handler))
+        .route("/.well-known/sylva-discovery", get(handler))
         .with_state(state)
 }
 

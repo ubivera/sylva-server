@@ -22,11 +22,11 @@ pub type Result<T> = std::result::Result<T, AuditError>;
 /// stays race-free without needing SERIALIZABLE isolation.
 const AUDIT_ADVISORY_LOCK_KEY: i64 = 0x1234_5678_9abc_def0_u64 as i64;
 
-/// Returns `sha256(b"hearth-audit-genesis")` - the `prev_hash` for the
+/// Returns `sha256(b"sylva-audit-genesis")` - the `prev_hash` for the
 /// first row in the chain.
 pub fn genesis_hash() -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"hearth-audit-genesis");
+    hasher.update(b"sylva-audit-genesis");
     hasher.finalize().into()
 }
 
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn genesis_hash_is_sha256_of_literal() {
         let mut h = Sha256::new();
-        h.update(b"hearth-audit-genesis");
+        h.update(b"sylva-audit-genesis");
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(genesis_hash(), expected);
     }

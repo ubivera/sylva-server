@@ -19,7 +19,7 @@ impl JobObject {
     /// Create a job object with `KILL_ON_JOB_CLOSE`, assign the current
     /// process to it, and return the handle. Subsequent child processes
     /// inherit the job by default, so they're killed when this handle
-    /// closes (i.e., when hearth dies).
+    /// closes (i.e., when server dies).
     pub fn assign_current_process_for_kill_on_close() -> Result<Self> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {

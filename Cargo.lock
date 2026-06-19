@@ -893,54 +893,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hearth"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "arc-swap",
- "audit",
- "auth",
- "authz",
- "axum",
- "chrono",
- "ed25519-dalek",
- "hmac",
- "identity",
- "notifications",
- "pending",
- "platform",
- "proto",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "subtle",
- "sylva-sdk",
- "thiserror 2.0.18",
- "tokio",
- "tonic",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "web",
- "webauthn-rs",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "hearth-server"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "hearth",
- "web",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2095,9 +2047,9 @@ dependencies = [
  "anyhow",
  "audit",
  "auth",
- "hearth",
  "identity",
  "serde_json",
+ "server",
  "sqlx",
  "tokio",
  "tracing",
@@ -2497,6 +2449,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "server"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "audit",
+ "auth",
+ "authz",
+ "axum",
+ "chrono",
+ "ed25519-dalek",
+ "hmac",
+ "identity",
+ "notifications",
+ "pending",
+ "platform",
+ "proto",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "sylva-sdk",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "web",
+ "webauthn-rs",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2841,6 +2832,15 @@ dependencies = [
  "tonic-prost-build",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "sylva-server"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "server",
+ "web",
 ]
 
 [[package]]
@@ -3514,7 +3514,6 @@ dependencies = [
  "auth",
  "axum",
  "chrono",
- "hearth",
  "identity",
  "maud",
  "pending",
@@ -3522,6 +3521,7 @@ dependencies = [
  "qrcode",
  "serde",
  "serde_json",
+ "server",
  "tower-http",
  "tracing",
  "uuid",

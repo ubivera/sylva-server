@@ -23,7 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 
-hearth = { path = "../hearth" }
+server = { path = "../server" }
 identity = { path = "../identity" }
 auth = { path = "../auth" }
 audit = { path = "../audit" }

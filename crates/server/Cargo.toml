@@ -1,5 +1,5 @@
 [package]
-name = "hearth"
+name = "server"
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,13 +9,13 @@ repository.workspace = true
 description = "Sylva Hearth API library (state, extractors, handlers for /api/*)"
 
 [lib]
-name = "hearth"
+name = "server"
 path = "src/lib.rs"
 
 [features]
 # Opt-in cross-stack end-to-end test (drives the real sylva-sdk client against a
 # live in-process server). Off by default, so the standard suite stays fully
-# decoupled from the SDK's build. Run: cargo test -p hearth --features e2e
+# decoupled from the SDK's build. Run: cargo test -p server --features e2e
 e2e = ["dep:sylva-sdk"]
 
 [dependencies]

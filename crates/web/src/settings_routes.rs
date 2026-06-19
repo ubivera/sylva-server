@@ -8,7 +8,7 @@
 //!   carries credentials); driven from the page via `REAUTH_CHAIN_JS`.
 //! * `/settings/notifications/test` — send a test email via the live notifier.
 //!
-//! The persist + audit + live-swap happen in [`hearth::settings_logic`]; these
+//! The persist + audit + live-swap happen in [`server::settings_logic`]; these
 //! handlers validate input and translate the outcome into a toast + redirect.
 
 use axum::{
@@ -17,7 +17,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use hearth::{app::AppState, csrf, settings_logic::TestEmailOutcome};
+use server::{app::AppState, csrf, settings_logic::TestEmailOutcome};
 use identity::InstanceRole;
 use serde::Deserialize;
 
@@ -39,14 +39,14 @@ pub async fn settings_page(
         return error_response(StatusCode::FORBIDDEN, "Owners only.");
     }
     let eff =
-        match hearth::instance::effective(&state.db, &state.env_config, &state.secret_key).await {
+        match server::instance::effective(&state.db, &state.env_config, &state.secret_key).await {
             Ok(e) => e,
             Err(err) => {
                 tracing::error!(?err, "computing effective config for /settings");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
             }
         };
-    let pw_set = hearth::instance::smtp_password_is_set(&state.db)
+    let pw_set = server::instance::smtp_password_is_set(&state.db)
         .await
         .unwrap_or(false);
     let recovery_created_at = auth::recovery_code::active_metadata(&state.db)
@@ -99,7 +99,7 @@ pub async fn settings_identity_submit(
         user_id: auth.user.id,
         display_name: auth.user.display_name.clone(),
     };
-    match hearth::settings_logic::apply_instance_name(&state, &actor, name).await {
+    match server::settings_logic::apply_instance_name(&state, &actor, name).await {
         Ok(()) => settings_success(htmx, "Saved", "Instance name updated."),
         Err(err) => {
             tracing::error!(?err, "applying instance name");
@@ -181,14 +181,14 @@ pub async fn settings_notifications_submit(
             _ => return settings_error(htmx, "Port must be a number between 1 and 65535."),
         };
         if password.is_none()
-            && !hearth::instance::smtp_password_is_set(&state.db)
+            && !server::instance::smtp_password_is_set(&state.db)
                 .await
                 .unwrap_or(false)
         {
             return settings_error(htmx, "Set an SMTP password — none is stored yet.");
         }
 
-        Some(hearth::instance::SmtpInput {
+        Some(server::instance::SmtpInput {
             host,
             port,
             tls,
@@ -205,7 +205,7 @@ pub async fn settings_notifications_submit(
         user_id: auth.user.id,
         display_name: auth.user.display_name.clone(),
     };
-    match hearth::settings_logic::apply_notifications(&state, &actor, mode, smtp).await {
+    match server::settings_logic::apply_notifications(&state, &actor, mode, smtp).await {
         Ok(()) => settings_success(htmx, "Saved", "Email settings updated."),
         Err(err) => {
             tracing::error!(?err, "applying notifications config");
@@ -236,7 +236,7 @@ pub async fn settings_test_email(
     let htmx = is_htmx(&headers);
     let to = auth.user.email.clone();
 
-    match hearth::settings_logic::send_test_email(&state, &to).await {
+    match server::settings_logic::send_test_email(&state, &to).await {
         TestEmailOutcome::Sent => {
             settings_success(htmx, "Test sent", &format!("Sent a test email to {to}."))
         }
@@ -297,7 +297,7 @@ pub async fn settings_shutdown_submit(
     if let Err(resp) = require_critical_sudo(&state, &headers, auth.user.id) {
         return resp;
     }
-    if let Err(err) = hearth::settings_logic::force_close_instance(&state).await {
+    if let Err(err) = server::settings_logic::force_close_instance(&state).await {
         tracing::error!(?err, "force-closing instance");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }

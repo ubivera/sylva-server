@@ -824,7 +824,7 @@ pub enum NotifierImpl {
     Smtp(Arc<SmtpNotifier>),
     /// Test-only backend that always reports a transient failure with the
     /// given reason. Not used by production code; kept here (rather than
-    /// `#[cfg(test)]`) so integration tests living in the `hearth` crate
+    /// `#[cfg(test)]`) so integration tests living in the `server` crate
     /// can reach it.
     #[doc(hidden)]
     AlwaysFail(String),
@@ -1141,7 +1141,7 @@ mod tests {
         let r = Notification::Invitation {
             recipient_email: "alice@example.com".into(),
             inviter_display_name: "Bob".into(),
-            accept_url: "https://hearth.example.com/invite/abc".into(),
+            accept_url: "https://sylva.example.com/invite/abc".into(),
             expires_at: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
             instance_role: InstanceRole::Admin,
             invitation_id: Uuid::nil(),
@@ -1150,9 +1150,9 @@ mod tests {
         assert!(matches!(r.kind, OutboxKind::Invitation));
         assert!(r.subject.contains("Bob"));
         assert!(r.body_text.contains("Admin"));
-        assert!(r.body_text.contains("https://hearth.example.com/invite/abc"));
+        assert!(r.body_text.contains("https://sylva.example.com/invite/abc"));
         assert!(r.body_html.contains("Admin"));
-        assert!(r.body_html.contains("https://hearth.example.com/invite/abc"));
+        assert!(r.body_html.contains("https://sylva.example.com/invite/abc"));
     }
 
     #[test]

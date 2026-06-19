@@ -1,13 +1,13 @@
 //! Instance Settings (CP1) — the storage + effective-config layer.
 //!
-//! Covers `hearth::instance`'s override round-trips and the
+//! Covers `server::instance`'s override round-trips and the
 //! DB-override-else-env `effective` model that seeds the hot-swappable
 //! `AppState` cells. The page + handlers land in CP2.
 
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
-use hearth::config::{Config, NotificationsConfig};
-use hearth::instance::{self, SmtpInput};
+use server::config::{Config, NotificationsConfig};
+use server::instance::{self, SmtpInput};
 use identity::InstanceRole;
 use uuid::Uuid;
 
@@ -20,8 +20,8 @@ fn env_config(instance_name: &str, notifications_mode: &str) -> Config {
     let instance_name = instance_name.to_string();
     let notifications_mode = notifications_mode.to_string();
     Config::from_env_lookup(move |key| match key {
-        "HEARTH_INSTANCE_NAME" => Some(instance_name.clone()),
-        "HEARTH_NOTIFICATIONS_MODE" => Some(notifications_mode.clone()),
+        "SYLVA_INSTANCE_NAME" => Some(instance_name.clone()),
+        "SYLVA_NOTIFICATIONS_MODE" => Some(notifications_mode.clone()),
         _ => None,
     })
     .expect("test config parses")
@@ -132,7 +132,7 @@ async fn smtp_password_is_stored_sealed_not_plaintext() {
     // The raw column must not contain the plaintext — it's sealed
     // (XChaCha20-Poly1305: 24-byte nonce + ciphertext + 16-byte tag).
     let enc: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT smtp_password_enc FROM hearth_meta.instance WHERE id = TRUE")
+        sqlx::query_scalar("SELECT smtp_password_enc FROM sylva_meta.instance WHERE id = TRUE")
             .fetch_one(&app.pool)
             .await
             .expect("read enc column");
@@ -256,7 +256,7 @@ async fn get_with_cookie(app: &TestApp, path: &str, cookie: &str) -> (StatusCode
 
 /// POST a urlencoded form with `HX-Request` set (mirrors the htmx-driven
 /// browser flow, including the reauth chain). `cookie_header` is the full
-/// Cookie value (session, optionally plus a `hearth_sudo` grant).
+/// Cookie value (session, optionally plus a `sylva_sudo` grant).
 async fn post_form_hx(app: &TestApp, path: &str, cookie_header: &str, body: String) -> Response {
     let req = axum::http::Request::builder()
         .method(Method::POST)
@@ -280,7 +280,7 @@ fn hx_redirect(resp: &Response) -> String {
 fn hx_trigger_toast(resp: &Response) -> Option<serde_json::Value> {
     let raw = resp.headers().get("hx-trigger")?.to_str().ok()?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
-    parsed.get("hearth-toast").cloned()
+    parsed.get("sylva-toast").cloned()
 }
 
 #[tokio::test]
@@ -366,7 +366,7 @@ async fn notifications_save_is_reauth_gated() {
     let (cookie, sid) = web_login_session(&app, OWNER_EMAIL, OWNER_PW).await;
     let csrf = app.csrf_for(sid);
 
-    // No `hearth_sudo` grant attached → require_sudo rejects with 403.
+    // No `sylva_sudo` grant attached → require_sudo rejects with 403.
     let resp = post_form_hx(
         &app,
         "/settings/notifications",

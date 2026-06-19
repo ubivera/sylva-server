@@ -4,16 +4,16 @@ use axum::{
     http::{StatusCode, request::Parts},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use hearth::{app::AppState, auth_routes::SESSION_COOKIE_NAME, csrf};
+use server::{app::AppState, auth_routes::SESSION_COOKIE_NAME, csrf};
 use serde::Deserialize;
 
 use crate::views;
 
 /// Browser-side auth wrapper: same lookup as
-/// [`hearth::auth_routes::AuthenticatedUser`] but rejects with a redirect
+/// [`server::auth_routes::AuthenticatedUser`] but rejects with a redirect
 /// to `/login` instead of a JSON 401. Browser users hitting an
 /// unauthenticated route get bounced to sign in.
-pub struct BrowserAuth(pub hearth::auth_routes::AuthenticatedUser);
+pub struct BrowserAuth(pub server::auth_routes::AuthenticatedUser);
 
 impl FromRequestParts<AppState> for BrowserAuth {
     type Rejection = Redirect;
@@ -22,7 +22,7 @@ impl FromRequestParts<AppState> for BrowserAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        hearth::auth_routes::AuthenticatedUser::from_request_parts(parts, state)
+        server::auth_routes::AuthenticatedUser::from_request_parts(parts, state)
             .await
             .map(BrowserAuth)
             .map_err(|_| Redirect::to("/login"))
@@ -41,7 +41,7 @@ impl OptionalFromRequestParts<AppState> for BrowserAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Option<Self>, Self::Rejection> {
-        match hearth::auth_routes::AuthenticatedUser::from_request_parts(parts, state).await {
+        match server::auth_routes::AuthenticatedUser::from_request_parts(parts, state).await {
             Ok(user) => Ok(Some(BrowserAuth(user))),
             Err(_) => Ok(None),
         }
@@ -90,12 +90,12 @@ pub struct LoginForm {
 }
 
 /// `POST /login` — credential check + session creation. Sets the
-/// `hearth_session` cookie on success and redirects to `/me`. On failure
+/// `sylva_session` cookie on success and redirects to `/me`. On failure
 /// re-renders the login form with an error message (status 200 so the
 /// browser doesn't replace the page with a custom error UI).
 pub async fn login_submit(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -141,7 +141,7 @@ pub async fn login_submit(
     // Password is correct. If the user has any second factor (TOTP or a
     // passkey), don't issue a session yet — hand off to /login/verify
     // with a short-lived, single-purpose cookie instead.
-    match hearth::mfa::has_second_factor(&state.db, user.id).await {
+    match server::mfa::has_second_factor(&state.db, user.id).await {
         Ok(true) => {
             let mut resp = Redirect::to("/login/verify").into_response();
             set_cookie_header(&mut resp, &mfa_pending_cookie(&state, user.id));
@@ -158,7 +158,7 @@ pub async fn login_submit(
         user_id: user.id,
         display_name: user.display_name.clone(),
     };
-    let user_agent = hearth::rate_limit::user_agent(&headers);
+    let user_agent = server::rate_limit::user_agent(&headers);
     let result: anyhow::Result<String> = async {
         let mut tx = state.db.begin().await?;
         let (session, token) = auth::SessionRepository::create(
@@ -207,13 +207,13 @@ pub async fn login_submit(
 /// as JSON. Public; lightly rate-limited per IP to bound challenge churn.
 pub async fn login_passkey_start(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
 ) -> Response {
     let rl_key = format!("pklogin:{client_ip}");
     if !state.rate_limiter.allowed(&rl_key) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response();
     }
-    match hearth::webauthn::start_discoverable(&state).await {
+    match server::webauthn::start_discoverable(&state).await {
         Ok((challenge_id, options)) => axum::Json(serde_json::json!({
             "challenge_id": challenge_id,
             "options": options,
@@ -239,7 +239,7 @@ pub struct LoginPasskeyFinishForm {
 /// gated on the account being **active**, mirroring `verify_credentials`.
 pub async fn login_passkey_finish(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginPasskeyFinishForm>,
 ) -> Response {
@@ -255,7 +255,7 @@ pub async fn login_passkey_finish(
             .into_response();
     }
 
-    let user_id = match hearth::webauthn::finish_discoverable(&state, form.challenge_id, &form.passkey)
+    let user_id = match server::webauthn::finish_discoverable(&state, form.challenge_id, &form.passkey)
         .await
     {
         Ok(Some(id)) => id,
@@ -294,7 +294,7 @@ pub async fn login_passkey_finish(
         }
     };
 
-    let user_agent = hearth::rate_limit::user_agent(&headers);
+    let user_agent = server::rate_limit::user_agent(&headers);
     issue_session_after_mfa(
         &state,
         &user,
@@ -349,20 +349,20 @@ pub async fn accept_invite_form(
 }
 
 /// `POST /invite/{token}` — accept the invitation. On success, sets the
-/// `hearth_session` cookie and redirects to `/me`. On validation
+/// `sylva_session` cookie and redirects to `/me`. On validation
 /// failure (missing display_name / password), re-renders the form with
 /// the entered display_name preserved. On invalid token (raced expiry,
 /// concurrent acceptance), renders the "unavailable" page.
 pub async fn accept_invite_submit(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     axum::extract::Path(token): axum::extract::Path<String>,
     Form(form): Form<AcceptInviteForm>,
 ) -> Response {
-    use hearth::auth_routes::{AcceptInviteError, perform_accept_invite};
+    use server::auth_routes::{AcceptInviteError, perform_accept_invite};
 
-    let user_agent = hearth::rate_limit::user_agent(&headers);
+    let user_agent = server::rate_limit::user_agent(&headers);
     match perform_accept_invite(
         &state,
         &token,
@@ -486,18 +486,18 @@ pub async fn account_settings_modal(
             tracing::warn!(?err, "loading TOTP credentials for settings modal");
             Vec::new()
         });
-    let passkey_creds = hearth::webauthn::list(&state.db, auth.user.id)
+    let passkey_creds = server::webauthn::list(&state.db, auth.user.id)
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(?err, "loading passkeys for settings modal");
             Vec::new()
         });
-    let passkey_available = hearth::webauthn::available(&state);
+    let passkey_available = server::webauthn::available(&state);
     // Active sessions drive the Devices tab. Degrade to empty on error.
     let sessions = active_sessions(&state, auth.user.id).await;
     // Whether the Data Control close-account sections must show the
     // "transfer ownership first" block (last owner with other users present).
-    let last_owner_blocked = hearth::account_logic::last_owner_blocked(&state, &auth.user)
+    let last_owner_blocked = server::account_logic::last_owner_blocked(&state, &auth.user)
         .await
         .unwrap_or(false);
     let ctx = views::ChromeContext {
@@ -545,7 +545,7 @@ async fn active_sessions(state: &AppState, user_id: identity::UserId) -> Vec<aut
 /// (they target it via `outerHTML`).
 async fn sessions_section_response(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     mode: views::SectionMode,
 ) -> Response {
     let sessions = active_sessions(state, auth.user.id).await;
@@ -766,7 +766,7 @@ pub struct MeReauthForm {
     pub passkey: Option<String>,
     /// Set to `"1"` by the forced-reauth modal (`/modals/reauth?critical=1`)
     /// for irreversible account actions. When present, a successful re-auth
-    /// additionally mints the short-lived `hearth_sudo_critical` grant those
+    /// additionally mints the short-lived `sylva_sudo_critical` grant those
     /// actions require — so they always re-prompt, ignoring the sudo window.
     pub critical: Option<String>,
 }
@@ -774,7 +774,7 @@ pub struct MeReauthForm {
 /// `POST /me/reauth` — step-up reauthentication. Verifies the factors the
 /// account's assurance level demands (passkey one-tap; or password, plus
 /// the authenticator code when TOTP is enrolled), then mints the
-/// `hearth_sudo` grant and fires `reauth-ok` so the chain runs the
+/// `sylva_sudo` grant and fires `reauth-ok` so the chain runs the
 /// original action. Rate-limited `reauth:{user_id}`. Never accepts a
 /// password alone when a second factor is enrolled (no AAL downgrade).
 pub async fn me_reauth_submit(
@@ -806,7 +806,7 @@ pub async fn me_reauth_submit(
         let Some(challenge_id) = form.challenge_id else {
             return reauth_modal_error(&state, &auth, has_totp, has_passkey, want_critical, "Passkey verification failed. Try again.");
         };
-        return match hearth::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await {
+        return match server::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await {
             Ok(true) => grant_and_proceed(&state, &auth, "passkey", want_critical).await,
             Ok(false) => {
                 state.rate_limiter.record_failure(&rl_key);
@@ -868,7 +868,7 @@ pub async fn me_reauth_passkey_start(
     State(state): State<AppState>,
     BrowserAuth(auth): BrowserAuth,
 ) -> Response {
-    match hearth::webauthn::start_authentication(&state, auth.user.id).await {
+    match server::webauthn::start_authentication(&state, auth.user.id).await {
         Ok(Some((challenge_id, options))) => axum::Json(serde_json::json!({
             "challenge_id": challenge_id,
             "options": options,
@@ -882,12 +882,12 @@ pub async fn me_reauth_passkey_start(
     }
 }
 
-/// Successful step-up: mint the `hearth_sudo` grant + fire `reauth-ok`
+/// Successful step-up: mint the `sylva_sudo` grant + fire `reauth-ok`
 /// (204, so htmx swaps nothing) so `REAUTH_CHAIN_JS` runs the original
 /// action.
 async fn grant_and_proceed(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     factor: &str,
     critical: bool,
 ) -> Response {
@@ -911,7 +911,7 @@ async fn grant_and_proceed(
 /// back into `#reauth-modal-content`).
 fn reauth_modal_error(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     has_totp: bool,
     has_passkey: bool,
     critical: bool,
@@ -933,7 +933,7 @@ fn reauth_modal_error(
 /// Best-effort audit of a step-up attempt.
 async fn audit_reauth(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     factor: &str,
     success: bool,
 ) {
@@ -1069,7 +1069,7 @@ pub async fn me_profile_submit(
 ///   stays open and the operator can retry. Same shape as the admin
 ///   destructive actions.
 /// - **Invalid email shape / email in use / success / no-op** → HX-
-///   Redirect to `/me` with a hearth-toast describing the outcome.
+///   Redirect to `/me` with a sylva-toast describing the outcome.
 ///   Closes both modals (reauth + settings) on the way out.
 pub async fn me_email_submit(
     State(state): State<AppState>,
@@ -1170,7 +1170,7 @@ pub async fn me_email_submit(
 pub struct MePasswordForm {
     pub csrf_token: String,
     /// New password, staged from the Security tab's form. The current
-    /// password is no longer collected — the `hearth_sudo` grant is the
+    /// password is no longer collected — the `sylva_sudo` grant is the
     /// reauth.
     pub new_password: String,
 }
@@ -1266,7 +1266,7 @@ pub async fn me_password_submit(
 
 /// Form for reauth-gated actions that carry no payload of their own (e.g.
 /// regenerate recovery code, add authenticator/passkey). Authorization is
-/// the `hearth_sudo` grant; only the CSRF token rides along.
+/// the `sylva_sudo` grant; only the CSRF token rides along.
 #[derive(Deserialize)]
 pub struct MeReauthOnlyForm {
     pub csrf_token: String,
@@ -1368,7 +1368,7 @@ fn render_qr_svg(data: &str) -> String {
 /// retried) secret + its pending credential id.
 fn totp_enroll_response(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     secret: &[u8],
     cred_id: uuid::Uuid,
     error: Option<&str>,
@@ -1385,7 +1385,7 @@ fn totp_enroll_response(
 /// the response for refresh / edit / rename / delete HTMX swaps.
 async fn totp_section_response(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     mode: views::SectionMode,
 ) -> Response {
     let creds = match auth::user_totp::list_verified(&state.db, auth.user.id).await {
@@ -1686,7 +1686,7 @@ pub async fn me_totp_delete(
 /// OOB section updates the list behind it.
 async fn totp_removed_response(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
 ) -> Response {
     let creds = match auth::user_totp::list_verified(&state.db, auth.user.id).await {
         Ok(c) => c,
@@ -1723,17 +1723,17 @@ async fn totp_removed_response(
 /// Render the passkeys island (`#passkey-section`) in a given mode.
 async fn passkey_section_response(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
     mode: views::SectionMode,
 ) -> Response {
-    let creds = match hearth::webauthn::list(&state.db, auth.user.id).await {
+    let creds = match server::webauthn::list(&state.db, auth.user.id).await {
         Ok(c) => c,
         Err(err) => {
             tracing::error!(?err, "passkey section: list");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
-    let available = hearth::webauthn::available(state);
+    let available = server::webauthn::available(state);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
         instance_name: state.instance_name.load_full(),
@@ -1765,8 +1765,8 @@ pub async fn me_passkey_start(
         return resp;
     }
 
-    match hearth::webauthn::count(&state.db, auth.user.id).await {
-        Ok(n) if n >= hearth::webauthn::MAX_PASSKEYS => {
+    match server::webauthn::count(&state.db, auth.user.id).await {
+        Ok(n) if n >= server::webauthn::MAX_PASSKEYS => {
             return Html(views::passkey_limit_reached_content().into_string()).into_response();
         }
         Ok(_) => {}
@@ -1776,7 +1776,7 @@ pub async fn me_passkey_start(
         }
     }
 
-    match hearth::webauthn::start_registration(&state, &auth.user).await {
+    match server::webauthn::start_registration(&state, &auth.user).await {
         Ok((challenge_id, options)) => {
             let options_json = serde_json::to_string(&options).unwrap_or_else(|_| "{}".to_string());
             let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
@@ -1813,7 +1813,7 @@ pub async fn me_passkey_finish(
         return resp;
     }
     let label = clean_label(&form.label);
-    match hearth::webauthn::finish_registration(
+    match server::webauthn::finish_registration(
         &state,
         &auth.user,
         form.challenge_id,
@@ -1845,10 +1845,10 @@ pub async fn me_passkey_finish(
                 tracing::error!(?err, "passkey_finish: audit");
             }
 
-            let creds = hearth::webauthn::list(&state.db, auth.user.id)
+            let creds = server::webauthn::list(&state.db, auth.user.id)
                 .await
                 .unwrap_or_default();
-            let available = hearth::webauthn::available(&state);
+            let available = server::webauthn::available(&state);
             let csrf = csrf::compute_token(&state.csrf_secret, auth.session_id);
             let ctx = views::ChromeContext {
                 instance_name: state.instance_name.load_full(),
@@ -1912,7 +1912,7 @@ pub async fn me_passkey_rename(
         return resp;
     }
     let label = clean_label(&form.label);
-    if let Err(err) = hearth::webauthn::rename(&state.db, auth.user.id, cred_id, &label).await {
+    if let Err(err) = server::webauthn::rename(&state.db, auth.user.id, cred_id, &label).await {
         tracing::error!(?err, "passkey_rename");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
@@ -1949,7 +1949,7 @@ pub async fn me_passkey_delete(
         display_name: auth.user.display_name.clone(),
     };
     let result: anyhow::Result<()> = async {
-        let removed = hearth::webauthn::delete(&state.db, auth.user.id, cred_id).await?;
+        let removed = server::webauthn::delete(&state.db, auth.user.id, cred_id).await?;
         if removed {
             let mut tx = state.db.begin().await?;
             audit::append(
@@ -1976,16 +1976,16 @@ pub async fn me_passkey_delete(
 /// refresh of `#passkey-section`. Mirror of [`totp_removed_response`].
 async fn passkey_removed_response(
     state: &AppState,
-    auth: &hearth::auth_routes::AuthenticatedUser,
+    auth: &server::auth_routes::AuthenticatedUser,
 ) -> Response {
-    let creds = match hearth::webauthn::list(&state.db, auth.user.id).await {
+    let creds = match server::webauthn::list(&state.db, auth.user.id).await {
         Ok(c) => c,
         Err(err) => {
             tracing::error!(?err, "passkey removed: list");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
         }
     };
-    let available = hearth::webauthn::available(state);
+    let available = server::webauthn::available(state);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
     let ctx = views::ChromeContext {
         instance_name: state.instance_name.load_full(),
@@ -2041,7 +2041,7 @@ fn attach_toast(mut response: Response, toast: Option<views::Toast>) -> Response
     let Some(t) = toast else {
         return response;
     };
-    let payload = serde_json::json!({ "hearth-toast": t });
+    let payload = serde_json::json!({ "sylva-toast": t });
     if let Ok(json) = serde_json::to_string(&payload)
         && let Ok(v) = axum::http::HeaderValue::from_str(&json)
     {
@@ -2076,7 +2076,7 @@ fn render_name_partial(
 /// swallows any DB error (the sidebar then just renders without a
 /// badge rather than failing the entire page render).
 pub(crate) async fn pending_count_for(
-    state: &hearth::app::AppState,
+    state: &server::app::AppState,
     role: identity::InstanceRole,
 ) -> Option<u32> {
     if role != identity::InstanceRole::Owner {
@@ -2381,13 +2381,13 @@ pub(crate) fn check_csrf_token(
 /// `admin_logic` calls accept it directly.
 #[allow(clippy::result_large_err)]
 pub(crate) fn require_admin(
-    auth: hearth::auth_routes::AuthenticatedUser,
-) -> Result<hearth::auth_routes::AdminUser, Response> {
+    auth: server::auth_routes::AuthenticatedUser,
+) -> Result<server::auth_routes::AdminUser, Response> {
     if matches!(
         auth.user.instance_role,
         identity::InstanceRole::Admin | identity::InstanceRole::Owner,
     ) {
-        Ok(hearth::auth_routes::AdminUser(auth))
+        Ok(server::auth_routes::AdminUser(auth))
     } else {
         Err(error_response(StatusCode::FORBIDDEN, "Admins only."))
     }
@@ -2433,7 +2433,7 @@ async fn maybe_close_instance(state: &AppState, scorch: bool) -> Option<Response
     if active != 0 {
         return None;
     }
-    if let Err(err) = hearth::instance::close(&state.db, scorch).await {
+    if let Err(err) = server::instance::close(&state.db, scorch).await {
         // Best-effort: there are no users left regardless, so the closed page
         // is still the right thing to serve.
         tracing::error!(?err, "closing emptied instance");
@@ -2462,10 +2462,10 @@ pub async fn me_account_anonymize_submit(
     }
     // Backstop the last-owner guard (the modal already blocks; this catches a
     // race where ownership changed between opening the modal and submitting).
-    if hearth::account_logic::last_owner_blocked(&state, &auth.user).await.unwrap_or(false) {
+    if server::account_logic::last_owner_blocked(&state, &auth.user).await.unwrap_or(false) {
         return Html(views::account_close_blocked_content().into_string()).into_response();
     }
-    if let Err(err) = hearth::account_logic::perform_self_anonymize(&state, &auth).await {
+    if let Err(err) = server::account_logic::perform_self_anonymize(&state, &auth).await {
         tracing::error!(?err, "self anonymize");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
@@ -2495,10 +2495,10 @@ pub async fn me_account_delete_submit(
     }
     // Backstop the last-owner guard (the modal already blocks; this catches a
     // race where ownership changed between opening the modal and submitting).
-    if hearth::account_logic::last_owner_blocked(&state, &auth.user).await.unwrap_or(false) {
+    if server::account_logic::last_owner_blocked(&state, &auth.user).await.unwrap_or(false) {
         return Html(views::account_close_blocked_content().into_string()).into_response();
     }
-    if let Err(err) = hearth::account_logic::perform_self_delete(&state, &auth).await {
+    if let Err(err) = server::account_logic::perform_self_delete(&state, &auth).await {
         tracing::error!(?err, "self delete");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal error");
     }
@@ -2530,7 +2530,7 @@ pub async fn account_close_modal(
         "anonymize" => false,
         _ => return error_response(StatusCode::NOT_FOUND, "Unknown action."),
     };
-    let blocked = hearth::account_logic::last_owner_blocked(&state, &auth.user)
+    let blocked = server::account_logic::last_owner_blocked(&state, &auth.user)
         .await
         .unwrap_or(false);
     let csrf_token = csrf::compute_token(&state.csrf_secret, auth.session_id);
@@ -2681,7 +2681,7 @@ fn append_cookie_header(response: &mut Response, value: &str) {
 /// Cookie carrying the single-purpose reset token between `POST
 /// /recover` and the `/recover/reset` step. HttpOnly + SameSite=Lax
 /// (so a cross-site POST can't drive the reset), short-lived.
-const RECOVERY_COOKIE_NAME: &str = "hearth_recovery";
+const RECOVERY_COOKIE_NAME: &str = "sylva_recovery";
 
 /// How long a verified recovery grant is good for before the user must
 /// re-enter their code. 10 minutes — enough to pick a password, short
@@ -2716,9 +2716,9 @@ fn recovery_user_id(
 ) -> Option<identity::UserId> {
     let token = read_cookie(headers, RECOVERY_COOKIE_NAME)?;
     let now = chrono::Utc::now().timestamp();
-    hearth::signed_token::verify(
+    server::signed_token::verify(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_RECOVERY_RESET,
+        server::signed_token::PURPOSE_RECOVERY_RESET,
         &token,
         now,
     )
@@ -2732,7 +2732,7 @@ fn recovery_user_id(
 /// Cookie carrying the "password verified, awaiting second factor" token
 /// between `POST /login` and `/login/verify`. Same posture as the
 /// recovery cookie: HttpOnly + SameSite=Lax + short-lived.
-const MFA_COOKIE_NAME: &str = "hearth_mfa";
+const MFA_COOKIE_NAME: &str = "sylva_mfa";
 /// How long the password-verified grant lasts before the user must
 /// re-enter their password. 10 minutes.
 const MFA_PENDING_TTL_SECS: i64 = 600;
@@ -2748,21 +2748,21 @@ fn mfa_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
     }
 }
 
-/// Mint the `hearth_mfa` cookie for a user who passed the password step
+/// Mint the `sylva_mfa` cookie for a user who passed the password step
 /// but still owes a second factor. Used by both web and (indirectly) the
 /// login flow.
 pub(crate) fn mfa_pending_cookie(state: &AppState, user_id: identity::UserId) -> String {
     let expires_at = chrono::Utc::now().timestamp() + MFA_PENDING_TTL_SECS;
-    let token = hearth::signed_token::sign(
+    let token = server::signed_token::sign(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_MFA_PENDING,
+        server::signed_token::PURPOSE_MFA_PENDING,
         user_id.0,
         expires_at,
     );
     mfa_cookie_value(&token, /* clearing = */ false, cookie_secure(state))
 }
 
-/// Resolve the `hearth_mfa` cookie to the pending user, or `None` if it's
+/// Resolve the `sylva_mfa` cookie to the pending user, or `None` if it's
 /// missing / tampered / expired.
 fn mfa_pending_user_id(
     state: &AppState,
@@ -2770,9 +2770,9 @@ fn mfa_pending_user_id(
 ) -> Option<identity::UserId> {
     let token = read_cookie(headers, MFA_COOKIE_NAME)?;
     let now = chrono::Utc::now().timestamp();
-    hearth::signed_token::verify(
+    server::signed_token::verify(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_MFA_PENDING,
+        server::signed_token::PURPOSE_MFA_PENDING,
         &token,
         now,
     )
@@ -2785,7 +2785,7 @@ async fn enrolled_factors(state: &AppState, user_id: identity::UserId) -> (bool,
     let has_totp = auth::user_totp::is_enrolled(&state.db, user_id)
         .await
         .unwrap_or(false);
-    let has_passkey = hearth::webauthn::has_any(&state.db, user_id)
+    let has_passkey = server::webauthn::has_any(&state.db, user_id)
         .await
         .unwrap_or(false);
     (has_totp, has_passkey)
@@ -2794,9 +2794,9 @@ async fn enrolled_factors(state: &AppState, user_id: identity::UserId) -> (bool,
 // ── Step-up reauth ("sudo") grant ─────────────────────────────────────────
 
 /// Cookie carrying the "recently reauthenticated" grant that unlocks
-/// sensitive actions for a short window. Same posture as `hearth_mfa`:
+/// sensitive actions for a short window. Same posture as `sylva_mfa`:
 /// HttpOnly + SameSite=Lax + `Secure` on https + short-lived.
-const SUDO_COOKIE_NAME: &str = "hearth_sudo";
+const SUDO_COOKIE_NAME: &str = "sylva_sudo";
 /// How long a single reauth stays valid before the user must confirm
 /// again. 5 minutes — long enough for a burst of actions, short enough
 /// that a walked-up-to session can't act indefinitely.
@@ -2804,9 +2804,9 @@ const SUDO_TTL_SECS: i64 = 300;
 
 /// Cookie carrying a *critical* reauth grant, minted only by a forced
 /// re-auth and required by irreversible account actions (self anonymize /
-/// delete). Separate from `hearth_sudo` precisely so an ordinary fresh sudo
+/// delete). Separate from `sylva_sudo` precisely so an ordinary fresh sudo
 /// grant can never satisfy these — they must always re-prove a factor.
-const SUDO_CRITICAL_COOKIE_NAME: &str = "hearth_sudo_critical";
+const SUDO_CRITICAL_COOKIE_NAME: &str = "sylva_sudo_critical";
 /// Very short window for the critical grant: just long enough to carry the
 /// user from the re-auth submit to the immediately-following action POST.
 /// The action handler also clears it on use, so it is effectively one-shot.
@@ -2823,26 +2823,26 @@ fn sudo_cookie_value(token: &str, clearing: bool, secure: bool) -> String {
     }
 }
 
-/// Mint the `hearth_sudo` grant for a user who just passed step-up reauth.
+/// Mint the `sylva_sudo` grant for a user who just passed step-up reauth.
 fn sudo_grant_cookie(state: &AppState, user_id: identity::UserId) -> String {
     let expires_at = chrono::Utc::now().timestamp() + SUDO_TTL_SECS;
-    let token = hearth::signed_token::sign(
+    let token = server::signed_token::sign(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_REAUTH,
+        server::signed_token::PURPOSE_REAUTH,
         user_id.0,
         expires_at,
     );
     sudo_cookie_value(&token, /* clearing = */ false, cookie_secure(state))
 }
 
-/// Resolve the `hearth_sudo` cookie to the user it was granted to, or
+/// Resolve the `sylva_sudo` cookie to the user it was granted to, or
 /// `None` if missing / tampered / expired.
 fn sudo_user_id(state: &AppState, headers: &axum::http::HeaderMap) -> Option<identity::UserId> {
     let token = read_cookie(headers, SUDO_COOKIE_NAME)?;
     let now = chrono::Utc::now().timestamp();
-    hearth::signed_token::verify(
+    server::signed_token::verify(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_REAUTH,
+        server::signed_token::PURPOSE_REAUTH,
         &token,
         now,
     )
@@ -2895,13 +2895,13 @@ fn sudo_critical_cookie_value(token: &str, clearing: bool, secure: bool) -> Stri
     }
 }
 
-/// Mint the `hearth_sudo_critical` grant for a user who just passed a
+/// Mint the `sylva_sudo_critical` grant for a user who just passed a
 /// *forced* step-up reauth (one that ignored any existing sudo window).
 fn sudo_critical_grant_cookie(state: &AppState, user_id: identity::UserId) -> String {
     let expires_at = chrono::Utc::now().timestamp() + SUDO_CRITICAL_TTL_SECS;
-    let token = hearth::signed_token::sign(
+    let token = server::signed_token::sign(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_REAUTH_CRITICAL,
+        server::signed_token::PURPOSE_REAUTH_CRITICAL,
         user_id.0,
         expires_at,
     );
@@ -2920,9 +2920,9 @@ fn sudo_critical_user_id(
 ) -> Option<identity::UserId> {
     let token = read_cookie(headers, SUDO_CRITICAL_COOKIE_NAME)?;
     let now = chrono::Utc::now().timestamp();
-    hearth::signed_token::verify(
+    server::signed_token::verify(
         &state.csrf_secret,
-        hearth::signed_token::PURPOSE_REAUTH_CRITICAL,
+        server::signed_token::PURPOSE_REAUTH_CRITICAL,
         &token,
         now,
     )
@@ -2930,7 +2930,7 @@ fn sudo_critical_user_id(
 }
 
 /// Gate an irreversible account action on a fresh *critical* grant for this
-/// exact user. A normal `hearth_sudo` grant — however fresh — does not count
+/// exact user. A normal `sylva_sudo` grant — however fresh — does not count
 /// (different token purpose + cookie), which is what makes these actions
 /// always re-prompt regardless of the 5-minute sudo window.
 #[allow(clippy::result_large_err)]
@@ -2981,11 +2981,11 @@ pub struct LoginVerifyForm {
 /// lands `/me`. Rate-limited per user (`mfa:{id}`).
 pub async fn login_verify_submit(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginVerifyForm>,
 ) -> Response {
-    let user_agent = hearth::rate_limit::user_agent(&headers);
+    let user_agent = server::rate_limit::user_agent(&headers);
     let user_id = match mfa_pending_user_id(&state, &headers) {
         Some(id) => id,
         None => return Redirect::to("/login").into_response(),
@@ -3023,7 +3023,7 @@ pub async fn login_verify_submit(
         let Some(challenge_id) = form.challenge_id else {
             return Redirect::to("/login/verify").into_response();
         };
-        match hearth::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await
+        match server::webauthn::finish_authentication(&state, user_id, challenge_id, assertion).await
         {
             Ok(true) => {
                 return issue_session_after_mfa(
@@ -3164,7 +3164,7 @@ impl MfaFactor {
 
 /// `POST /login/verify/passkey/start` — begin a passkey assertion for the
 /// pending-MFA user. Returns the WebAuthn request options (+ a challenge
-/// id) as JSON for the browser ceremony. Gated by the `hearth_mfa` cookie.
+/// id) as JSON for the browser ceremony. Gated by the `sylva_mfa` cookie.
 pub async fn login_verify_passkey_start(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -3175,7 +3175,7 @@ pub async fn login_verify_passkey_start(
             return (StatusCode::UNAUTHORIZED, "session expired").into_response();
         }
     };
-    match hearth::webauthn::start_authentication(&state, user_id).await {
+    match server::webauthn::start_authentication(&state, user_id).await {
         Ok(Some((challenge_id, options))) => axum::Json(serde_json::json!({
             "challenge_id": challenge_id,
             "options": options,
@@ -3204,7 +3204,7 @@ async fn verify_recovery_code(
 
 /// Issue the real session once the second factor has passed: create the
 /// session, stamp TOTP usage (if that was the factor), audit
-/// `signin_success {mfa}`, set `hearth_session`, clear `hearth_mfa`.
+/// `signin_success {mfa}`, set `sylva_session`, clear `sylva_mfa`.
 async fn issue_session_after_mfa(
     state: &AppState,
     user: &identity::User,
@@ -3312,7 +3312,7 @@ pub async fn recover_page() -> Response {
 /// generic error. Audits `recovery_started` / `recovery_failed`.
 pub async fn recover_submit(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
     Form(form): Form<RecoverForm>,
 ) -> Response {
     let rl_key = format!("recover:{client_ip}");
@@ -3400,9 +3400,9 @@ pub async fn recover_submit(
     match verified {
         Some(user_id) => {
             let expires_at = chrono::Utc::now().timestamp() + RESET_TTL_SECS;
-            let token = hearth::signed_token::sign(
+            let token = server::signed_token::sign(
                 &state.csrf_secret,
-                hearth::signed_token::PURPOSE_RECOVERY_RESET,
+                server::signed_token::PURPOSE_RECOVERY_RESET,
                 user_id.0,
                 expires_at,
             );
@@ -3442,7 +3442,7 @@ pub async fn recover_reset_page(
 /// Audits `recovery_succeeded`.
 pub async fn recover_reset_submit(
     State(state): State<AppState>,
-    hearth::rate_limit::ClientIp(client_ip): hearth::rate_limit::ClientIp,
+    server::rate_limit::ClientIp(client_ip): server::rate_limit::ClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<RecoverResetForm>,
 ) -> Response {
@@ -3487,7 +3487,7 @@ pub async fn recover_reset_submit(
         display_name: user.display_name.clone(),
     };
 
-    let user_agent = hearth::rate_limit::user_agent(&headers);
+    let user_agent = server::rate_limit::user_agent(&headers);
     let result: anyhow::Result<String> = async {
         let mut tx = state.db.begin().await?;
         auth::update_password_hash(&mut tx, user.id, &new_phc).await?;

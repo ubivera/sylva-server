@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 
 type CleanResult<T> = Result<T, Box<dyn Error>>;
 
-const DEFAULT_DATABASE: &str = "hearth";
-const META_SCHEMA: &str = "hearth_meta";
+const DEFAULT_DATABASE: &str = "sylva";
+const META_SCHEMA: &str = "sylva_meta";
 
 fn main() {
     if let Err(err) = run() {
@@ -48,7 +48,7 @@ fn run() -> CleanResult<()> {
             Some(pid) if pid_is_running(pid) => {
                 return Err(format!(
                     "Postgres is running (PID {pid}; lock file {}).\n\
-                     Stop hearth first (Ctrl+C in the server window).",
+                     Stop server first (Ctrl+C in the server window).",
                     pid_file.display()
                 )
                 .into());
@@ -91,7 +91,7 @@ fn run() -> CleanResult<()> {
     reset_database(&pg_dir, &pg_data_dir, DEFAULT_DATABASE)?;
 
     println!();
-    println!("Done. Next `cargo run --bin hearth` re-applies migrations against the fresh database.");
+    println!("Done. Next `cargo run --bin sylva-server` re-applies migrations against the fresh database.");
     Ok(())
 }
 
@@ -211,14 +211,14 @@ mod tests {
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "hearth-clean-test-{}-{label}",
+            "sylva-clean-test-{}-{label}",
             std::process::id()
         ))
     }
 
     #[test]
     fn quote_ident_wraps_and_escapes() {
-        assert_eq!(quote_ident("hearth"), "\"hearth\"");
+        assert_eq!(quote_ident("server"), "\"server\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_ident(""), "\"\"");
     }

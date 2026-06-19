@@ -19,7 +19,7 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     let opts: PgConnectOptions = url
         .parse()
         .with_context(|| format!("parsing postgres url {url}"))?;
-    let opts = opts.options([("search_path", "hearth_meta,public")]);
+    let opts = opts.options([("search_path", "sylva_meta,public")]);
 
     PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)

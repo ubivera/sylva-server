@@ -22,12 +22,12 @@ pub struct AppState {
     pub invitations: InvitationRepository,
     /// Public-facing base URL used when building links inside outbound
     /// emails (e.g., the invitation accept URL). Set from
-    /// `HEARTH_PUBLIC_BASE_URL`; reverse proxies in production override
+    /// `SYLVA_PUBLIC_BASE_URL`; reverse proxies in production override
     /// the default loopback value.
     pub public_base_url: String,
     /// Operator-chosen display name for this instance, shown in the chrome +
     /// page titles. Hot-swappable: seeded at startup from the DB override or
-    /// `HEARTH_INSTANCE_NAME`, and replaced live when an Owner edits it on the
+    /// `SYLVA_INSTANCE_NAME`, and replaced live when an Owner edits it on the
     /// Settings page. Read via `.load()` at use-time.
     pub instance_name: Arc<ArcSwap<String>>,
     /// Shared, hot-swappable notification backend. Same cell the notification
@@ -56,7 +56,7 @@ pub struct AppState {
     /// socket peer. See [`crate::rate_limit`].
     pub trust_proxy: bool,
     /// Cached "instance has been closed" flag (the last user closed their
-    /// account). Seeded from `hearth_meta.instance.closed_at` at startup and
+    /// account). Seeded from `sylva_meta.instance.closed_at` at startup and
     /// flipped when a close empties the instance, so the closed-page
     /// middleware never hits the DB on the hot path. See [`crate::instance`].
     pub instance_closed: Arc<AtomicBool>,

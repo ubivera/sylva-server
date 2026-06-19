@@ -1,4 +1,4 @@
-//! Public server discovery (Hub Phase 2c) — `GET /.well-known/hearth-discovery`.
+//! Public server discovery (Hub Phase 2c) — `GET /.well-known/sylva-discovery`.
 //! Verifies the response is signed by the server identity key over the exact
 //! fields returned, that the identity is stable + nonce-bound, and that the
 //! nonce is length-bounded.
@@ -34,7 +34,7 @@ async fn discovery_is_signed_stable_and_nonce_bound() {
 
     let nonce = "client-nonce-123";
     let resp = app
-        .get(&format!("/.well-known/hearth-discovery?nonce={nonce}"), None)
+        .get(&format!("/.well-known/sylva-discovery?nonce={nonce}"), None)
         .await;
     resp.assert_status(StatusCode::OK);
     let d: Discovery = resp.json();
@@ -52,12 +52,12 @@ async fn discovery_is_signed_stable_and_nonce_bound() {
     let signature = Signature::from_bytes(&sig);
 
     // The signature verifies over the exact fields the server returned.
-    let msg = hearth::discovery::canonical_bytes(&d.nonce, &pk, d.grpc_port, &d.name);
+    let msg = server::discovery::canonical_bytes(&d.nonce, &pk, d.grpc_port, &d.name);
     vk.verify_strict(&msg, &signature)
         .expect("discovery signature verifies");
 
     // Tampering with any covered field breaks verification.
-    let tampered = hearth::discovery::canonical_bytes(&d.nonce, &pk, d.grpc_port, "evil-server");
+    let tampered = server::discovery::canonical_bytes(&d.nonce, &pk, d.grpc_port, "evil-server");
     assert!(
         vk.verify_strict(&tampered, &signature).is_err(),
         "signature must not verify over altered fields"
@@ -66,7 +66,7 @@ async fn discovery_is_signed_stable_and_nonce_bound() {
     // The identity is stable across calls, and the signature is freshly bound
     // to the supplied nonce (so a recorded response can't be replayed).
     let resp2 = app
-        .get("/.well-known/hearth-discovery?nonce=a-different-nonce", None)
+        .get("/.well-known/sylva-discovery?nonce=a-different-nonce", None)
         .await;
     resp2.assert_status(StatusCode::OK);
     let d2: Discovery = resp2.json();
@@ -81,7 +81,7 @@ async fn discovery_is_signed_stable_and_nonce_bound() {
 #[tokio::test]
 async fn discovery_without_a_nonce_is_ok() {
     let app = TestApp::new().await;
-    let resp = app.get("/.well-known/hearth-discovery", None).await;
+    let resp = app.get("/.well-known/sylva-discovery", None).await;
     resp.assert_status(StatusCode::OK);
     let d: Discovery = resp.json();
     assert_eq!(d.nonce, "", "missing nonce defaults to empty");
@@ -89,7 +89,7 @@ async fn discovery_without_a_nonce_is_ok() {
     let pk: [u8; 32] = hex_decode(&d.server_identity_public).try_into().unwrap();
     let sig: [u8; 64] = hex_decode(&d.signature).try_into().unwrap();
     let vk = VerifyingKey::from_bytes(&pk).unwrap();
-    let msg = hearth::discovery::canonical_bytes(&d.nonce, &pk, d.grpc_port, &d.name);
+    let msg = server::discovery::canonical_bytes(&d.nonce, &pk, d.grpc_port, &d.name);
     vk.verify_strict(&msg, &Signature::from_bytes(&sig))
         .expect("empty-nonce response still verifies");
 }
@@ -99,7 +99,7 @@ async fn discovery_rejects_an_overlong_nonce() {
     let app = TestApp::new().await;
     let long = "a".repeat(257);
     let resp = app
-        .get(&format!("/.well-known/hearth-discovery?nonce={long}"), None)
+        .get(&format!("/.well-known/sylva-discovery?nonce={long}"), None)
         .await;
     resp.assert_status(StatusCode::BAD_REQUEST);
 }

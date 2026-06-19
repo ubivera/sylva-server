@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
 };
-use hearth::{app::AppState, csrf};
+use server::{app::AppState, csrf};
 use identity::InstanceRole;
 use serde::Deserialize;
 

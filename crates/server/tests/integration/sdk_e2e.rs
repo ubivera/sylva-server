@@ -4,7 +4,7 @@
 //! storage. Proves the full client crypto + wire path before any UI.
 //!
 //! Gated behind the `e2e` feature so the standard suite never pulls the SDK:
-//!   cargo test -p hearth --features e2e --test integration sdk_e2e
+//!   cargo test -p server --features e2e --test integration sdk_e2e
 
 use sylva_sdk::crypto::KdfParams;
 use sylva_sdk::flows::{self, NewOwner};
@@ -45,7 +45,7 @@ async fn spawn_grpc(app: &TestApp) -> (String, tokio::sync::watch::Sender<bool>)
     (addr.to_string(), tx)
 }
 
-/// Serve Hearth's real HTTP router (which carries `/.well-known/hearth-discovery`)
+/// Serve Hearth's real HTTP router (which carries `/.well-known/sylva-discovery`)
 /// on an ephemeral port; returns the base URL + the server task handle.
 async fn spawn_http(app: &TestApp) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -67,7 +67,7 @@ async fn sdk_discovers_and_verifies_the_real_server() {
 
     // It recovered the server's actual identity key (the one TestApp generated).
     let (stored,): (Option<Vec<u8>>, ) = sqlx::query_as(
-        "SELECT server_identity_public FROM hearth_meta.instance WHERE id = TRUE",
+        "SELECT server_identity_public FROM sylva_meta.instance WHERE id = TRUE",
     )
     .fetch_one(&app.pool)
     .await

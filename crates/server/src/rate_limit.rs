@@ -4,15 +4,15 @@
 //!
 //! The token-bucket limiter itself now lives in [`auth::ratelimit`] — shared
 //! with the gRPC `Account` service (`Bootstrap` / `Login`), which can't depend
-//! on `hearth`. It's re-exported here so existing `rate_limit::RateLimiter`
+//! on `server`. It's re-exported here so existing `rate_limit::RateLimiter`
 //! call-sites keep working unchanged.
 //!
 //! Keying is by client IP. **By default the socket peer IP is used and
 //! forwarding headers are ignored** — a client could otherwise spoof
 //! `X-Forwarded-For` to mint a fresh bucket per request and defeat the limit
 //! entirely. Operators behind a reverse proxy (the standard https topology) set
-//! `HEARTH_TRUST_PROXY=1`, which switches keying to the first `X-Forwarded-For`
-//! / `X-Real-IP` hop the proxy sets. See `hearth-recovery.md`.
+//! `SYLVA_TRUST_PROXY=1`, which switches keying to the first `X-Forwarded-For`
+//! / `X-Real-IP` hop the proxy sets. See `server-recovery.md`.
 
 use std::net::{IpAddr, SocketAddr};
 

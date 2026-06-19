@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::common::TestApp;
 
-/// POST `/login` (form-encoded) and return the `hearth_session=<token>` cookie.
+/// POST `/login` (form-encoded) and return the `sylva_session=<token>` cookie.
 async fn web_login(app: &TestApp, email: &str, password: &str) -> String {
     let body = format!("email={}&password={}", enc(email), enc(password));
     let req = axum::http::Request::builder()
@@ -178,7 +178,7 @@ fn location(resp: &axum::response::Response) -> String {
         .to_string()
 }
 
-/// POST a reauth-gated app action: mints a `hearth_sudo` grant from the
+/// POST a reauth-gated app action: mints a `sylva_sudo` grant from the
 /// password (as the reauth chain does in the browser) and attaches it.
 async fn post_action(
     app: &TestApp,

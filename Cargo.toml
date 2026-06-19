@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/audit", "crates/auth", "crates/authz", "crates/bootstrap", "crates/clean", "crates/hearth", "crates/hearth-server", "crates/identity", "crates/notifications", "crates/pending", "crates/platform", "crates/proto", "crates/provision", "crates/web"]
+members = ["crates/audit", "crates/auth", "crates/authz", "crates/bootstrap", "crates/clean", "crates/server", "crates/sylva-server", "crates/identity", "crates/notifications", "crates/pending", "crates/platform", "crates/proto", "crates/provision", "crates/web"]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
 authors = ["Ubivera, LLC"]
 license = "UNLICENSED"
-repository = "https://github.com/ubivera/sylva-hearth"
+repository = "https://github.com/ubivera/sylva-server"
 
 [workspace.dependencies]
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "process"] }

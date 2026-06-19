@@ -17,14 +17,14 @@ const POSTGRES_VERSION: &str = "18.3";
 const EXPECTED_SHA256: &str = "d5e16a9317216731c0e564ab63fca7c049fd7e2f727a28628cb649207748129c";
 
 const DEFAULT_PORT: u16 = 15432;
-const DEFAULT_SUPERUSER: &str = "hearth";
-const DEFAULT_DATABASE: &str = "hearth";
+const DEFAULT_SUPERUSER: &str = "sylva";
+const DEFAULT_DATABASE: &str = "sylva";
 
-/// Dedicated schema for hearth-internal infrastructure tables (notably
+/// Dedicated schema for sylva-internal infrastructure tables (notably
 /// sqlx's `_sqlx_migrations`). Created at bootstrap time so the schema
-/// always exists by the time hearth makes its first connection - sqlx
+/// always exists by the time server makes its first connection - sqlx
 /// can't create it via a migration without a chicken-and-egg problem.
-const META_SCHEMA: &str = "hearth_meta";
+const META_SCHEMA: &str = "sylva_meta";
 
 const KEEP_EXECUTABLES: &[&str] = &["postgres.exe", "initdb.exe", "pg_ctl.exe"];
 
@@ -78,7 +78,7 @@ fn run() -> SetupResult<()> {
         eprintln!("  data:     {}", pg_data_dir.display());
         eprintln!();
         eprintln!("Delete both directories to re-run setup, or just");
-        eprintln!("`cargo run --bin hearth` to use the existing install.");
+        eprintln!("`cargo run --bin sylva-server` to use the existing install.");
         return Ok(());
     }
 
@@ -86,7 +86,7 @@ fn run() -> SetupResult<()> {
         .map_err(|e| format!("creating {}: {e}", data_dir.display()))?;
 
     let temp_dir = std::env::temp_dir().join(format!(
-        "hearth-bootstrap-{}",
+        "sylva-bootstrap-{}",
         std::process::id()
     ));
     fs::create_dir_all(&temp_dir)
@@ -171,7 +171,7 @@ fn run() -> SetupResult<()> {
     eprintln!("  Database:          {DEFAULT_DATABASE}");
     eprintln!("  Meta schema:       {META_SCHEMA}");
     eprintln!();
-    eprintln!("Run `cargo run --bin hearth` to start the server.");
+    eprintln!("Run `cargo run --bin sylva-server` to start the server.");
 
     Ok(())
 }
@@ -379,7 +379,7 @@ fn create_database(pg_dir: &Path, data_dir: &Path, db_name: &str) -> SetupResult
 }
 
 /// Creates the dedicated meta schema inside the application database. Runs
-/// in single-user mode against the just-created `hearth` database (not
+/// in single-user mode against the just-created `server` database (not
 /// `postgres`), so the schema lives in the right place.
 fn create_meta_schema(
     pg_dir: &Path,
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn quote_ident_wraps_simple_name() {
-        assert_eq!(quote_ident("hearth"), "\"hearth\"");
+        assert_eq!(quote_ident("server"), "\"server\"");
     }
 
     #[test]
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn directory_size_counts_nested_files() {
         let tmp = std::env::temp_dir()
-            .join(format!("hearth-bootstrap-test-dirsize-{}", std::process::id()));
+            .join(format!("sylva-bootstrap-test-dirsize-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("nested")).unwrap();
         fs::write(tmp.join("a.txt"), b"1234567890").unwrap();

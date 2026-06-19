@@ -69,7 +69,7 @@ async fn login_post_with_valid_creds_redirects_and_sets_cookie() {
     let set_cookie = web_login(&app, "owner@test.local", OWNER_PW)
         .await
         .expect("login should succeed");
-    assert!(set_cookie.starts_with("hearth_session="));
+    assert!(set_cookie.starts_with("sylva_session="));
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Lax"));
 }
@@ -776,7 +776,7 @@ async fn root_redirects_based_on_auth() {
 
 #[tokio::test]
 async fn cookie_auth_works_on_json_api_routes() {
-    // The Authorization header + `hearth_session` cookie should both
+    // The Authorization header + `sylva_session` cookie should both
     // satisfy the AuthenticatedUser extractor. This proves the cookie
     // fallback doesn't only work on web routes — the API surface is
     // also usable from a browser session if you ever want to.
@@ -1436,7 +1436,7 @@ async fn me_email_submit_changes_email_with_correct_password() {
     let sudo = app.sudo_cookie(&cookie, &csrf, "rightpw").await;
 
     // The settings email form posts through the reauth chain; success
-    // returns 200 with `HX-Redirect: /me` + a hearth-toast trigger.
+    // returns 200 with `HX-Redirect: /me` + a sylva-toast trigger.
     let body = format!(
         "csrf_token={}&email={}",
         urlencoding(&csrf),
@@ -1493,7 +1493,7 @@ async fn me_email_submit_changes_email_with_correct_password() {
 
 /// A wrong password at the step-up gate (`POST /me/reauth`) re-renders
 /// the modal with an error and mints **no** grant — so the email-change
-/// action can't proceed (no `hearth_sudo` cookie). DB unchanged.
+/// action can't proceed (no `sylva_sudo` cookie). DB unchanged.
 #[tokio::test]
 async fn me_email_submit_rejects_wrong_password() {
     let app = TestApp::new().await;
@@ -1520,7 +1520,7 @@ async fn me_email_submit_rejects_wrong_password() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(
-        set_cookie_value(resp.headers(), "hearth_sudo").is_none(),
+        set_cookie_value(resp.headers(), "sylva_sudo").is_none(),
         "wrong password must not mint a sudo grant"
     );
     let body = String::from_utf8_lossy(
@@ -2070,7 +2070,7 @@ async fn reauth_password_alone_rejected_when_totp_enrolled() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(
-        set_cookie_value(resp.headers(), "hearth_sudo").is_none(),
+        set_cookie_value(resp.headers(), "sylva_sudo").is_none(),
         "password alone must not mint a grant when TOTP is enrolled"
     );
 }
@@ -2146,10 +2146,10 @@ async fn recover_full_flow_resets_password_and_rotates_code() {
         resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
         Some("/recover/reset")
     );
-    let reset_token = set_cookie_value(resp.headers(), "hearth_recovery")
+    let reset_token = set_cookie_value(resp.headers(), "sylva_recovery")
         .expect("recover should set the reset cookie");
     assert!(!reset_token.is_empty());
-    let reset_cookie = format!("hearth_recovery={reset_token}");
+    let reset_cookie = format!("sylva_recovery={reset_token}");
 
     // Step 2: GET /recover/reset with the cookie renders the form.
     let (status, reset_form) = get_with_cookie(&app, "/recover/reset", Some(&reset_cookie)).await;
@@ -2174,7 +2174,7 @@ async fn recover_full_flow_resets_password_and_rotates_code() {
     let resp_headers = resp.headers().clone();
     // A fresh session is issued for this device.
     assert!(
-        set_cookie_value(&resp_headers, "hearth_session").is_some(),
+        set_cookie_value(&resp_headers, "sylva_session").is_some(),
         "reset should log the device in"
     );
     let reset_body = String::from_utf8_lossy(
@@ -2247,7 +2247,7 @@ async fn recover_wrong_code_is_generic_and_sets_no_cookie() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(set_cookie_value(resp.headers(), "hearth_recovery").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_recovery").is_none());
     let body = String::from_utf8_lossy(
         &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
     )
@@ -2280,7 +2280,7 @@ async fn recover_unknown_email_is_generic() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(set_cookie_value(resp.headers(), "hearth_recovery").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_recovery").is_none());
     let body = String::from_utf8_lossy(
         &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
     )
@@ -2315,7 +2315,7 @@ async fn recover_reset_without_cookie_redirects_to_recover() {
 async fn recover_reset_with_garbage_cookie_redirects() {
     let app = TestApp::new().await;
     let (status, _) =
-        get_with_cookie(&app, "/recover/reset", Some("hearth_recovery=not-a-valid-token")).await;
+        get_with_cookie(&app, "/recover/reset", Some("sylva_recovery=not-a-valid-token")).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 }
 
@@ -2347,8 +2347,8 @@ async fn recover_reset_password_mismatch_rerenders() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let reset_cookie = format!(
-        "hearth_recovery={}",
-        set_cookie_value(resp.headers(), "hearth_recovery").unwrap()
+        "sylva_recovery={}",
+        set_cookie_value(resp.headers(), "sylva_recovery").unwrap()
     );
 
     let body = "new_password=abcdefgh&confirm_password=DIFFERENT";
@@ -2394,7 +2394,7 @@ async fn post_form_with_ip(app: &TestApp, uri: &str, ip: &str, body: String) -> 
 #[tokio::test]
 async fn recover_is_rate_limited_per_ip() {
     let app = TestApp::new().await;
-    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let burst = server::rate_limit::DEFAULT_AUTH_BURST;
     let body = || {
         format!(
             "email={}&recovery_code={}",
@@ -2426,7 +2426,7 @@ async fn recover_is_rate_limited_per_ip() {
 #[tokio::test]
 async fn login_is_rate_limited_per_ip() {
     let app = TestApp::new().await;
-    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let burst = server::rate_limit::DEFAULT_AUTH_BURST;
     let body = || {
         format!(
             "email={}&password={}",
@@ -2454,7 +2454,7 @@ async fn successful_login_does_not_consume_rate_budget() {
     let app = TestApp::new().await;
     app.seed_user("good@test.local", "Good", "rightpw", InstanceRole::Member)
         .await;
-    let burst = hearth::rate_limit::DEFAULT_AUTH_BURST;
+    let burst = server::rate_limit::DEFAULT_AUTH_BURST;
     for _ in 0..(burst + 2) {
         let ok = format!(
             "email={}&password={}",
@@ -2543,7 +2543,7 @@ async fn security_tab_lists_enrolled_authenticators() {
 }
 
 /// Drive the full password → TOTP challenge → session flow and return
-/// the resulting `hearth_session` cookie (name=value).
+/// the resulting `sylva_session` cookie (name=value).
 async fn totp_login(app: &TestApp, email: &str, password: &str) -> String {
     // Step 1: password.
     let body = format!("email={}&password={}", urlencoding(email), urlencoding(password));
@@ -2556,8 +2556,8 @@ async fn totp_login(app: &TestApp, email: &str, password: &str) -> String {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let mfa_cookie = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").expect("mfa cookie")
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").expect("mfa cookie")
     );
     // Step 2: TOTP code.
     let body = format!("code={}", urlencoding(&current_totp_code()));
@@ -2571,8 +2571,8 @@ async fn totp_login(app: &TestApp, email: &str, password: &str) -> String {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     format!(
-        "hearth_session={}",
-        set_cookie_value(resp.headers(), "hearth_session").expect("session cookie")
+        "sylva_session={}",
+        set_cookie_value(resp.headers(), "sylva_session").expect("session cookie")
     )
 }
 
@@ -2598,8 +2598,8 @@ async fn login_with_totp_enrolled_defers_session() {
         Some("/login/verify")
     );
     // No real session yet — only the pending-MFA cookie.
-    assert!(set_cookie_value(resp.headers(), "hearth_mfa").is_some());
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_mfa").is_some());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_none());
 }
 
 #[tokio::test]
@@ -2625,8 +2625,8 @@ async fn totp_code_is_single_use() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let mfa1 = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").expect("mfa cookie")
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").expect("mfa cookie")
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
@@ -2637,7 +2637,7 @@ async fn totp_code_is_single_use() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_some());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_some());
 
     // Second sign-in: replaying the same code on a fresh challenge is
     // rejected — TOTP codes are single-use within their window.
@@ -2653,8 +2653,8 @@ async fn totp_code_is_single_use() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let mfa2 = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").expect("mfa cookie")
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").expect("mfa cookie")
     );
     let req = axum::http::Request::builder()
         .method(Method::POST)
@@ -2665,7 +2665,7 @@ async fn totp_code_is_single_use() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK); // re-rendered challenge, not a redirect
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_none());
 }
 
 #[tokio::test]
@@ -2712,8 +2712,8 @@ async fn login_verify_rejects_wrong_totp() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let mfa_cookie = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").unwrap()
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").unwrap()
     );
 
     let req = axum::http::Request::builder()
@@ -2726,7 +2726,7 @@ async fn login_verify_rejects_wrong_totp() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     // Re-render (200), no session issued.
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_none());
 
     let (failed,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM audit.events WHERE event_type = 'mfa_failed' AND actor_user_id = $1",
@@ -2764,8 +2764,8 @@ async fn login_verify_recovery_code_bypasses_totp() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let mfa_cookie = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").unwrap()
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").unwrap()
     );
 
     // Recovery code instead of TOTP → session issued.
@@ -2779,7 +2779,7 @@ async fn login_verify_recovery_code_bypasses_totp() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_some());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_some());
 }
 
 #[tokio::test]
@@ -2886,7 +2886,7 @@ async fn totp_rename_updates_label() {
     assert_eq!(creds[0].label, "New Name");
 }
 
-/// Removing an authenticator is reauth-gated: without a fresh `hearth_sudo`
+/// Removing an authenticator is reauth-gated: without a fresh `sylva_sudo`
 /// grant the action is refused (a stolen session can't strip 2FA), and both
 /// authenticators remain. This is the regression test for the step-up hole.
 #[tokio::test]
@@ -2901,7 +2901,7 @@ async fn totp_delete_without_grant_refused() {
     let session_id = app.session_id_for_cookie(&session).await;
     let csrf = app.csrf_for(session_id);
 
-    // No hearth_sudo cookie attached → refused.
+    // No sylva_sudo cookie attached → refused.
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(format!("/me/totp/{drop}/delete"))
@@ -2949,8 +2949,8 @@ async fn totp_delete_removes_one_of_several() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let sudo = format!(
-        "hearth_sudo={}",
-        set_cookie_value(resp.headers(), "hearth_sudo").expect("reauth should mint a grant")
+        "sylva_sudo={}",
+        set_cookie_value(resp.headers(), "sylva_sudo").expect("reauth should mint a grant")
     );
 
     let body = format!("csrf_token={}", urlencoding(&csrf));
@@ -2999,8 +2999,8 @@ async fn login_verify_tries_all_authenticators() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     let mfa_cookie = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").unwrap()
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").unwrap()
     );
 
     // Submit a code from the SECOND authenticator — the loop must find it.
@@ -3014,7 +3014,7 @@ async fn login_verify_tries_all_authenticators() {
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_some());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_some());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3060,7 +3060,7 @@ async fn passkey_section_renders_for_authed_user() {
 
 /// Removing a passkey is reauth-gated too. Minting a passkey grant needs
 /// the WebAuthn ceremony (browser-only), so this covers the security-
-/// critical half: without a fresh `hearth_sudo` grant the removal is
+/// critical half: without a fresh `sylva_sudo` grant the removal is
 /// refused and the passkey stays. We grab the session *before* enrolling
 /// the passkey so login doesn't defer to the 2FA challenge.
 #[tokio::test]
@@ -3092,7 +3092,7 @@ async fn passkey_delete_without_grant_refused() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // The passkey is still there.
-    assert_eq!(hearth::webauthn::count(&app.pool, user.id).await.unwrap(), 1);
+    assert_eq!(server::webauthn::count(&app.pool, user.id).await.unwrap(), 1);
 }
 
 /// Insert a placeholder passkey row. The login-gating + page-rendering
@@ -3133,10 +3133,10 @@ async fn login_with_passkey_only_defers_session() {
         Some("/login/verify")
     );
     let mfa_cookie = format!(
-        "hearth_mfa={}",
-        set_cookie_value(resp.headers(), "hearth_mfa").expect("pending cookie")
+        "sylva_mfa={}",
+        set_cookie_value(resp.headers(), "sylva_mfa").expect("pending cookie")
     );
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_none());
 
     // The challenge page offers the passkey path.
     let (status, body) = get_with_cookie(&app, "/login/verify", Some(&mfa_cookie)).await;
@@ -3145,7 +3145,7 @@ async fn login_with_passkey_only_defers_session() {
     assert!(body.contains(r#"data-passkey-auth="/login/verify/passkey/start""#));
     // The ceremony JS must be loaded on this public page, or the button
     // is dead (regression guard: WEBAUTHN_JS belongs in shell_public).
-    assert!(body.contains("__hearthWebauthnLoaded"));
+    assert!(body.contains("__sylvaWebauthnLoaded"));
 }
 
 #[tokio::test]
@@ -3172,7 +3172,7 @@ async fn login_page_shows_passwordless_passkey_button() {
     assert!(body.contains("Sign in with a passkey"));
     assert!(body.contains(r#"data-passkey-auth="/login/passkey/start""#));
     // The ceremony JS must be present on the public page.
-    assert!(body.contains("__hearthWebauthnLoaded"));
+    assert!(body.contains("__sylvaWebauthnLoaded"));
 }
 
 #[tokio::test]
@@ -3211,7 +3211,7 @@ async fn login_passkey_finish_rejects_bad_assertion() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     // Re-renders the login page with an error; no session is issued.
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(set_cookie_value(resp.headers(), "hearth_session").is_none());
+    assert!(set_cookie_value(resp.headers(), "sylva_session").is_none());
 }
 
 // ── Self-service account closure (anonymize / delete) ─────────────────────
@@ -3584,7 +3584,7 @@ async fn table_count(app: &TestApp, table: &str) -> i64 {
 }
 
 async fn instance_closed(app: &TestApp) -> bool {
-    sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM hearth_meta.instance WHERE id = TRUE")
+    sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM sylva_meta.instance WHERE id = TRUE")
         .fetch_one(&app.pool)
         .await
         .unwrap()
@@ -3719,7 +3719,7 @@ async fn scalar_i64(app: &TestApp, sql: &str) -> i64 {
 }
 
 async fn instance_closed_at(app: &TestApp) -> Option<chrono::DateTime<chrono::Utc>> {
-    sqlx::query_scalar("SELECT closed_at FROM hearth_meta.instance WHERE id = TRUE")
+    sqlx::query_scalar("SELECT closed_at FROM sylva_meta.instance WHERE id = TRUE")
         .fetch_one(&app.pool)
         .await
         .unwrap()
@@ -3751,7 +3751,7 @@ async fn solo_delete_closes_and_scorches_the_instance() {
     assert_eq!(scalar_i64(&app, "SELECT count(*) FROM identity.users").await, 0, "users");
     assert_eq!(scalar_i64(&app, "SELECT count(*) FROM auth.credentials").await, 0, "credentials");
     assert_eq!(scalar_i64(&app, "SELECT count(*) FROM audit.events").await, 0, "audit scorched");
-    // The closed flag is set and survived the scorch (it's in hearth_meta).
+    // The closed flag is set and survived the scorch (it's in sylva_meta).
     assert!(instance_closed_at(&app).await.is_some(), "instance marked closed");
     // Any subsequent web route serves the closed page; assets still serve.
     let (status, body) = get_with_cookie(&app, "/login", None).await;
