@@ -64,7 +64,7 @@ fn form_field(body: &str, key: &str) -> Option<String> {
 }
 
 /// Mint a step-up sudo grant by POSTing the body's password+csrf to
-/// `/me/reauth` (the no-2FA path), returning the `hearth_sudo=…` cookie
+/// `/me/reauth` (the no-2FA path), returning the `sylva_sudo=…` cookie
 /// pair on success. Reauth-gated actions are now authorized by this grant
 /// rather than a password in the action body.
 async fn mint_sudo_cookie(app: &TestApp, cookie: &str, body: &str) -> Option<String> {
@@ -82,7 +82,7 @@ async fn mint_sudo_cookie(app: &TestApp, cookie: &str, body: &str) -> Option<Str
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     for v in resp.headers().get_all(header::SET_COOKIE) {
         if let Ok(s) = v.to_str()
-            && s.starts_with("hearth_sudo=")
+            && s.starts_with("sylva_sudo=")
         {
             return Some(cookie_name_value(s));
         }
@@ -92,7 +92,7 @@ async fn mint_sudo_cookie(app: &TestApp, cookie: &str, body: &str) -> Option<Str
 
 /// POST a form to `path` with the given cookie + form body. For
 /// reauth-gated actions the body still carries the operator password
-/// (legacy shape); we transparently mint a `hearth_sudo` grant from it
+/// (legacy shape); we transparently mint a `sylva_sudo` grant from it
 /// and attach the cookie, so the action's `require_sudo` check passes.
 async fn post_form(
     app: &TestApp,
@@ -123,12 +123,12 @@ fn location(resp: &axum::response::Response) -> String {
 }
 
 /// Parse the `HX-Trigger` response header into the toast payload it
-/// carries (under the `hearth-toast` key). Returns `None` when the
+/// carries (under the `sylva-toast` key). Returns `None` when the
 /// header isn't present or the payload isn't shaped as expected.
 fn hx_trigger_toast(resp: &axum::response::Response) -> Option<serde_json::Value> {
     let raw = resp.headers().get("hx-trigger")?.to_str().ok()?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
-    parsed.get("hearth-toast").cloned()
+    parsed.get("sylva-toast").cloned()
 }
 
 fn hx_redirect(resp: &axum::response::Response) -> String {
@@ -509,7 +509,7 @@ async fn anonymize_with_grant_htmx_responds_with_hx_redirect() {
     // carrying the toast payload that the client renders post-redirect.
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(hx_redirect(&resp), "/members");
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "error");
     assert_eq!(toast["title"], "Account anonymized");
 
@@ -757,7 +757,7 @@ async fn htmx_deactivate_emits_info_toast_via_hx_trigger() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(hx_redirect(&resp), "/members");
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "info");
     assert_eq!(toast["title"], "Deactivated");
     assert!(
@@ -800,7 +800,7 @@ async fn htmx_reactivate_emits_success_toast() {
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "success");
     assert_eq!(toast["title"], "Reactivated");
 }
@@ -831,7 +831,7 @@ async fn htmx_delete_emits_error_toast() {
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "error");
     assert_eq!(toast["title"], "Account deleted");
 }
@@ -864,7 +864,7 @@ async fn htmx_failed_action_emits_error_toast() {
         )))
         .unwrap();
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "error");
     assert!(
         toast["message"]
@@ -1228,7 +1228,7 @@ async fn accept_invite_submit_creates_account_and_sets_session_cookie() {
         .get(header::SET_COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap();
-    assert!(set_cookie.starts_with("hearth_session="));
+    assert!(set_cookie.starts_with("sylva_session="));
     assert!(set_cookie.contains("HttpOnly"));
 
     let body = body_text(resp).await;
@@ -1613,7 +1613,7 @@ async fn shared_modals_not_baked_into_live_dom() {
     );
     // The fetch helper is exposed for the on-demand open + reauth chain.
     assert!(
-        body.contains("hearthOpenModal"),
+        body.contains("sylvaOpenModal"),
         "DIALOG_JS must expose the on-demand open helper"
     );
     // Invite modal is on-demand — no template, no live dialog.
@@ -1772,7 +1772,7 @@ async fn revoke_invite_with_correct_password_htmx_responds_with_hx_redirect() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(hx_redirect(&resp), "/members");
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "info");
     assert_eq!(toast["title"], "Invitation revoked");
 
@@ -2312,7 +2312,7 @@ async fn pending_veto_with_correct_password_htmx_responds_with_hx_redirect() {
     let resp = tower::ServiceExt::oneshot(app.router.clone(), req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(hx_redirect(&resp), "/pending");
-    let toast = hx_trigger_toast(&resp).expect("expected hearth-toast payload");
+    let toast = hx_trigger_toast(&resp).expect("expected sylva-toast payload");
     assert_eq!(toast["kind"], "success");
     assert_eq!(toast["title"], "Action vetoed");
 

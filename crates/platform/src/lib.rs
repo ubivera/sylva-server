@@ -7,7 +7,7 @@
 //! enabled app via `app_id`. Sharing/ReBAC + a sync stream are later checkpoints.
 //!
 //! Deliberately depends only on `proto`, `auth`, and `identity` — never on the
-//! `hearth` crate — so the dependency graph stays `hearth → platform → proto`
+//! `server` crate — so the dependency graph stays `server → platform → proto`
 //! with no cycle. The gRPC server is handed a [`PlatformContext`] built from the
 //! same repositories the REST layer uses.
 
@@ -483,7 +483,7 @@ fn app_to_proto(row: registry::RegisteredAppRow) -> AppRegistration {
 }
 
 /// Serve the gRPC API on an already-bound `listener` until `shutdown` resolves.
-/// Taking a pre-bound listener lets the caller (`hearth::serve`, and tests on
+/// Taking a pre-bound listener lets the caller (`server::serve`, and tests on
 /// port 0) control binding and learn the assigned port.
 pub async fn serve_grpc(
     ctx: PlatformContext,

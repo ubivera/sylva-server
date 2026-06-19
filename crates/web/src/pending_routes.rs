@@ -4,7 +4,7 @@ use axum::{
     http::HeaderMap,
     response::{Html, IntoResponse, Response},
 };
-use hearth::{admin_logic, app::AppState, csrf};
+use server::{admin_logic, app::AppState, csrf};
 use identity::InstanceRole;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -148,7 +148,7 @@ pub async fn veto_pending(
     // Re-use the AdminUser wrapper because `perform_veto_pending`
     // takes it (Owners satisfy the Admin gate). The wrapper carries
     // the session id + user so audit attribution lines up.
-    let admin = hearth::auth_routes::AdminUser(auth);
+    let admin = server::auth_routes::AdminUser(auth);
     let htmx = is_htmx(&headers);
     if let Err(resp) =
         crate::routes::require_sudo(&state, &headers, admin.0.user.id)

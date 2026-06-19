@@ -18,7 +18,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use hearth::{app::AppState, csrf};
+use server::{app::AppState, csrf};
 use identity::InstanceRole;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Reauth-gated action form: carries only the CSRF token. The action is
-/// authorized by the short-lived `hearth_sudo` grant (checked via
+/// authorized by the short-lived `sylva_sudo` grant (checked via
 /// `require_sudo`); the reauth chain strips any password before submitting.
 #[derive(Deserialize)]
 pub struct AppActionForm {
@@ -192,7 +192,7 @@ pub async fn uninstall_app(
 }
 
 /// Build the audit actor from the authenticated owner.
-fn actor_of(auth: &hearth::auth_routes::AuthenticatedUser) -> audit::Actor {
+fn actor_of(auth: &server::auth_routes::AuthenticatedUser) -> audit::Actor {
     audit::Actor {
         user_id: auth.user.id,
         display_name: auth.user.display_name.clone(),

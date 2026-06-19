@@ -1,3 +1,3 @@
 fn main() -> anyhow::Result<()> {
-    hearth::run(web::ui_router)
+    server::run(web::ui_router)
 }

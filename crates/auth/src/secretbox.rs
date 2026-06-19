@@ -5,7 +5,7 @@
 //!
 //! XChaCha20-Poly1305 with a random 192-bit nonce prepended to the
 //! ciphertext: `nonce(24) || ciphertext+tag`. The key is the persistent
-//! per-instance server key (hearth's `secret_key`), which — unlike the
+//! per-instance server key (server's `secret_key`), which — unlike the
 //! per-process CSRF secret — survives restarts so sealed data stays
 //! readable.
 

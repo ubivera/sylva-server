@@ -30,21 +30,21 @@ pub(crate) fn redirect_or_hx_redirect(url: &str, htmx: bool) -> Response {
     }
 }
 
-/// Attach a `hearth-toast` HX-Trigger event to a response so the
+/// Attach a `sylva-toast` HX-Trigger event to a response so the
 /// client-side toast system (see `TOAST_JS`) buffers + renders it
 /// across the HX-Redirect navigation that usually accompanies these
 /// handlers. Non-HTMX responses pass through unchanged — the modal
 /// flow requires JS anyway, so a JS-disabled caller wouldn't be
 /// hitting these endpoints in the first place.
 ///
-/// HX-Trigger value is `{"hearth-toast": {kind, title, message}}`;
+/// HX-Trigger value is `{"sylva-toast": {kind, title, message}}`;
 /// the client parses the JSON and dispatches the event with the
 /// payload as `event.detail`.
 pub(crate) fn with_toast(mut response: Response, toast: Option<views::Toast>) -> Response {
     let Some(t) = toast else {
         return response;
     };
-    let payload = serde_json::json!({ "hearth-toast": t });
+    let payload = serde_json::json!({ "sylva-toast": t });
     if let Ok(json) = serde_json::to_string(&payload)
         && let Ok(v) = axum::http::HeaderValue::from_str(&json)
     {
@@ -73,7 +73,7 @@ pub(crate) fn redirect_with_error_toast(url: &str, htmx: bool, error_code: &str)
     with_toast(redirect_or_hx_redirect(url, htmx), toast)
 }
 
-use hearth::{
+use server::{
     admin_logic::{self, CreateInviteError, LifecycleError, Outcome, RevokeInviteError, RoleError},
     app::AppState,
     csrf,
@@ -88,7 +88,7 @@ use crate::{
 };
 
 // Reauth-gated forms carry no password: the action is authorized by the
-// short-lived `hearth_sudo` grant (minted at POST /me/reauth), checked via
+// short-lived `sylva_sudo` grant (minted at POST /me/reauth), checked via
 // `require_sudo`. The chain strips any password before submitting.
 #[derive(Deserialize)]
 pub struct LifecycleActionForm {
@@ -675,7 +675,7 @@ pub async fn reissue_invitation(
 // On-demand modal fragments
 //
 // Every modal on the admin surface is fetched when opened and removed
-// on close (see `DIALOG_JS` / `hearthOpenModal`); none ship in the page
+// on close (see `DIALOG_JS` / `sylvaOpenModal`); none ship in the page
 // source. These GET endpoints return the bare `<dialog>` markup. They
 // reuse the same authz the kebab uses to decide what to render, so a
 // direct GET for a forbidden action 403s rather than handing back a

@@ -13,7 +13,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Filename for the captured postgres stderr log (lives inside the cluster's
-/// data directory; truncated on every hearth startup so the tail is always
+/// data directory; truncated on every server startup so the tail is always
 /// from the current run).
 const STDERR_LOG_FILENAME: &str = "postgres.stderr.log";
 
@@ -200,7 +200,7 @@ mod tests {
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "hearth-postgres-test-{}-{label}",
+            "server-postgres-test-{}-{label}",
             std::process::id()
         ))
     }

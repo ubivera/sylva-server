@@ -1,4 +1,4 @@
-//! Instance lifecycle — the `hearth_meta.instance` singleton + the
+//! Instance lifecycle — the `sylva_meta.instance` singleton + the
 //! "scorch on the last user out" teardown.
 //!
 //! When the last active user closes their account, the instance is **closed**:
@@ -9,7 +9,7 @@
 //! the instance level, audit log included. A self-**Anonymize** closes without
 //! scorching, keeping the tombstone the user chose to leave behind.
 //!
-//! The closed flag lives in `hearth_meta` (not a data schema), so it survives
+//! The closed flag lives in `sylva_meta` (not a data schema), so it survives
 //! the scorch. Only `clean` (DROP DATABASE) clears it.
 
 use sqlx::PgPool;
@@ -34,18 +34,18 @@ const SCORCH_SQL: &str = "TRUNCATE \
 /// should always exist; a missing row is treated as open.
 pub async fn load_closed(db: &PgPool) -> anyhow::Result<bool> {
     let closed: Option<Option<chrono::DateTime<chrono::Utc>>> =
-        sqlx::query_scalar("SELECT closed_at FROM hearth_meta.instance WHERE id = TRUE")
+        sqlx::query_scalar("SELECT closed_at FROM sylva_meta.instance WHERE id = TRUE")
             .fetch_optional(db)
             .await?;
     Ok(matches!(closed, Some(Some(_))))
 }
 
 /// Mark the instance closed; when `scorch`, also wipe every data table (audit
-/// log included) in the same transaction. `hearth_meta.instance` is in a
+/// log included) in the same transaction. `sylva_meta.instance` is in a
 /// different schema, so the flag it just set survives the `TRUNCATE`.
 pub async fn close(db: &PgPool, scorch: bool) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
-    sqlx::query("UPDATE hearth_meta.instance SET closed_at = now() WHERE id = TRUE")
+    sqlx::query("UPDATE sylva_meta.instance SET closed_at = now() WHERE id = TRUE")
         .execute(&mut *tx)
         .await?;
     if scorch {
@@ -59,7 +59,7 @@ pub async fn close(db: &PgPool, scorch: bool) -> anyhow::Result<()> {
 //
 // The Ed25519 keypair native clients (Sylva Hub) TOFU-pin as the server's
 // durable trust anchor — stable across cert rotation and multiple endpoints
-// (see docs/design/hub.md). It lives on the scorch-surviving `hearth_meta`
+// (see docs/design/hub.md). It lives on the scorch-surviving `sylva_meta`
 // singleton so the server keeps its identity across a close/reopen; the private
 // key is sealed with the instance `secret_key` (XChaCha20-Poly1305), exactly
 // like `smtp_password_enc`. The server signs discovery responses with it.
@@ -84,7 +84,7 @@ pub async fn ensure_server_identity(
 ) -> anyhow::Result<ServerIdentity> {
     let row: Option<StoredServerIdentity> = sqlx::query_as(
         "SELECT server_identity_public, server_identity_priv_enc \
-         FROM hearth_meta.instance WHERE id = TRUE",
+         FROM sylva_meta.instance WHERE id = TRUE",
     )
     .fetch_optional(db)
     .await?;
@@ -115,7 +115,7 @@ pub async fn ensure_server_identity(
     let priv_enc = auth::secretbox::seal(secret_key, &seed)
         .map_err(|_| anyhow::anyhow!("sealing server identity key"))?;
     sqlx::query(
-        "UPDATE hearth_meta.instance \
+        "UPDATE sylva_meta.instance \
          SET server_identity_public = $1, server_identity_priv_enc = $2 \
          WHERE id = TRUE",
     )
@@ -129,7 +129,7 @@ pub async fn ensure_server_identity(
 // ── Owner-editable instance settings ──────────────────────────────────────
 //
 // A subset of config is editable at runtime via the Owner Settings page and
-// stored as overrides on the `hearth_meta.instance` singleton. NULL columns
+// stored as overrides on the `sylva_meta.instance` singleton. NULL columns
 // mean "fall back to the env/startup default" (`effective`); a set value wins.
 // The SMTP password is sealed with the instance `secret_key` (never clear).
 
@@ -152,7 +152,7 @@ async fn load_settings(db: &PgPool) -> anyhow::Result<SettingsRow> {
     let row = sqlx::query_as::<_, SettingsRow>(
         "SELECT instance_name, notifications_mode, smtp_host, smtp_port, smtp_tls, \
                 smtp_username, smtp_password_enc, smtp_from_email, smtp_from_name \
-         FROM hearth_meta.instance WHERE id = TRUE",
+         FROM sylva_meta.instance WHERE id = TRUE",
     )
     .fetch_optional(db)
     .await?
@@ -234,7 +234,7 @@ pub async fn save_instance_name<'e, E>(db: E, name: Option<&str>) -> anyhow::Res
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query("UPDATE hearth_meta.instance SET instance_name = $1 WHERE id = TRUE")
+    sqlx::query("UPDATE sylva_meta.instance SET instance_name = $1 WHERE id = TRUE")
         .bind(name.filter(|n| !n.is_empty()))
         .execute(db)
         .await?;
@@ -268,7 +268,7 @@ where
     let Some(s) = smtp.filter(|_| mode == "smtp") else {
         // disabled / log — just record the mode; stale SMTP columns are
         // harmless (only read when mode == "smtp").
-        sqlx::query("UPDATE hearth_meta.instance SET notifications_mode = $1 WHERE id = TRUE")
+        sqlx::query("UPDATE sylva_meta.instance SET notifications_mode = $1 WHERE id = TRUE")
             .bind(mode)
             .execute(db)
             .await?;
@@ -286,7 +286,7 @@ where
 
     if let Some(enc) = sealed {
         sqlx::query(
-            "UPDATE hearth_meta.instance SET notifications_mode = 'smtp', \
+            "UPDATE sylva_meta.instance SET notifications_mode = 'smtp', \
                  smtp_host = $1, smtp_port = $2, smtp_tls = $3, smtp_username = $4, \
                  smtp_password_enc = $5, smtp_from_email = $6, smtp_from_name = $7 \
              WHERE id = TRUE",
@@ -303,7 +303,7 @@ where
     } else {
         // No new password → leave `smtp_password_enc` untouched.
         sqlx::query(
-            "UPDATE hearth_meta.instance SET notifications_mode = 'smtp', \
+            "UPDATE sylva_meta.instance SET notifications_mode = 'smtp', \
                  smtp_host = $1, smtp_port = $2, smtp_tls = $3, smtp_username = $4, \
                  smtp_from_email = $5, smtp_from_name = $6 \
              WHERE id = TRUE",
@@ -324,7 +324,7 @@ where
 /// "configured" vs "not set" without ever revealing it).
 pub async fn smtp_password_is_set(db: &PgPool) -> anyhow::Result<bool> {
     let present: Option<bool> = sqlx::query_scalar(
-        "SELECT smtp_password_enc IS NOT NULL FROM hearth_meta.instance WHERE id = TRUE",
+        "SELECT smtp_password_enc IS NOT NULL FROM sylva_meta.instance WHERE id = TRUE",
     )
     .fetch_optional(db)
     .await?;

@@ -76,7 +76,7 @@ pub enum UserLifecycle {
 /// Server-level role. Mirrors `identity.instance_role` in SQL. Owner/Admin
 /// semantics are spelled out in `docs/design/authz.md`. `Member` is the
 /// base role — the rebrand from the older `User` label reflects Hearth's
-/// community-oriented framing (see `hearth-web.md`).
+/// community-oriented framing (see `server-web.md`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize,
 )]

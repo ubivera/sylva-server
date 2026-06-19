@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
-use hearth::{config::Config, db, instance, postgres::PostgresProcess};
+use server::{config::Config, db, instance, postgres::PostgresProcess};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -60,7 +60,7 @@ async fn run() -> Result<()> {
     eprintln!();
     eprintln!("Infrastructure initialized (migrations + server identity + recovery code).");
     eprintln!("Create the first Owner from Sylva Hub — it calls Account.Bootstrap with");
-    eprintln!("client-generated keys. Then run `cargo run --bin hearth` to start the server.");
+    eprintln!("client-generated keys. Then run `cargo run --bin sylva-server` to start the server.");
     Ok(())
 }
 
@@ -96,7 +96,7 @@ async fn init_infrastructure(config: &Config) -> Result<()> {
 
     // Break-glass server recovery code — the Owner-on-Owner veto bypass. Minted
     // as a system event (no owner exists yet); the first Owner inherits it and
-    // can rotate it later. See docs/dev/hearth-owner-protection.md.
+    // can rotate it later. See docs/dev/server-owner-protection.md.
     let recovery_code = auth::recovery_code::generate_code();
     let mut tx = pool.begin().await?;
     let code_id = auth::recovery_code::bootstrap(&mut tx, &recovery_code, None)
@@ -136,7 +136,7 @@ fn refuse_if_postgres_running(config: &Config) -> Result<()> {
         Some(pid) if pid_is_running(pid) => {
             bail!(
                 "Postgres is already running (PID {pid}; lock file {}).\n\
-                 Stop hearth first (Ctrl+C in the server window).",
+                 Stop server first (Ctrl+C in the server window).",
                 pid_file.display()
             );
         }
@@ -182,7 +182,7 @@ fn print_help() {
     eprintln!("a recovery code already exists (instance already initialized).");
     eprintln!();
     eprintln!("The first Owner is NOT created here — create it from Sylva Hub, which calls");
-    eprintln!("Account.Bootstrap. Stop hearth first (Ctrl+C) before running provision.");
+    eprintln!("Account.Bootstrap. Stop server first (Ctrl+C) before running provision.");
 }
 
 fn init_tracing() {

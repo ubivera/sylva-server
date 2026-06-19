@@ -1,5 +1,5 @@
 [package]
-name = "hearth-server"
+name = "sylva-server"
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,13 +9,13 @@ repository.workspace = true
 description = "Sylva Hearth server binary: composes the API and web routers"
 
 [[bin]]
-name = "hearth"
+name = "sylva-server"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
 
-hearth = { path = "../hearth" }
+server = { path = "../server" }
 web = { path = "../web" }
 
 [lints]

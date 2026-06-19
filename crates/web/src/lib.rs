@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use hearth::app::AppState;
+use server::app::AppState;
 use tower_http::services::ServeDir;
 
 /// Once the instance has been closed (the last user left), short-circuit every

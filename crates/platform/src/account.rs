@@ -306,7 +306,7 @@ pub fn account_server(ctx: PlatformContext) -> AccountServer<AccountService> {
 
 /// The client-IP key for rate-limiting an unauthenticated RPC: the first
 /// `x-forwarded-for` hop when a proxy is trusted, else the socket peer IP
-/// (mirrors `hearth`'s REST `resolve_client_ip`). Falls back to `"direct"`.
+/// (mirrors `server`'s REST `resolve_client_ip`). Falls back to `"direct"`.
 fn rate_key<T>(request: &Request<T>, trust_proxy: bool) -> String {
     if trust_proxy
         && let Some(value) = request.metadata().get("x-forwarded-for")

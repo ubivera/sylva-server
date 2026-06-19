@@ -10,7 +10,7 @@ use axum::{
     http::{Method, Request, StatusCode, header::AUTHORIZATION},
 };
 use chrono::{DateTime, Utc};
-use hearth::{app, db, postgres::PostgresProcess};
+use server::{app, db, postgres::PostgresProcess};
 use identity::{InstanceRole, InvitationRepository, UserId, UserRepository};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -20,12 +20,12 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 /// Postgres port used by the test harness. Matches production on purpose —
-/// tests refuse to run while `hearth` (which would already be bound to this
+/// tests refuse to run while `server` (which would already be bound to this
 /// port) is up.
 const TEST_PG_PORT: u16 = 15432;
 
 /// Superuser baked into the bundled cluster by `bootstrap`.
-const SUPERUSER: &str = "hearth";
+const SUPERUSER: &str = "sylva";
 
 struct SharedPg {
     port: u16,
@@ -51,7 +51,7 @@ async fn init_shared_postgres() -> SharedPg {
         .await
         .expect(
             "starting bundled postgres for tests \
-             (is `cargo run --bin hearth` already running? \
+             (is `cargo run --bin sylva-server` already running? \
              stop it before running tests)",
         );
     // Leak so the tokio::process::Child's `kill_on_drop(true)` doesn't fire
@@ -59,11 +59,11 @@ async fn init_shared_postgres() -> SharedPg {
     // when the test binary exits.
     std::mem::forget(pg);
 
-    // hearth's PostgresProcess::start only waits for the TCP listener; the
+    // server's PostgresProcess::start only waits for the TCP listener; the
     // SQL layer may still be in recovery. Block on the shared db helper
     // (same logic prod uses) so subsequent tests never race against
     // startup-not-ready errors.
-    hearth::db::wait_until_ready(&format!(
+    server::db::wait_until_ready(&format!(
         "postgresql://{SUPERUSER}@127.0.0.1:{TEST_PG_PORT}/postgres"
     ))
     .await
@@ -85,7 +85,7 @@ async fn init_shared_postgres() -> SharedPg {
 /// Open a single connection to the `postgres` maintenance database.
 ///
 /// Retries on Postgres `57P03` ("the database system is starting up") for up
-/// to 30 seconds — hearth's `PostgresProcess::start` waits only for the TCP
+/// to 30 seconds — server's `PostgresProcess::start` waits only for the TCP
 /// listener, which races against the SQL layer becoming usable. Callers
 /// should `close()` the returned connection explicitly when done.
 async fn maint_conn(port: u16) -> PgConnection {
@@ -122,7 +122,7 @@ fn install_job_object() {
         if JOB_OBJECT_INSTALLED.swap(true, Ordering::SeqCst) {
             return;
         }
-        match hearth::job_object::JobObject::assign_current_process_for_kill_on_close() {
+        match server::job_object::JobObject::assign_current_process_for_kill_on_close() {
             Ok(job) => {
                 std::mem::forget(job);
             }
@@ -139,12 +139,12 @@ fn install_job_object() {
     }
 }
 
-/// Drop any `hearth_test_*` databases left over from a previous test run.
+/// Drop any `sylva_test_*` databases left over from a previous test run.
 /// Best-effort: we ignore errors so a transient hiccup here doesn't mask the
 /// real failure that comes later.
 async fn drop_orphan_test_dbs(conn: &mut PgConnection) {
     let names: Vec<String> = sqlx::query_scalar(
-        "SELECT datname::text FROM pg_database WHERE datname LIKE 'hearth\\_test\\_%' ESCAPE '\\'",
+        "SELECT datname::text FROM pg_database WHERE datname LIKE 'server\\_test\\_%' ESCAPE '\\'",
     )
     .fetch_all(&mut *conn)
     .await
@@ -171,7 +171,7 @@ fn workspace_root() -> PathBuf {
     manifest
         .parent()
         .and_then(std::path::Path::parent)
-        .expect("CARGO_MANIFEST_DIR has two parents (crates/hearth)")
+        .expect("CARGO_MANIFEST_DIR has two parents (crates/server)")
         .to_path_buf()
 }
 
@@ -192,7 +192,7 @@ pub struct TestApp {
     /// The CSRF secret used by this app's `AppState`. Held here so tests
     /// can compute valid tokens via [`TestApp::csrf_for`] without scraping
     /// rendered HTML.
-    csrf_secret: std::sync::Arc<[u8; hearth::csrf::SECRET_LEN]>,
+    csrf_secret: std::sync::Arc<[u8; server::csrf::SECRET_LEN]>,
     /// The instance secret key used by this app's `AppState`. Held here so
     /// TOTP tests can seed encrypted secrets the same way the server does.
     pub secret_key: std::sync::Arc<[u8; 32]>,
@@ -205,7 +205,7 @@ pub struct TestApp {
 impl TestApp {
     pub async fn new() -> Self {
         let shared = shared_pg().await;
-        let db_name = format!("hearth_test_{}", Uuid::new_v4().simple());
+        let db_name = format!("sylva_test_{}", Uuid::new_v4().simple());
 
         let mut mc = maint_conn(shared.port).await;
         mc.execute(format!("CREATE DATABASE \"{db_name}\"").as_str())
@@ -213,7 +213,7 @@ impl TestApp {
             .expect("creating test db");
         let _ = mc.close().await;
 
-        // Production's bootstrap step creates the `hearth_meta` schema before
+        // Production's bootstrap step creates the `sylva_meta` schema before
         // any migration runs (sqlx's `_sqlx_migrations` lands there). Mirror
         // that here so the migrator behaves identically to a real install.
         let setup_url = format!(
@@ -225,19 +225,19 @@ impl TestApp {
             .connect(&setup_url)
             .await
             .expect("connecting to test db for setup");
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS hearth_meta")
+        sqlx::query("CREATE SCHEMA IF NOT EXISTS sylva_meta")
             .execute(&setup_pool)
             .await
-            .expect("creating hearth_meta schema");
+            .expect("creating sylva_meta schema");
         setup_pool.close().await;
 
         // Use a small pool so highly-parallel tests don't blow past the
-        // bundled cluster's `max_connections`. Production hearth uses 20
+        // bundled cluster's `max_connections`. Production server uses 20
         // connections per pool; tests cap at 4.
         let opts: sqlx::postgres::PgConnectOptions = setup_url
             .parse::<sqlx::postgres::PgConnectOptions>()
             .expect("parse setup_url")
-            .options([("search_path", "hearth_meta,public")]);
+            .options([("search_path", "sylva_meta,public")]);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .acquire_timeout(std::time::Duration::from_secs(15))
@@ -254,9 +254,9 @@ impl TestApp {
 
         // Compose the same shape as production: API under `/api`, the web
         // UI at root, plus `/health`. Mirrors the composition in
-        // `hearth::serve` and `web::ui_router`.
-        let csrf_secret = std::sync::Arc::new(hearth::csrf::generate_secret());
-        let secret_key = std::sync::Arc::new(hearth::csrf::generate_secret());
+        // `server::serve` and `web::ui_router`.
+        let csrf_secret = std::sync::Arc::new(server::csrf::generate_secret());
+        let secret_key = std::sync::Arc::new(server::csrf::generate_secret());
         // Shared notifier cell: production wires the same `Arc` into both
         // `AppState` and the worker so an Owner's live SMTP change is picked up
         // on the next drain. Tests flip it via `set_notifier`.
@@ -266,7 +266,7 @@ impl TestApp {
         // Generate this test instance's server identity (same path production
         // uses), so the discovery endpoint signs with a real key.
         let server_identity = std::sync::Arc::new(
-            hearth::instance::ensure_server_identity(&pool, &secret_key)
+            server::instance::ensure_server_identity(&pool, &secret_key)
                 .await
                 .expect("generating test server identity"),
         );
@@ -284,15 +284,15 @@ impl TestApp {
             // Env baseline for the effective-config model — kept consistent
             // with the seeded cells above (name "test-instance", log notifier).
             env_config: std::sync::Arc::new(
-                hearth::config::Config::from_env_lookup(|k| match k {
-                    "HEARTH_INSTANCE_NAME" => Some("test-instance".to_string()),
-                    "HEARTH_NOTIFICATIONS_MODE" => Some("log".to_string()),
+                server::config::Config::from_env_lookup(|k| match k {
+                    "SYLVA_INSTANCE_NAME" => Some("test-instance".to_string()),
+                    "SYLVA_NOTIFICATIONS_MODE" => Some("log".to_string()),
                     _ => None,
                 })
                 .expect("default test config parses"),
             ),
             csrf_secret: csrf_secret.clone(),
-            rate_limiter: std::sync::Arc::new(hearth::rate_limit::RateLimiter::auth_default()),
+            rate_limiter: std::sync::Arc::new(server::rate_limit::RateLimiter::auth_default()),
             secret_key: secret_key.clone(),
             // Trust forwarding headers in tests: requests via `oneshot`
             // carry no socket peer, so rate-limit tests simulate distinct
@@ -306,10 +306,10 @@ impl TestApp {
         let health = axum::Router::new()
             .route(
                 "/health",
-                axum::routing::get(hearth::health::handler),
+                axum::routing::get(server::health::handler),
             )
             .with_state(app_state.clone());
-        let discovery = hearth::discovery::router(app_state.clone());
+        let discovery = server::discovery::router(app_state.clone());
         let router = Router::new()
             .nest("/api", app::api_router(app_state.clone()))
             .merge(web::ui_router(app_state))
@@ -333,12 +333,12 @@ impl TestApp {
     /// build `csrf_token` form values when posting to web endpoints from
     /// tests; equivalent to scraping the value out of a rendered form.
     pub fn csrf_for(&self, session_id: Uuid) -> String {
-        hearth::csrf::compute_token(&self.csrf_secret, session_id)
+        server::csrf::compute_token(&self.csrf_secret, session_id)
     }
 
     /// Mint a step-up "sudo" grant for `session_cookie` via `POST
     /// /me/reauth` (the no-2FA password path) and return the
-    /// `hearth_sudo=<token>` cookie pair to attach to the follow-up
+    /// `sylva_sudo=<token>` cookie pair to attach to the follow-up
     /// reauth-gated action request. Returns an empty string if the grant
     /// wasn't issued (e.g. a wrong password). Mirrors what the
     /// `REAUTH_CHAIN_JS` flow does in the browser.
@@ -359,19 +359,19 @@ impl TestApp {
             .unwrap();
         for v in resp.headers().get_all(axum::http::header::SET_COOKIE) {
             if let Ok(s) = v.to_str()
-                && let Some(rest) = s.strip_prefix("hearth_sudo=")
+                && let Some(rest) = s.strip_prefix("sylva_sudo=")
             {
                 let val = rest.split(';').next().unwrap_or("");
-                return format!("hearth_sudo={val}");
+                return format!("sylva_sudo={val}");
             }
         }
         String::new()
     }
 
     /// Like [`TestApp::sudo_cookie`] but mints a *critical* grant by posting
-    /// `critical=1` to `/me/reauth`, returning the `hearth_sudo_critical=<token>`
+    /// `critical=1` to `/me/reauth`, returning the `sylva_sudo_critical=<token>`
     /// cookie pair. This is the always-on gate that irreversible account
-    /// actions (self anonymize / delete) require — an ordinary `hearth_sudo`
+    /// actions (self anonymize / delete) require — an ordinary `sylva_sudo`
     /// grant does not satisfy it.
     pub async fn sudo_critical_cookie(
         &self,
@@ -395,24 +395,24 @@ impl TestApp {
             .unwrap();
         for v in resp.headers().get_all(axum::http::header::SET_COOKIE) {
             if let Ok(s) = v.to_str()
-                && let Some(rest) = s.strip_prefix("hearth_sudo_critical=")
+                && let Some(rest) = s.strip_prefix("sylva_sudo_critical=")
             {
                 let val = rest.split(';').next().unwrap_or("");
-                return format!("hearth_sudo_critical={val}");
+                return format!("sylva_sudo_critical={val}");
             }
         }
         String::new()
     }
 
     /// Look up the `auth.sessions.id` for a session whose token lives in
-    /// the given `hearth_session=<token>` cookie pair. The web login
+    /// the given `sylva_session=<token>` cookie pair. The web login
     /// helper returns the full `Set-Cookie` header; trim it down to just
-    /// `hearth_session=<token>` (e.g. via `cookie_name_value`) before
+    /// `sylva_session=<token>` (e.g. via `cookie_name_value`) before
     /// passing in.
     pub async fn session_id_for_cookie(&self, cookie_value: &str) -> Uuid {
         let token = cookie_value
-            .strip_prefix("hearth_session=")
-            .expect("cookie value must start with hearth_session=");
+            .strip_prefix("sylva_session=")
+            .expect("cookie value must start with sylva_session=");
         let token_hash = auth::hash_token(token);
         sqlx::query_scalar("SELECT id FROM auth.sessions WHERE token_hash = $1")
             .bind(&token_hash[..])

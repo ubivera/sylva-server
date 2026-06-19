@@ -33,7 +33,7 @@ pub struct ChromeContext<'a> {
     pub instance_name: std::sync::Arc<String>,
     pub user: &'a User,
     /// CSRF token for this session — derived via
-    /// [`hearth::csrf::compute_token`]. Embed in every state-changing
+    /// [`server::csrf::compute_token`]. Embed in every state-changing
     /// form via [`csrf_input`].
     pub csrf_token: &'a str,
     /// Count of currently-pending Owner-on-Owner transitions. Sidebar
@@ -48,7 +48,7 @@ pub struct ChromeContext<'a> {
 
 /// Render the hidden `csrf_token` input for a form. Every state-changing
 /// `<form method="post">` in the authed UI must include this; the route
-/// handler then validates via `hearth::csrf::verify_token`.
+/// handler then validates via `server::csrf::verify_token`.
 pub fn csrf_input(token: &str) -> Markup {
     html! {
         input type="hidden" name="csrf_token" value=(token);
@@ -579,8 +579,8 @@ const CHANGE_PASSWORD_GATE_JS: &str = r#"
 // the WebAuthn API speaks ArrayBuffers but the wire format is base64url.
 const WEBAUTHN_JS: &str = r#"
 (function() {
-    if (window.__hearthWebauthnLoaded) return;
-    window.__hearthWebauthnLoaded = true;
+    if (window.__sylvaWebauthnLoaded) return;
+    window.__sylvaWebauthnLoaded = true;
 
     function b64urlToBuf(s) {
         s = s.replace(/-/g, '+').replace(/_/g, '/');
@@ -817,8 +817,8 @@ const USER_CARD_OUTSIDE_CLICK_JS: &str = r#"
 // Three parts:
 //
 //   1. Server: action handlers attach an `HX-Trigger` header with a
-//      `hearth-toast` event carrying `{kind, title, message}`.
-//   2. Old-page listener: when HTMX fires `hearth-toast`, we push the
+//      `sylva-toast` event carrying `{kind, title, message}`.
+//   2. Old-page listener: when HTMX fires `sylva-toast`, we push the
 //      payload into sessionStorage so it survives the HX-Redirect
 //      navigation that usually accompanies the trigger.
 //   3. New-page bootstrap: drain anything queued in sessionStorage and
@@ -834,7 +834,7 @@ const USER_CARD_OUTSIDE_CLICK_JS: &str = r#"
 //     immediately.
 const TOAST_JS: &str = r#"
 (function() {
-    var STORAGE_KEY = 'hearth-toasts';
+    var STORAGE_KEY = 'sylva-toasts';
     var DURATION_MS = 15000;
     var MAX_AGE_MS = 30000;
 
@@ -941,7 +941,7 @@ const TOAST_JS: &str = r#"
     // exactly the "toasts never show up post-navigation" symptom.
     // Extract only the three fields we care about so the payload is
     // pure data and round-trips through JSON cleanly.
-    document.body.addEventListener('hearth-toast', function(e) {
+    document.body.addEventListener('sylva-toast', function(e) {
         var src = (e && e.detail) || {};
         var clean = {
             kind: src.kind,
@@ -988,7 +988,7 @@ const DIALOG_JS: &str = r#"
 // removed from the DOM on close. `beforeend` append (not replace) lets
 // modals stack — e.g. the reauth modal opening over the settings modal,
 // both live in the dialog top layer, each removed on its own close.
-window.hearthOpenModal = function(url) {
+window.sylvaOpenModal = function(url) {
     var host = document.getElementById('modal-host');
     if (!host) return Promise.resolve(null);
     return fetch(url, { credentials: 'same-origin' })
@@ -1014,10 +1014,10 @@ window.hearthOpenModal = function(url) {
 
 // Fetch-if-missing variant. Used by the reauth chain, which may be
 // re-entered while a previous reauth dialog is still mounted.
-window.hearthEnsureModal = function(id, url) {
+window.sylvaEnsureModal = function(id, url) {
     var live = document.getElementById(id);
     if (live) return Promise.resolve(live);
-    return window.hearthOpenModal(url);
+    return window.sylvaOpenModal(url);
 };
 
 document.addEventListener('click', function(e) {
@@ -1026,7 +1026,7 @@ document.addEventListener('click', function(e) {
     var openModal = e.target.closest('[data-open-modal]');
     if (openModal) {
         e.preventDefault();
-        window.hearthOpenModal(openModal.getAttribute('data-open-modal'))
+        window.sylvaOpenModal(openModal.getAttribute('data-open-modal'))
             .then(function(d) {
                 if (d && typeof d.showModal === 'function') d.showModal();
             });
@@ -1595,7 +1595,7 @@ pub fn recover_reset_page(error: Option<&str>) -> Markup {
 
 /// `GET /login/verify` — the second-factor challenge, reached after a
 /// correct password when the user has TOTP enrolled. Reachable only with
-/// a valid `hearth_mfa` cookie. Offers the authenticator code (primary)
+/// a valid `sylva_mfa` cookie. Offers the authenticator code (primary)
 /// and a recovery-code break-glass (in a native `<details>`, no JS).
 pub fn login_verify_page(error: Option<&str>, has_totp: bool, has_passkey: bool) -> Markup {
     let content = html! {
@@ -1814,10 +1814,10 @@ pub fn reauth_modal(
 }
 
 /// Inner content of the step-up reauth modal. Renders the factors the
-/// account's assurance level demands (see `hearth-mfa.md`): a one-tap
+/// account's assurance level demands (see `server-mfa.md`): a one-tap
 /// passkey when enrolled, password (+ authenticator code when TOTP is
 /// enrolled) otherwise. Both paths POST to `/me/reauth`, which verifies
-/// the factor and mints the short-lived `hearth_sudo` grant; on success
+/// the factor and mints the short-lived `sylva_sudo` grant; on success
 /// the response fires `reauth-ok` and `REAUTH_CHAIN_JS` runs the original
 /// action. `error` is a free-text retry message.
 ///
@@ -2155,7 +2155,7 @@ pub fn account_settings_modal(
     ctx: &ChromeContext,
     recovery_meta: Option<&auth::user_recovery_code::UserRecoveryCodeRow>,
     totp_creds: &[auth::user_totp::TotpCredential],
-    passkey_creds: &[hearth::webauthn::WebauthnCredentialRow],
+    passkey_creds: &[server::webauthn::WebauthnCredentialRow],
     passkey_available: bool,
     sessions: &[auth::Session],
     current_session_id: uuid::Uuid,
@@ -2364,7 +2364,7 @@ fn change_password_button(oob: bool) -> Markup {
 fn settings_security_panel(
     ctx: &ChromeContext,
     totp_creds: &[auth::user_totp::TotpCredential],
-    passkey_creds: &[hearth::webauthn::WebauthnCredentialRow],
+    passkey_creds: &[server::webauthn::WebauthnCredentialRow],
     passkey_available: bool,
 ) -> Markup {
     html! {
@@ -2642,12 +2642,12 @@ fn fingerprint_icon() -> Markup {
 /// (e.g. a bare-IP base URL) — then we explain instead of offering enroll.
 pub fn passkey_credentials_section(
     ctx: &ChromeContext,
-    creds: &[hearth::webauthn::WebauthnCredentialRow],
+    creds: &[server::webauthn::WebauthnCredentialRow],
     mode: SectionMode,
     available: bool,
     oob: bool,
 ) -> Markup {
-    let at_max = creds.len() as i64 >= hearth::webauthn::MAX_PASSKEYS;
+    let at_max = creds.len() as i64 >= server::webauthn::MAX_PASSKEYS;
     let oob_attr = oob.then_some("true");
     html! {
         section id="passkey-section" class="settings-section" hx-swap-oob=[oob_attr] {
@@ -2683,7 +2683,7 @@ pub fn passkey_credentials_section(
                     p class="settings-row-hint" {
                         "Passkeys need this site to be reached over https or "
                         "at a hostname like localhost (not a bare IP "
-                        "address). Set HEARTH_PUBLIC_BASE_URL accordingly to "
+                        "address). Set SYLVA_PUBLIC_BASE_URL accordingly to "
                         "enable them."
                     }
                 } @else {
@@ -2702,7 +2702,7 @@ pub fn passkey_credentials_section(
                     @if at_max {
                         p class="settings-row-hint" {
                             "You've reached the maximum of "
-                            (hearth::webauthn::MAX_PASSKEYS)
+                            (server::webauthn::MAX_PASSKEYS)
                             " passkeys."
                         }
                     }
@@ -2728,7 +2728,7 @@ pub fn passkey_credentials_section(
 
 fn passkey_row(
     ctx: &ChromeContext,
-    cred: &hearth::webauthn::WebauthnCredentialRow,
+    cred: &server::webauthn::WebauthnCredentialRow,
     mode: SectionMode,
     is_last: bool,
 ) -> Markup {
@@ -5041,11 +5041,11 @@ const REAUTH_CHAIN_JS: &str = r#"
 (function() {
     // Idempotency guard — the shell wires this for every authed page and
     // /members loads it again; double-binding would run the chain twice.
-    if (window.__hearthReauthChainLoaded) return;
-    window.__hearthReauthChainLoaded = true;
+    if (window.__sylvaReauthChainLoaded) return;
+    window.__sylvaReauthChainLoaded = true;
 
     // The source form's payload minus the password — under the sudo-grant
-    // model the action is authorized by the hearth_sudo cookie, not a
+    // model the action is authorized by the sylva_sudo cookie, not a
     // password field, so the action handlers no longer accept one.
     function payloadOf(sourceForm) {
         var values = {};
@@ -5106,7 +5106,7 @@ const REAUTH_CHAIN_JS: &str = r#"
             if (roleInput && roleInput.value === 'owner') {
                 var targetId = btn.getAttribute('data-target-id');
                 var roleDialog = btn.closest('dialog');
-                window.hearthOpenModal('/members/' + targetId + '/modal/role-owner-confirm')
+                window.sylvaOpenModal('/members/' + targetId + '/modal/role-owner-confirm')
                     .then(function(oc) {
                         if (oc && typeof oc.showModal === 'function') oc.showModal();
                         if (roleDialog) roleDialog.remove();
@@ -5132,7 +5132,7 @@ const REAUTH_CHAIN_JS: &str = r#"
         // one first so the flag is current.
         var stale = document.getElementById('dlg-reauth');
         if (stale) stale.remove();
-        window.hearthOpenModal(reauthUrl).then(function(dlg) {
+        window.sylvaOpenModal(reauthUrl).then(function(dlg) {
             if (!dlg) return;
             var fresh = dlg.dataset.sudoFresh === '1';
 
@@ -7189,7 +7189,7 @@ fn key_short(hex: &str) -> String {
 /// apply live — the handlers swap the hot-reloadable `AppState` cells.
 pub fn settings_page(
     ctx: &ChromeContext,
-    notifications: &hearth::config::NotificationsConfig,
+    notifications: &server::config::NotificationsConfig,
     smtp_password_set: bool,
     recovery_created_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Markup {
@@ -7253,10 +7253,10 @@ fn settings_identity_section(ctx: &ChromeContext) -> Markup {
 /// and shows "saved" vs "not set" without revealing the secret.
 fn settings_notifications_section(
     ctx: &ChromeContext,
-    notifications: &hearth::config::NotificationsConfig,
+    notifications: &server::config::NotificationsConfig,
     smtp_password_set: bool,
 ) -> Markup {
-    use hearth::config::{NotificationsConfig, SmtpTls};
+    use server::config::{NotificationsConfig, SmtpTls};
     let smtp = match notifications {
         NotificationsConfig::Smtp(s) => Some(s),
         _ => None,
@@ -7651,7 +7651,7 @@ pub enum ToastKind {
     Error,
 }
 
-/// Toast payload sent from server → client via the `hearth-toast`
+/// Toast payload sent from server → client via the `sylva-toast`
 /// HX-Trigger event. The client (see [`TOAST_JS`]) buffers it into
 /// sessionStorage so it survives the HX-Redirect navigation that
 /// usually accompanies the trigger, then renders it on the next

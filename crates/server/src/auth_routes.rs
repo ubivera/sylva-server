@@ -32,7 +32,7 @@ pub struct ErrorResponse {
 }
 
 /// How long the "password verified, awaiting second factor" token is
-/// valid (seconds). Mirrors the web `hearth_mfa` cookie TTL.
+/// valid (seconds). Mirrors the web `sylva_mfa` cookie TTL.
 const MFA_PENDING_TTL_SECS: i64 = 600;
 
 /// Returned by `/auth/login` (200) when the account has a second factor:
@@ -359,7 +359,7 @@ impl AuthenticatedUser {
 /// Name of the cookie carrying the session token for browser clients.
 /// API clients still use `Authorization: Bearer <token>`; the extractor
 /// accepts either.
-pub const SESSION_COOKIE_NAME: &str = "hearth_session";
+pub const SESSION_COOKIE_NAME: &str = "sylva_session";
 
 /// Pull a named cookie's value out of the `Cookie` request header.
 /// Returns `None` when the header is missing, unparseable, or the named
@@ -386,7 +386,7 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         // Try `Authorization: Bearer <token>` first (API clients), fall back
-        // to the `hearth_session` cookie (browser clients). Both reference
+        // to the `sylva_session` cookie (browser clients). Both reference
         // the same session row.
         let token = bearer_token(parts).or_else(|| extract_cookie(parts, SESSION_COOKIE_NAME));
         let Some(token) = token else {

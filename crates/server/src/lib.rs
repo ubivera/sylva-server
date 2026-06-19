@@ -29,9 +29,9 @@ use anyhow::Context;
 /// alongside the JSON API at server boot.
 pub type UiRouterFn = fn(app::AppState) -> axum::Router;
 
-/// Entry point used by `hearth-server`'s `main`. The `ui_router` parameter
+/// Entry point used by `sylva-server`'s `main`. The `ui_router` parameter
 /// lets the binary plug in the [`web`](https://docs.rs/web) crate's HTML
-/// router without `hearth` having a circular dependency on it.
+/// router without `server` having a circular dependency on it.
 pub fn run(ui_router: UiRouterFn) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -48,7 +48,7 @@ async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         listen = %config.listen_addr,
         data_dir = %config.data_dir.display(),
-        "starting hearth"
+        "starting server"
     );
 
     #[cfg(windows)]
@@ -259,7 +259,7 @@ async fn serve(
     }
 
     pool.close().await;
-    tracing::info!("hearth http server stopped");
+    tracing::info!("server http server stopped");
     serve_outcome
 }
 

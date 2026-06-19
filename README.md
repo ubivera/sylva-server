@@ -12,7 +12,7 @@ Windows + MSVC toolchain + Rust 1.95 via `rustup`.
 
 ```bash
 cargo run --bin bootstrap
-cargo run --bin hearth
+cargo run --bin sylva-server
 cargo run --bin clean
 ```
 
