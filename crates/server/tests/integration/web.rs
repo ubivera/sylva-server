@@ -490,7 +490,7 @@ async fn login_page_uses_public_shell_not_app_shell() {
     assert!(!body.contains(r#"class="user-card""#));
     assert!(!body.contains(r#"class="search-trigger""#));
     assert!(body.contains("/assets/css/app.css"));
-    assert!(body.contains("Sylva Hearth"));
+    assert!(body.contains("Sylva Server"));
 }
 
 #[tokio::test]

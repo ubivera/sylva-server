@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Dev-only: reset Hearth's local state to a fresh baseline (drops + recreates database)"
+description = "Dev-only: reset server's local state to a fresh baseline (drops + recreates database)"
 
 [[bin]]
 name = "clean"

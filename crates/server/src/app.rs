@@ -11,7 +11,7 @@ use sqlx::PgPool;
 
 use crate::{account_routes, admin_routes, auth_routes, csrf};
 
-/// Shared state for every Hearth HTTP handler. Cloning is cheap - every
+/// Shared state for every server HTTP handler. Cloning is cheap - every
 /// field is itself a handle (Pool, Repository wrappers, Instant, Arc).
 #[derive(Clone)]
 pub struct AppState {

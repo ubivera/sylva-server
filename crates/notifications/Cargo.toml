@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth notification outbox + delivery"
+description = "Sylva Server notification outbox + delivery"
 
 [lib]
 path = "src/lib.rs"

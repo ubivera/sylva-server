@@ -1,4 +1,4 @@
-//! Sylva Hearth **platform** gRPC services — the app-facing API.
+//! Sylva Server **platform** gRPC services — the app-facing API.
 //!
 //! Two services: `Platform` (`WhoAmI` + app registration) and `Resources`
 //! (owner-scoped generic content storage). Every RPC authenticates the caller

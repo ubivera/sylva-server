@@ -97,11 +97,11 @@ pub async fn send_test_email(state: &AppState, to: &str) -> TestEmailOutcome {
     let notifier = state.notifier.load();
     let msg = notifications::OutboundMessage {
         to: to.to_string(),
-        subject: "Sylva Hearth test email".to_string(),
-        body_text: "This is a test email from your Sylva Hearth instance. \
+        subject: "Sylva Server test email".to_string(),
+        body_text: "This is a test email from your Sylva Server instance. \
                      If you received it, outbound email is configured correctly."
             .to_string(),
-        body_html: "<p>This is a test email from your Sylva Hearth instance. \
+        body_html: "<p>This is a test email from your Sylva Server instance. \
                      If you received it, outbound email is configured correctly.</p>"
             .to_string(),
     };

@@ -75,7 +75,7 @@ fn run() -> CleanResult<()> {
     if !auto_yes {
         println!();
         println!("This will drop the '{DEFAULT_DATABASE}' database and recreate it empty.");
-        println!("All Hearth application data will be lost.");
+        println!("All server application data will be lost.");
         print!("Type 'yes' to continue: ");
         io::stdout().flush()?;
         let mut input = String::new();

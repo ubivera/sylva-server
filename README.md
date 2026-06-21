@@ -1,7 +1,7 @@
-![Hearth hero image](docs/images/header.png)
+![Sylva Server hero image](docs/images/header.png)
 
 <h1 align="center">
-    Ubivera.Sylva.Hearth
+    Ubivera.Sylva.Server
 </h1>
 
 The server for the Sylva ecosystem; a self-hosted, privacy-first, end-to-end encrypted modular monolith.

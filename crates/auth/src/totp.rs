@@ -184,10 +184,10 @@ mod tests {
 
     #[test]
     fn otpauth_uri_encodes_email_and_issuer() {
-        let uri = otpauth_uri("Sylva Hearth", "a@b.test", "ABCD");
-        assert!(uri.starts_with("otpauth://totp/Sylva%20Hearth:a%40b.test?"));
+        let uri = otpauth_uri("Sylva Server", "a@b.test", "ABCD");
+        assert!(uri.starts_with("otpauth://totp/Sylva%20Server:a%40b.test?"));
         assert!(uri.contains("secret=ABCD"));
-        assert!(uri.contains("issuer=Sylva%20Hearth"));
+        assert!(uri.contains("issuer=Sylva%20Server"));
         assert!(uri.contains("algorithm=SHA1"));
         assert!(uri.contains("digits=6"));
         assert!(uri.contains("period=30"));

@@ -2,7 +2,7 @@
 //!
 //! An app registers by submitting a declaration (identifier, display name,
 //! publisher, its own Ed25519 key, schema version, resource types) **signed by
-//! a trusted publisher's key**. Hearth verifies the signature against the named
+//! a trusted publisher's key**. server verifies the signature against the named
 //! trusted publisher's verifying key — so only apps a publisher the Owner
 //! trusts can register. See `design/platform.md` §App Registration.
 //!
@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// The signed-over fields of an app registration (everything except the
-/// signature itself). Both the publisher (when signing) and Hearth (when
+/// signature itself). Both the publisher (when signing) and server (when
 /// verifying) canonicalize *these* bytes — see [`canonical_declaration_bytes`].
 pub struct AppDeclaration {
     pub app_identifier: String,

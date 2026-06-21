@@ -1,5 +1,5 @@
 //! Cross-stack end-to-end test (Hub build spec Phase 3.7): the **real**
-//! `sylva-sdk` client driven against a **real**, live Hearth — discovery over
+//! `sylva-sdk` client driven against a **real**, live server — discovery over
 //! actual HTTP, the enrollment flows over actual gRPC, real server-side crypto
 //! storage. Proves the full client crypto + wire path before any UI.
 //!
@@ -22,7 +22,7 @@ fn fast() -> KdfParams {
     }
 }
 
-/// Serve Hearth's real gRPC services on an ephemeral port against the test pool;
+/// Serve server's real gRPC services on an ephemeral port against the test pool;
 /// returns `host:port` + a shutdown sender.
 async fn spawn_grpc(app: &TestApp) -> (String, tokio::sync::watch::Sender<bool>) {
     let ctx = platform::PlatformContext {
@@ -45,7 +45,7 @@ async fn spawn_grpc(app: &TestApp) -> (String, tokio::sync::watch::Sender<bool>)
     (addr.to_string(), tx)
 }
 
-/// Serve Hearth's real HTTP router (which carries `/.well-known/sylva-discovery`)
+/// Serve server's real HTTP router (which carries `/.well-known/sylva-discovery`)
 /// on an ephemeral port; returns the base URL + the server task handle.
 async fn spawn_http(app: &TestApp) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
