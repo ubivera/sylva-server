@@ -302,3 +302,99 @@ async fn machine_agent_registers_checks_in_and_subscribes_end_to_end() {
     let _ = shutdown.send(true);
     http.abort();
 }
+
+/// The full telemetry path (CP3): an admin enables location + provisions a
+/// device-admin group key; the agent reads that from `Subscribe`, seals a
+/// location fix to the group key, and reports it; the server stores only
+/// ciphertext; an admin holding the group secret decrypts it. Exercises the
+/// SDK's sealed-box crypto + the server's zero-knowledge storage end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_telemetry_seals_to_group_and_admin_decrypts_end_to_end() {
+    let app = TestApp::new().await;
+    let (grpc_addr, shutdown) = spawn_grpc(&app).await;
+    let channel = client::connect(&[grpc_addr]).await.unwrap();
+    let mut machine = MachineClient::new(channel);
+
+    // Register the machine.
+    let signing_key = SigningKey::from_bytes(&[6u8; 32]);
+    let public = signing_key.verifying_key().to_bytes();
+    let signature = signing_key
+        .sign(&canonical_machine_bytes(&public, "windows", "Family-PC"))
+        .to_bytes()
+        .to_vec();
+    let session = machine
+        .register_machine(tonic::Request::new(mb::RegisterMachineRequest {
+            machine_identity_public: public.to_vec(),
+            platform: "windows".to_string(),
+            label: "Family-PC".to_string(),
+            signature,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let machine_id = uuid::Uuid::parse_str(&session.machine_id).unwrap();
+
+    // Admin policy (dev SQL until the client-app panel exists): provision a
+    // device-admin group key + enable location for this machine.
+    let group = sylva_sdk::crypto::generate_group_keypair();
+    sqlx::query("INSERT INTO identity.device_admin_group (group_public) VALUES ($1)")
+        .bind(group.public.as_slice())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE identity.machines SET location_enabled = true WHERE id = $1")
+        .bind(machine_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    // The agent reads its effective config from the push stream.
+    let mut stream = machine
+        .subscribe(machine_authed(&session.token, mb::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let config = loop {
+        match stream.message().await.unwrap().expect("a push").payload {
+            Some(mb::server_push::Payload::Config(cfg)) => break cfg,
+            _ => continue,
+        }
+    };
+    assert!(config.location_enabled);
+    let group_public: [u8; 32] = config.device_admin_group_public.as_slice().try_into().unwrap();
+    assert_eq!(group_public, group.public);
+
+    // The agent seals a location fix to the group key and reports it.
+    let location = br#"{"lat":35.594566,"lon":-77.408395,"accuracy_m":27.0}"#;
+    let ciphertext = sylva_sdk::crypto::seal_to(&group_public, location).unwrap();
+    machine
+        .report_telemetry(machine_authed(
+            &session.token,
+            mb::ReportTelemetryRequest {
+                blobs: vec![mb::TelemetryBlob {
+                    kind: "location".to_string(),
+                    recipient_key_id: config.group_key_id.clone(),
+                    seq: 1,
+                    ciphertext,
+                    signature: Vec::new(),
+                }],
+            },
+        ))
+        .await
+        .unwrap();
+
+    // The server stored only ciphertext; an admin with the group secret decrypts it.
+    let (kind, stored): (String, Vec<u8>) = sqlx::query_as(
+        "SELECT kind, ciphertext FROM identity.machine_telemetry WHERE machine_id = $1",
+    )
+    .bind(machine_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "location");
+    assert_ne!(stored, location, "server stores ciphertext, not plaintext");
+    let decrypted = sylva_sdk::crypto::open_sealed(&group.secret, &stored).unwrap();
+    assert_eq!(decrypted, location);
+
+    let _ = shutdown.send(true);
+}
