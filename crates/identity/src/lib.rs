@@ -20,6 +20,11 @@ pub use enrollment::{
     MachineSessionRepository, NewDevice, UserKeyMaterial, UserKeyRepository,
 };
 
+pub mod machine_telemetry;
+pub use machine_telemetry::{
+    DeviceAdminGroup, DeviceAdminGroupRepository, MachineTelemetryRepository, NewTelemetry,
+};
+
 /// Strongly-typed user identifier. Distinct nominal type prevents accidental
 /// mixing with the other UUID-keyed entities the design introduces later
 /// (DeviceId, ResourceId, GroupId).

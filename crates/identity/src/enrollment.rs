@@ -213,6 +213,28 @@ impl MachineRepository {
         .await?;
         Ok(())
     }
+
+    /// Whether location reporting is enabled for this machine (admin policy,
+    /// pushed to the agent in `MachineConfig`).
+    pub async fn location_enabled(&self, machine_id: MachineId) -> Result<bool> {
+        let (enabled,): (bool,) =
+            sqlx::query_as("SELECT location_enabled FROM identity.machines WHERE id = $1")
+                .bind(machine_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(enabled)
+    }
+
+    /// Set the per-machine location toggle. The real surface is the client-app
+    /// devices panel; dev/test uses this directly until that exists.
+    pub async fn set_location_enabled(&self, machine_id: MachineId, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE identity.machines SET location_enabled = $2 WHERE id = $1")
+            .bind(machine_id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 // ── machine sessions (slice 2 — the agent's bearer credential) ──────────────────

@@ -93,6 +93,7 @@ CREATE TABLE identity.machines (
     -- one machine identity maps to one row.
     machine_identity_public BYTEA NULL UNIQUE,
     agent_version           TEXT NULL,                                  -- reported at check-in (non-PII)
+    location_enabled        BOOLEAN NOT NULL DEFAULT false,             -- admin policy (slice 2, CP3)
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at            TIMESTAMPTZ NULL
 );
@@ -111,6 +112,33 @@ CREATE TABLE identity.machine_sessions (
 
 CREATE UNIQUE INDEX machine_sessions_token_hash_uniq ON identity.machine_sessions (token_hash);
 CREATE INDEX machine_sessions_by_machine            ON identity.machine_sessions (machine_id);
+
+-- The device-admin group key (slice 2, CP3): device telemetry is end-to-end
+-- sealed to this X25519 public key; admins hold the secret. Wrapping the secret
+-- to each admin (a `device_admin_group_members` table) is a client-app concern
+-- and lands with that panel. One active row (the latest); `id` is the recipient
+-- key id stamped on telemetry. See docs/design/agent.md.
+CREATE TABLE identity.device_admin_group (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    group_public BYTEA NOT NULL,                                        -- X25519 (32 bytes)
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- E2E-encrypted device telemetry (slice 2, CP3): the server stores ciphertext
+-- ONLY — sealed to the device-admin group key, never readable here. The envelope
+-- (kind / recipient_key_id / seq) is plaintext for routing + ordering.
+CREATE TABLE identity.machine_telemetry (
+    id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    machine_id       UUID NOT NULL REFERENCES identity.machines(id) ON DELETE CASCADE,
+    kind             TEXT NOT NULL,                                     -- location|inventory|...
+    recipient_key_id BYTEA NOT NULL,                                    -- which device-admin group key
+    seq              BIGINT NOT NULL,                                   -- per-machine sequence
+    ciphertext       BYTEA NOT NULL,                                    -- sealed to the group public key
+    signature        BYTEA NOT NULL,                                    -- machine-signed envelope (may be empty in CP3)
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX machine_telemetry_by_machine ON identity.machine_telemetry (machine_id, kind, seq);
 
 -- A user-scoped device enrollment: the user's keys bound to a device (and OS
 -- user). The master key lives in that OS user's keychain; only the public key is

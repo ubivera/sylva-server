@@ -12,7 +12,10 @@
 use std::pin::Pin;
 use std::time::Duration as StdDuration;
 
-use identity::{MachineId, MachineRepository, MachineSessionRepository};
+use identity::{
+    DeviceAdminGroupRepository, MachineId, MachineRepository, MachineSessionRepository,
+    MachineTelemetryRepository, NewTelemetry,
+};
 use proto::machine::v1::{
     CheckInRequest, Empty, MachineConfig, MachineSession as ProtoMachineSession,
     RegisterMachineRequest, ReportTelemetryRequest, ServerPush,
@@ -32,6 +35,8 @@ pub struct MachineService {
     ctx: PlatformContext,
     machines: MachineRepository,
     sessions: MachineSessionRepository,
+    telemetry: MachineTelemetryRepository,
+    groups: DeviceAdminGroupRepository,
 }
 
 #[tonic::async_trait]
@@ -113,10 +118,27 @@ impl Machine for MachineService {
         &self,
         request: Request<ReportTelemetryRequest>,
     ) -> Result<Response<Empty>, Status> {
-        // Authenticate even though storage lands in CP3, so an agent can tell
-        // "not yet implemented" from "not authorized".
-        let _ = self.authenticate_machine(request.metadata()).await?;
-        Err(Status::unimplemented("telemetry storage lands in CP3"))
+        let machine_id = self.authenticate_machine(request.metadata()).await?;
+        let blobs: Vec<NewTelemetry> = request
+            .into_inner()
+            .blobs
+            .into_iter()
+            .map(|b| NewTelemetry {
+                kind: b.kind,
+                recipient_key_id: b.recipient_key_id,
+                seq: i64::try_from(b.seq).unwrap_or(i64::MAX),
+                ciphertext: b.ciphertext,
+                signature: b.signature,
+            })
+            .collect();
+        if blobs.is_empty() {
+            return Ok(Response::new(Empty {}));
+        }
+        self.telemetry
+            .insert(machine_id, &blobs)
+            .await
+            .map_err(|err| internal(&err, "report_telemetry"))?;
+        Ok(Response::new(Empty {}))
     }
 
     type SubscribeStream =
@@ -126,7 +148,27 @@ impl Machine for MachineService {
         &self,
         request: Request<Empty>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let _machine_id = self.authenticate_machine(request.metadata()).await?;
+        let machine_id = self.authenticate_machine(request.metadata()).await?;
+
+        // Effective config at subscribe-time: the per-machine location toggle + the
+        // active device-admin group key (what the agent seals telemetry to).
+        // ponytail: pushed once on subscribe — a toggle change reaches the agent on
+        // its next reconnect; live re-push on change is a CP4 refinement.
+        let location_enabled = self
+            .machines
+            .location_enabled(machine_id)
+            .await
+            .map_err(|err| internal(&err, "subscribe:location_enabled"))?;
+        let group = self
+            .groups
+            .active()
+            .await
+            .map_err(|err| internal(&err, "subscribe:group"))?;
+        let (device_admin_group_public, group_key_id) = match group {
+            Some(g) => (g.public, g.id.as_bytes().to_vec()),
+            None => (Vec::new(), Vec::new()),
+        };
+
         // ponytail: the spine delivery channel is a timer — an initial config
         // push then periodic keep-alives. Real server-driven command push (tied
         // to admin actions) lands in CP4.
@@ -134,7 +176,9 @@ impl Machine for MachineService {
         tokio::spawn(async move {
             let config = ServerPush {
                 payload: Some(server_push::Payload::Config(MachineConfig {
-                    location_enabled: false,
+                    location_enabled,
+                    device_admin_group_public,
+                    group_key_id,
                 })),
             };
             if tx.send(Ok(config)).await.is_err() {
@@ -188,10 +232,14 @@ impl MachineService {
 pub fn machine_server(ctx: PlatformContext) -> MachineServer<MachineService> {
     let machines = MachineRepository::new(ctx.pool.clone());
     let sessions = MachineSessionRepository::new(ctx.pool.clone());
+    let telemetry = MachineTelemetryRepository::new(ctx.pool.clone());
+    let groups = DeviceAdminGroupRepository::new(ctx.pool.clone());
     MachineServer::new(MachineService {
         ctx,
         machines,
         sessions,
+        telemetry,
+        groups,
     })
 }
 
