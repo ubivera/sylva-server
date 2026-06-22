@@ -344,7 +344,7 @@ async fn identity_save_updates_name_live() {
         &app,
         "/settings/identity",
         &cookie,
-        format!("csrf_token={csrf}&instance_name={}", urlencoding("Hearthside HQ")),
+        format!("csrf_token={csrf}&instance_name={}", urlencoding("serverside HQ")),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -352,10 +352,10 @@ async fn identity_save_updates_name_live() {
 
     // The name field reflects the new value…
     let (_, settings_html) = get_with_cookie(&app, "/settings", &cookie).await;
-    assert!(settings_html.contains("value=\"Hearthside HQ\""));
+    assert!(settings_html.contains("value=\"serverside HQ\""));
     // …and the live sidebar brand (a different page) shows it without restart.
     let (_, me_html) = get_with_cookie(&app, "/me", &cookie).await;
-    assert!(me_html.contains("Hearthside HQ"));
+    assert!(me_html.contains("serverside HQ"));
 }
 
 #[tokio::test]

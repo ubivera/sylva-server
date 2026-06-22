@@ -11,7 +11,7 @@
 //! MITM can't pass off a recorded response.
 //!
 //! Channel binding: the design (docs/design/hub.md) also binds the signature to
-//! the TLS certificate SPKI. Hearth doesn't terminate TLS at this layer (a
+//! the TLS certificate SPKI. server doesn't terminate TLS at this layer (a
 //! reverse proxy does, in production), so the SPKI isn't available here yet;
 //! that field is added to the signed payload when TLS termination moves in. The
 //! durable anchor — the pinned identity key — and the nonce are in place now.

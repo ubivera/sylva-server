@@ -16,8 +16,8 @@ pub type Result<T> = std::result::Result<T, IdentityError>;
 
 pub mod enrollment;
 pub use enrollment::{
-    Device, DeviceId, DeviceRepository, Machine, MachineId, MachineRepository, NewDevice,
-    UserKeyMaterial, UserKeyRepository,
+    Device, DeviceId, DeviceRepository, Machine, MachineId, MachineRepository, MachineSession,
+    MachineSessionRepository, NewDevice, UserKeyMaterial, UserKeyRepository,
 };
 
 /// Strongly-typed user identifier. Distinct nominal type prevents accidental
@@ -75,7 +75,7 @@ pub enum UserLifecycle {
 
 /// Server-level role. Mirrors `identity.instance_role` in SQL. Owner/Admin
 /// semantics are spelled out in `docs/design/authz.md`. `Member` is the
-/// base role — the rebrand from the older `User` label reflects Hearth's
+/// base role — the rebrand from the older `User` label reflects server's
 /// community-oriented framing (see `server-web.md`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Serialize, Deserialize,

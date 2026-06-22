@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth gRPC protobuf stubs (generated from /proto)"
+description = "Sylva Server gRPC protobuf stubs (generated from /proto)"
 
 [lib]
 path = "src/lib.rs"

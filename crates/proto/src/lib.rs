@@ -1,4 +1,4 @@
-//! Generated gRPC stubs for the Sylva Hearth platform API.
+//! Generated gRPC stubs for the Sylva Server platform API.
 //!
 //! This crate is codegen output (protox + tonic-prost-build, see `build.rs`).
 //! It deliberately does not inherit the workspace deny-lints — generated code
@@ -17,5 +17,11 @@ pub mod platform {
 pub mod account {
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/sylva.account.v1.rs"));
+    }
+}
+
+pub mod machine {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/sylva.machine.v1.rs"));
     }
 }

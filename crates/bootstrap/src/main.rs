@@ -338,7 +338,7 @@ fn configure_postgres(data_dir: &Path) -> SetupResult<()> {
         .map_err(|e| format!("reading {}: {e}", conf_path.display()))?;
     let appended = format!(
         "\n\
-         # ── Hearth bundled-Postgres overrides ──────────────────────────\n\
+         # ── server bundled-Postgres overrides ──────────────────────────\n\
          port = {DEFAULT_PORT}\n\
          listen_addresses = '127.0.0.1'\n\
          unix_socket_directories = ''\n\
@@ -357,7 +357,7 @@ fn configure_postgres(data_dir: &Path) -> SetupResult<()> {
 
     let hba_path = data_dir.join("pg_hba.conf");
     let hba_content = "\
-        # Hearth bundled-Postgres authentication\n\
+        # server bundled-Postgres authentication\n\
         # Loopback-only; trust auth is safe because the listener is bound to\n\
         # 127.0.0.1 with no Unix socket exposed to other local users.\n\
         host all all 127.0.0.1/32 trust\n\

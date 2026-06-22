@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Hearth audit module"
+description = "Sylva Server audit module"
 
 [lib]
 name = "audit"

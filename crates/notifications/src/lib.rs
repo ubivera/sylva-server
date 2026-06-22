@@ -213,9 +213,9 @@ impl Notification {
                     InstanceRole::Admin => "Admin",
                     InstanceRole::Member => "User",
                 };
-                let subject = format!("{inviter_display_name} invited you to Sylva Hearth");
+                let subject = format!("{inviter_display_name} invited you to Sylva Server");
                 let body_text = format!(
-                    "{inviter_display_name} has invited you to join their Sylva Hearth instance \
+                    "{inviter_display_name} has invited you to join their Sylva Server instance \
                      as a {role_label}.\n\n\
                      Accept the invitation here:\n  {accept_url}\n\n\
                      This invitation expires on {expires_at}.\n\n\
@@ -224,7 +224,7 @@ impl Notification {
                 );
                 let body_html = format!(
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
-                     <p><strong>{inviter}</strong> has invited you to join their Sylva Hearth \
+                     <p><strong>{inviter}</strong> has invited you to join their Sylva Server \
                      instance as a <strong>{role}</strong>.</p>\
                      <p><a href=\"{url}\" style=\"display:inline-block;padding:10px 16px;\
                      background:#1e6feb;color:#fff;text-decoration:none;border-radius:4px;\">\
@@ -270,7 +270,7 @@ impl Notification {
                 );
                 let body_text = format!(
                     "{initiator_display_name} has initiated a pending role change on your \
-                     Sylva Hearth account:\n\n\
+                     Sylva Server account:\n\n\
                      \tFrom: {from}\n\
                      \tTo:   {to}\n\n\
                      If you don't take action, the change will be applied automatically on \
@@ -283,7 +283,7 @@ impl Notification {
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
                      <p>Hi {target},</p>\
                      <p><strong>{initiator}</strong> has initiated a pending role change on \
-                     your Sylva Hearth account:</p>\
+                     your Sylva Server account:</p>\
                      <ul><li>From: <strong>{from}</strong></li>\
                      <li>To: <strong>{to}</strong></li></ul>\
                      <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
@@ -333,7 +333,7 @@ impl Notification {
                      {target_display_name}"
                 );
                 let body_text = format!(
-                    "Another Owner action on your Sylva Hearth instance needs review.\n\n\
+                    "Another Owner action on your Sylva Server instance needs review.\n\n\
                      {initiator_display_name} has initiated a pending role change on \
                      {target_display_name}'s account:\n\n\
                      \tFrom: {from}\n\
@@ -345,7 +345,7 @@ impl Notification {
                 );
                 let body_html = format!(
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
-                     <p>Heads up — another Owner action on your Sylva Hearth instance needs review.</p>\
+                     <p>Heads up — another Owner action on your Sylva Server instance needs review.</p>\
                      <p><strong>{initiator}</strong> has initiated a pending role change on \
                      <strong>{target}</strong>'s account:</p>\
                      <ul><li>From: <strong>{from}</strong></li>\
@@ -445,14 +445,14 @@ impl Notification {
                 let subject = format!("Your account role has been changed to {role}");
                 let body_text = format!(
                     "Hi {target_display_name},\n\n\
-                     Your role on Sylva Hearth has been changed to {role} by \
+                     Your role on Sylva Server has been changed to {role} by \
                      {initiator_display_name} {how}.\n\n\
                      If you believe this was unauthorized, contact another Owner immediately.\n",
                 );
                 let body_html = format!(
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
                      <p>Hi {target},</p>\
-                     <p>Your role on Sylva Hearth has been changed to <strong>{role}</strong> by \
+                     <p>Your role on Sylva Server has been changed to <strong>{role}</strong> by \
                      <strong>{initiator}</strong> {how}.</p>\
                      <p style=\"color:#666;font-size:13px;\">If you believe this was \
                      unauthorized, contact another Owner immediately.</p>\
@@ -492,7 +492,7 @@ impl Notification {
                 let body_text = format!(
                     "Hi {target_display_name},\n\n\
                      {initiator_display_name} has initiated a pending {noun} on your Sylva \
-                     Hearth account.\n\n\
+                     server account.\n\n\
                      If you don't take action, this will be applied automatically on \
                      {effective_at}.\n\n\
                      If this was not expected, veto the action here:\n  {veto_url}\n\n\
@@ -503,7 +503,7 @@ impl Notification {
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
                      <p>Hi {target},</p>\
                      <p><strong>{initiator}</strong> has initiated a pending <strong>{noun}</strong> \
-                     on your Sylva Hearth account.</p>\
+                     on your Sylva Server account.</p>\
                      <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
                      <p><a href=\"{url}\" style=\"display:inline-block;padding:10px 16px;\
                      background:#d83a3a;color:#fff;text-decoration:none;border-radius:4px;\">\
@@ -547,7 +547,7 @@ impl Notification {
                      {target_display_name}"
                 );
                 let body_text = format!(
-                    "Another Owner action on your Sylva Hearth instance needs review.\n\n\
+                    "Another Owner action on your Sylva Server instance needs review.\n\n\
                      {initiator_display_name} has initiated a pending {noun} on \
                      {target_display_name}'s account.\n\n\
                      If you don't take action, this will apply automatically on \
@@ -557,7 +557,7 @@ impl Notification {
                 );
                 let body_html = format!(
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
-                     <p>Heads up — another Owner action on your Sylva Hearth instance needs review.</p>\
+                     <p>Heads up — another Owner action on your Sylva Server instance needs review.</p>\
                      <p><strong>{initiator}</strong> has initiated a pending \
                      <strong>{noun}</strong> on <strong>{target}</strong>'s account.</p>\
                      <p>If you take no action, this will apply on <strong>{when}</strong>.</p>\
@@ -647,14 +647,14 @@ impl Notification {
                 let subject = format!("Your account has been {past}");
                 let body_text = format!(
                     "Hi {target_display_name},\n\n\
-                     Your Sylva Hearth account has been {past} by {initiator_display_name} \
+                     Your Sylva Server account has been {past} by {initiator_display_name} \
                      {how}.\n\n\
                      If you believe this was unauthorized, contact another Owner immediately.\n",
                 );
                 let body_html = format!(
                     "<!doctype html><html><body style=\"font-family:sans-serif;line-height:1.5;\">\
                      <p>Hi {target},</p>\
-                     <p>Your Sylva Hearth account has been <strong>{past}</strong> by \
+                     <p>Your Sylva Server account has been <strong>{past}</strong> by \
                      <strong>{initiator}</strong> {how}.</p>\
                      <p style=\"color:#666;font-size:13px;\">If you believe this was \
                      unauthorized, contact another Owner immediately.</p>\

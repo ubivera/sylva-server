@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Dev-only one-time bootstrap: download, trim, and initialize the bundled Postgres for Hearth"
+description = "Dev-only one-time bootstrap: download, trim, and initialize the bundled Postgres for server"
 
 [[bin]]
 name = "bootstrap"

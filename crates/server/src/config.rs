@@ -19,10 +19,10 @@ pub struct Config {
     /// emails (e.g., invitation accept URLs). Distinct from `listen_addr`
     /// because production sits behind a reverse proxy on a different host.
     pub public_base_url: String,
-    /// Operator-chosen display name for this Hearth instance. Shown in the
+    /// Operator-chosen display name for this server instance. Shown in the
     /// admin UI brand line ("Sylva · {instance_name}") and in page titles.
-    /// Lets an operator running multiple Hearths tell them apart at a
-    /// glance. Defaults to `"Hearth"` when unset.
+    /// Lets an operator running multiple servers tell them apart at a
+    /// glance. Defaults to `"Server"` when unset.
     pub instance_name: String,
     /// Trust `X-Forwarded-For` / `X-Real-IP` for rate-limit client-IP
     /// keying. Off by default (key on the socket peer, which a client
@@ -77,7 +77,7 @@ const DEFAULT_POSTGRES_URL: &str = "postgresql://sylva@127.0.0.1:15432/sylva";
 // webauthn-rs requires the RP origin to have a domain, and an IP literal
 // has none. localhost still resolves to the loopback listener.
 const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:8443";
-const DEFAULT_INSTANCE_NAME: &str = "Hearth";
+const DEFAULT_INSTANCE_NAME: &str = "Server";
 const DEFAULT_NOTIFICATIONS_MODE: &str = "disabled";
 const DEFAULT_SMTP_PORT: u16 = 587;
 const DEFAULT_SMTP_TLS: &str = "starttls";

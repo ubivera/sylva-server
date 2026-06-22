@@ -277,7 +277,7 @@ pub fn shell_public(title: &str, content: Markup) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " · Hearth" }
+                title { (title) " · Sylva" }
                 // Theme bootstrap — mirrored from the authed shell
                 // so /login (and other public pages an operator
                 // lands on after sign-out) honor the same
@@ -295,7 +295,7 @@ pub fn shell_public(title: &str, content: Markup) -> Markup {
             }
             body class="public" {
                 main class="narrow" {
-                    p class="wordmark" { "Sylva Hearth" }
+                    p class="wordmark" { "Sylva Server" }
                     (content)
                 }
                 footer class="site" {
@@ -1751,7 +1751,7 @@ pub fn members_invite_form_page(
 /// All invites are issued as Member. Promotion to Admin or Owner
 /// happens after the invitee accepts, via the change-role flow on
 /// their row in the directory. That keeps the most-common path (just
-/// add someone to the Hearth) to a single field, and the elevation
+/// add someone to the server) to a single field, and the elevation
 /// path explicit and reauth-gated.
 fn invite_form_fields(
     csrf_token: &str,
@@ -5908,7 +5908,7 @@ pub(crate) fn role_owner_confirm_dialog(
                 }
                 h2 { "Make " (name) " an Owner?" }
                 p class="dialog-description" {
-                    "Owners have full control of this Hearth: they can change "
+                    "Owners have full control of this server: they can change "
                     "any member's role, deactivate or delete accounts, read the "
                     "audit log, and rotate the server-level recovery code. "
                     "Promoting someone to Owner means sharing your authority "
@@ -5919,7 +5919,7 @@ pub(crate) fn role_owner_confirm_dialog(
                           data-confirm-checkbox;
                     span {
                         "I understand the impact of making " strong { (name) }
-                        " an Owner of this Hearth instance."
+                        " an Owner of this server instance."
                     }
                 }
                 input type="hidden" name="role" value="owner";
@@ -6091,7 +6091,7 @@ pub(crate) fn render_action_dialog(action: RowAction, target: &User, csrf_token:
                     h2 { "Change role for " (name) }
                     p class="dialog-description" {
                         "Roles control what someone can do across this "
-                        "Hearth instance, like inviting members, "
+                        "server instance, like inviting members, "
                         "deactivating accounts, and configuring server "
                         "settings. App-level permissions (Tasks lists, "
                         "notes, etc.) are managed separately."
@@ -7368,7 +7368,7 @@ fn settings_notifications_section(
                         (settings_text_row("settings-smtp-from-email", "smtp_from_email",
                             "From address", "email", from_email, "noreply@example.com"))
                         (settings_text_row("settings-smtp-from-name", "smtp_from_name",
-                            "From name", "text", from_name, "Sylva Hearth"))
+                            "From name", "text", from_name, "Sylva Server"))
                     }
                 }
 
