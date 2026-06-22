@@ -21,7 +21,7 @@ use proto::account::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::{PlatformContext, authenticate, internal, parse_uuid};
+use crate::{PlatformContext, authenticate, internal, parse_uuid, rate_key};
 
 /// The `Account` gRPC service implementation.
 pub struct AccountService {
@@ -303,24 +303,6 @@ pub fn account_server(ctx: PlatformContext) -> AccountServer<AccountService> {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-/// The client-IP key for rate-limiting an unauthenticated RPC: the first
-/// `x-forwarded-for` hop when a proxy is trusted, else the socket peer IP
-/// (mirrors `server`'s REST `resolve_client_ip`). Falls back to `"direct"`.
-fn rate_key<T>(request: &Request<T>, trust_proxy: bool) -> String {
-    if trust_proxy
-        && let Some(value) = request.metadata().get("x-forwarded-for")
-        && let Ok(text) = value.to_str()
-        && let Some(first) = text.split(',').next()
-        && !first.trim().is_empty()
-    {
-        return first.trim().to_string();
-    }
-    request
-        .remote_addr()
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "direct".to_string())
-}
 
 fn actor_of(user: &User) -> audit::Actor {
     audit::Actor {

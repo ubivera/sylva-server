@@ -9,8 +9,10 @@
 //! keys, machine, and device atomically); reads + revoke are pool-based,
 //! mirroring [`crate::UserRepository`].
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use rand::{RngCore, rngs::OsRng};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -136,14 +138,22 @@ pub struct Machine {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
-/// Machine-plane writes. Slice 1 is create-only (one machine per enrollment);
-/// reads + the full management plane (dedup, claim lifecycle, location,
-/// app-push) land in slice 2, at which point this gains a pool + read methods.
-pub struct MachineRepository;
+/// Machine-plane writes + reads. Slice-1 device enrollment uses the
+/// transaction-static [`create`](Self::create) (one machine per enrollment);
+/// slice-2's agent uses the pool-based methods to register by machine identity
+/// key and record liveness check-ins (see `docs/design/agent.md`).
+#[derive(Clone)]
+pub struct MachineRepository {
+    pool: PgPool,
+}
 
 impl MachineRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     /// Create a machine row within the caller's transaction (claimed by the
-    /// enrolling user).
+    /// enrolling user). Slice-1 device enrollment.
     pub async fn create(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         label: &str,
@@ -161,6 +171,133 @@ impl MachineRepository {
         .fetch_one(&mut **tx)
         .await?;
         Ok(machine)
+    }
+
+    /// Register (or re-register) a machine by its Ed25519 identity key, within
+    /// the caller's transaction. Idempotent on the key: re-registering updates
+    /// the label/platform and bumps `last_seen_at`. Returns the machine id.
+    pub async fn register_or_update(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        identity_public: &[u8],
+        platform: &str,
+        label: &str,
+    ) -> Result<MachineId> {
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO identity.machines (label, platform, machine_identity_public, last_seen_at)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (machine_identity_public) DO UPDATE
+                 SET label = EXCLUDED.label,
+                     platform = EXCLUDED.platform,
+                     last_seen_at = now()
+             RETURNING id",
+        )
+        .bind(label)
+        .bind(platform)
+        .bind(identity_public)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(MachineId(id))
+    }
+
+    /// Record a liveness check-in: bump `last_seen_at` and the reported agent
+    /// version. Pool-based (single statement).
+    pub async fn touch_checkin(&self, machine_id: MachineId, agent_version: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE identity.machines
+             SET last_seen_at = now(), agent_version = $2
+             WHERE id = $1",
+        )
+        .bind(machine_id)
+        .bind(agent_version)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+// ── machine sessions (slice 2 — the agent's bearer credential) ──────────────────
+
+/// An issued machine session — the agent's bearer credential, carried on
+/// CheckIn/Subscribe. Only the token hash is stored; the raw token lives on the
+/// device's machine-scoped store.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MachineSession {
+    pub id: Uuid,
+    pub machine_id: MachineId,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Generate a 32-byte random machine session token (64-char hex). Mirrors the
+/// user-session + invite-token approach; `sha256(token)` is what's stored.
+pub fn generate_machine_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// SHA-256 of a machine session token — what goes into `token_hash`.
+pub fn hash_machine_token(token: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.finalize().into()
+}
+
+#[derive(Clone)]
+pub struct MachineSessionRepository {
+    pool: PgPool,
+}
+
+impl MachineSessionRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Issue a machine session within the caller's transaction. Returns the row
+    /// + the raw token (handed to the agent; only its hash is persisted).
+    pub async fn create(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        machine_id: MachineId,
+        ttl: Duration,
+    ) -> Result<(MachineSession, String)> {
+        let token = generate_machine_token();
+        let token_hash = hash_machine_token(&token);
+        let expires_at = Utc::now() + ttl;
+        let session: MachineSession = sqlx::query_as(
+            "INSERT INTO identity.machine_sessions (machine_id, token_hash, expires_at)
+             VALUES ($1, $2, $3)
+             RETURNING id, machine_id, created_at, expires_at, revoked_at",
+        )
+        .bind(machine_id)
+        .bind(&token_hash[..])
+        .bind(expires_at)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok((session, token))
+    }
+
+    /// Resolve a raw token to its active (non-revoked, non-expired) machine
+    /// session. `None` if no match.
+    pub async fn find_active(&self, token: &str) -> Result<Option<MachineSession>> {
+        let token_hash = hash_machine_token(token);
+        let session: Option<MachineSession> = sqlx::query_as(
+            "SELECT id, machine_id, created_at, expires_at, revoked_at
+             FROM identity.machine_sessions
+             WHERE token_hash = $1
+               AND revoked_at IS NULL
+               AND expires_at > now()",
+        )
+        .bind(&token_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(session)
     }
 }
 

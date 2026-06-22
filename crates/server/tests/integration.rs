@@ -32,6 +32,8 @@ mod notifications;
 mod pending_transitions;
 #[path = "integration/platform_grpc.rs"]
 mod platform_grpc;
+#[path = "integration/machine_grpc.rs"]
+mod machine_grpc;
 #[path = "integration/recovery.rs"]
 mod recovery;
 // Cross-stack e2e — only built with `--features e2e` (pulls the sibling sylva-sdk).

@@ -24,6 +24,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 pub mod account;
+pub mod machine;
 pub mod registry;
 pub mod resources;
 
@@ -447,6 +448,26 @@ fn internal<E: std::fmt::Debug>(err: &E, op: &str) -> Status {
     Status::internal("internal error")
 }
 
+/// The client-IP key for rate-limiting an unauthenticated RPC: the first
+/// `x-forwarded-for` hop when a proxy is trusted, else the socket peer IP
+/// (mirrors `server`'s REST `resolve_client_ip`). Falls back to `"direct"`.
+/// Shared by the `Account` (`Bootstrap`/`Login`) + `Machine` (`RegisterMachine`)
+/// unauthenticated RPCs.
+fn rate_key<T>(request: &Request<T>, trust_proxy: bool) -> String {
+    if trust_proxy
+        && let Some(value) = request.metadata().get("x-forwarded-for")
+        && let Ok(text) = value.to_str()
+        && let Some(first) = text.split(',').next()
+        && !first.trim().is_empty()
+    {
+        return first.trim().to_string();
+    }
+    request
+        .remote_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "direct".to_string())
+}
+
 /// Map a stored row to its wire form (timestamps as RFC 3339).
 fn to_proto(row: resources::ResourceRow) -> Resource {
     Resource {
@@ -493,7 +514,8 @@ pub async fn serve_grpc(
     tonic::transport::Server::builder()
         .add_service(platform_server(ctx.clone()))
         .add_service(resources_server(ctx.clone()))
-        .add_service(account::account_server(ctx))
+        .add_service(account::account_server(ctx.clone()))
+        .add_service(machine::machine_server(ctx))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
 }

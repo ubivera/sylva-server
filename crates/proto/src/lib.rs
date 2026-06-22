@@ -19,3 +19,9 @@ pub mod account {
         include!(concat!(env!("OUT_DIR"), "/sylva.account.v1.rs"));
     }
 }
+
+pub mod machine {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/sylva.machine.v1.rs"));
+    }
+}
