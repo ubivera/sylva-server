@@ -1,4 +1,4 @@
-use audit::{compute_hash, genesis_hash};
+use audit::{Actor, compute_hash, genesis_hash};
 use chrono::{DateTime, Utc};
 use identity::InstanceRole;
 use serde::Serialize;
@@ -58,55 +58,33 @@ async fn fresh_db_starts_empty() {
 async fn chain_is_intact_after_a_busy_session() {
     let app = TestApp::new().await;
 
-    // Drive a realistic mix of operations so we get heterogeneous event types.
+    // Seed an owner (emits one `test_seed_user` event), then append a realistic
+    // mix of heterogeneous events through the same `audit::append` path the
+    // services use. The chain's integrity is what's under test, independent of
+    // which surface produced the events.
     let owner = app
         .seed_user("owner@test.local", "Owner", "pw", InstanceRole::Owner)
         .await;
-    let owner_tok = app.login(&owner.email, "pw").await;
+    let actor = Actor {
+        user_id: owner.id,
+        display_name: owner.display_name.clone(),
+    };
 
-    let inv: serde_json::Value = app
-        .post(
-            "/api/admin/invites",
-            Some(&owner_tok),
-            Some(json!({ "email": "alice@test.local" })),
-        )
-        .await
-        .json();
-    let alice_tok: String = app
-        .post(
-            "/api/auth/accept-invite",
-            None,
-            Some(json!({
-                "token": inv["token"],
-                "display_name": "Alice",
-                "password": "alicepw",
-            })),
-        )
-        .await
-        .json::<serde_json::Value>()["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    app.patch(
-        "/api/account/profile",
-        Some(&alice_tok),
-        Some(json!({ "display_name": "Alice Q" })),
-    )
-    .await;
-    app.post(
-        "/api/account/password",
-        Some(&alice_tok),
-        Some(json!({ "current_password": "alicepw", "new_password": "alicepw2" })),
-    )
-    .await;
-    // Failed login → audits signin_failed_password.
-    app.post(
-        "/api/auth/login",
-        None,
-        Some(json!({ "email": owner.email, "password": "wrong" })),
-    )
-    .await;
+    let events: &[(&str, serde_json::Value)] = &[
+        ("invite_created", json!({ "email": "alice@test.local" })),
+        ("account_accepted_invite", json!({ "display_name": "Alice" })),
+        ("profile_updated", json!({ "display_name": "Alice Q" })),
+        ("password_changed", json!({})),
+        ("signin_failed_password", json!({ "email": owner.email })),
+        ("signin_success", json!({ "email": owner.email })),
+    ];
+    for (event_type, data) in events {
+        let mut tx = app.pool.begin().await.unwrap();
+        audit::append(&mut tx, Some(&actor), None, event_type, data.clone())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
 
     let rows = fetch_chain(&app.pool).await;
     assert!(
@@ -161,10 +139,9 @@ async fn tampering_with_event_data_is_detectable() {
     // If somebody mutates a stored event_data row, recomputing the hash from
     // the (mutated) canonical bytes must NOT match the stored hash.
     let app = TestApp::new().await;
-    let owner = app
-        .seed_user("o@test.local", "O", "pw", InstanceRole::Owner)
+    // `seed_user` emits one `test_seed_user` audit event — the row we tamper with.
+    app.seed_user("o@test.local", "O", "pw", InstanceRole::Owner)
         .await;
-    let _ = app.login(&owner.email, "pw").await; // adds a signin_success event
 
     sqlx::query(
         "UPDATE audit.events SET event_data = $1 WHERE seqno = (SELECT MIN(seqno) FROM audit.events)",

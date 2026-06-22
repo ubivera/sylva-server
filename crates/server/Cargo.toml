@@ -25,28 +25,18 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-sha2 = { workspace = true }
-hmac = { workspace = true }
-subtle = { workspace = true }
-arc-swap = { workspace = true }
 rand = { workspace = true }
 ed25519-dalek = { workspace = true }
-webauthn-rs = { workspace = true }
-url = { workspace = true }
 
 identity = { path = "../identity" }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
-authz = { path = "../authz" }
-notifications = { path = "../notifications" }
-pending = { path = "../pending" }
 platform = { path = "../platform" }
 
 # Optional, `e2e`-feature only: the real SDK client, to drive the cross-stack
@@ -59,8 +49,6 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
-web = { path = "../web" }
-arc-swap = { workspace = true }
 proto = { path = "../proto" }
 platform = { path = "../platform" }
 tonic = { workspace = true }

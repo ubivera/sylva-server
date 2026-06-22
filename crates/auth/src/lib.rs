@@ -248,9 +248,8 @@ pub async fn create_credentials(
 }
 
 /// True when the user has at least one active second factor — a *verified*
-/// TOTP authenticator or any registered passkey. Used to gate post-password
-/// MFA. Mirrors `server::mfa::has_second_factor`, exposed here so the gRPC
-/// `Account` service — which can't depend on `server` — can check it.
+/// TOTP authenticator or any registered passkey. Used by the gRPC `Account`
+/// service to gate post-password MFA.
 pub async fn has_second_factor(pool: &PgPool, user_id: UserId) -> Result<bool> {
     let (count,): (i64,) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM auth.totp_credentials
