@@ -13,9 +13,11 @@ use identity::{
     UserKeyMaterial, UserKeyRepository, UserLifecycle, UserRepository,
 };
 use proto::account::v1::{
-    BootstrapRequest, Device as ProtoDevice, DeviceEnrollment, DeviceId as ProtoDeviceId, Empty,
-    GetKeyMaterialResponse, KeyMaterial as ProtoKeyMaterial, ListMyDevicesResponse, LoginRequest,
-    LoginResponse, MfaRequired, RegisterDeviceRequest, Session as ProtoSession, VerifyMfaRequest,
+    BootstrapRequest, ChangePasswordRequest, Device as ProtoDevice, DeviceEnrollment,
+    DeviceId as ProtoDeviceId, Empty, GetKeyMaterialResponse, KeyMaterial as ProtoKeyMaterial,
+    ListMyDevicesResponse, LoginRequest, LoginResponse, MfaRequired, Profile as ProtoProfile,
+    RegisterDeviceRequest, Session as ProtoSession, UpdateDisplayNameRequest, UpdateEmailRequest,
+    VerifyMfaRequest,
     account_server::{Account, AccountServer},
     login_response,
 };
@@ -248,6 +250,159 @@ impl Account for AccountService {
             Err(err) => Err(internal(&err, "revoke_device")),
         }
     }
+
+    // ── Account self-service ───────────────────────────────────────────────────
+
+    async fn get_profile(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<ProtoProfile>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        Ok(Response::new(profile_of(&user)))
+    }
+
+    async fn update_display_name(
+        &self,
+        request: Request<UpdateDisplayNameRequest>,
+    ) -> Result<Response<ProtoProfile>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let display_name = request.into_inner().display_name.trim().to_string();
+        if display_name.is_empty() {
+            return Err(Status::invalid_argument("display_name is required"));
+        }
+
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .map_err(|err| internal(&err, "update_display_name:begin"))?;
+        let updated = UserRepository::update_profile(&mut tx, user.id, Some(&display_name), None)
+            .await
+            .map_err(|err| internal(&err, "update_display_name:update"))?;
+        let actor = actor_of(&updated);
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "display_name_changed",
+            serde_json::json!({ "display_name": updated.display_name }),
+        )
+        .await
+        .map_err(|err| internal(&err, "update_display_name:audit"))?;
+        tx.commit()
+            .await
+            .map_err(|err| internal(&err, "update_display_name:commit"))?;
+        Ok(Response::new(profile_of(&updated)))
+    }
+
+    async fn update_email(
+        &self,
+        request: Request<UpdateEmailRequest>,
+    ) -> Result<Response<ProtoProfile>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let req = request.into_inner();
+        // Re-auth before a sensitive change (mirrors the destructive-action
+        // password gate on the members surface).
+        if !auth::verify_user_password(&self.ctx.pool, user.id, &req.current_password)
+            .await
+            .map_err(|err| internal(&err, "update_email:verify"))?
+        {
+            return Err(Status::unauthenticated("current password is incorrect"));
+        }
+        let new_email = req.new_email.trim().to_string();
+        if new_email.is_empty() {
+            return Err(Status::invalid_argument("new_email is required"));
+        }
+
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .map_err(|err| internal(&err, "update_email:begin"))?;
+        let updated = match UserRepository::update_email(&mut tx, user.id, &new_email).await {
+            Ok(user) => user,
+            // The `email_lower` unique index rejects an address already in use.
+            Err(identity::IdentityError::Database(sqlx::Error::Database(dbe)))
+                if dbe.code().as_deref() == Some("23505") =>
+            {
+                return Err(Status::already_exists("that email address is already in use"));
+            }
+            Err(err) => return Err(internal(&err, "update_email:update")),
+        };
+        let actor = actor_of(&updated);
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "email_changed",
+            serde_json::json!({ "email": updated.email }),
+        )
+        .await
+        .map_err(|err| internal(&err, "update_email:audit"))?;
+        tx.commit()
+            .await
+            .map_err(|err| internal(&err, "update_email:commit"))?;
+        Ok(Response::new(profile_of(&updated)))
+    }
+
+    async fn change_password(
+        &self,
+        request: Request<ChangePasswordRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let req = request.into_inner();
+        if !auth::verify_user_password(&self.ctx.pool, user.id, &req.current_password)
+            .await
+            .map_err(|err| internal(&err, "change_password:verify"))?
+        {
+            return Err(Status::unauthenticated("current password is incorrect"));
+        }
+        if req.new_password.is_empty() {
+            return Err(Status::invalid_argument("new_password is required"));
+        }
+
+        let new_phc = auth::hash_password(&req.new_password)
+            .map_err(|err| internal(&err, "change_password:hash"))?;
+
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .map_err(|err| internal(&err, "change_password:begin"))?;
+        // Server-side verifier (recomputed) + the client's 2SKD re-wrap of the
+        // master key go together: a return needs only the new password.
+        auth::update_password_hash(&mut tx, user.id, &new_phc)
+            .await
+            .map_err(|err| internal(&err, "change_password:credentials"))?;
+        UserKeyRepository::update(
+            &mut tx,
+            user.id,
+            &req.new_master_key_wrapped,
+            &req.new_kdf_salt,
+            &req.new_kdf_params,
+        )
+        .await
+        .map_err(|err| internal(&err, "change_password:keys"))?;
+        let actor = actor_of(&user);
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "password_changed",
+            serde_json::json!({}),
+        )
+        .await
+        .map_err(|err| internal(&err, "change_password:audit"))?;
+        tx.commit()
+            .await
+            .map_err(|err| internal(&err, "change_password:commit"))?;
+        // Deferred hardening: other live sessions are NOT revoked here — a
+        // password change should eventually invalidate sibling sessions.
+        Ok(Response::new(Empty {}))
+    }
 }
 
 impl AccountService {
@@ -308,6 +463,23 @@ fn actor_of(user: &User) -> audit::Actor {
     audit::Actor {
         user_id: user.id,
         display_name: user.display_name.clone(),
+    }
+}
+
+/// Map an `identity::User` to the wire `Profile`. The role token is spelled out
+/// explicitly so the contract doesn't ride on serde's `InstanceRole` encoding
+/// (mirrors `Platform::who_am_i`).
+fn profile_of(user: &User) -> ProtoProfile {
+    let instance_role = match user.instance_role {
+        InstanceRole::Owner => "owner",
+        InstanceRole::Admin => "admin",
+        InstanceRole::Member => "member",
+    };
+    ProtoProfile {
+        user_id: user.id.to_string(),
+        email: user.email.clone(),
+        display_name: user.display_name.clone(),
+        instance_role: instance_role.to_string(),
     }
 }
 

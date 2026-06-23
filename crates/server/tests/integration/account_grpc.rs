@@ -6,8 +6,9 @@
 
 use identity::InstanceRole;
 use proto::account::v1::{
-    BootstrapRequest, DeviceEnrollment, DeviceId, Empty, KeyMaterial, LoginRequest,
-    RegisterDeviceRequest, account_client::AccountClient, login_response::Outcome,
+    BootstrapRequest, ChangePasswordRequest, DeviceEnrollment, DeviceId, Empty, KeyMaterial,
+    LoginRequest, RegisterDeviceRequest, UpdateDisplayNameRequest, UpdateEmailRequest,
+    account_client::AccountClient, login_response::Outcome,
 };
 
 use crate::common::TestApp;
@@ -454,6 +455,295 @@ async fn login_is_rate_limited_per_ip() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+    let _ = shutdown.send(true);
+}
+
+// ── Account self-service ───────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_and_update_profile_round_trips() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let session = client
+        .bootstrap(tonic::Request::new(bootstrap_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    let token = session.token;
+
+    // GetProfile reflects the bootstrapped owner.
+    let profile = client
+        .get_profile(authed(&token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(profile.user_id, session.user_id);
+    assert_eq!(profile.email, "owner@test.local");
+    assert_eq!(profile.display_name, "Olivia");
+    assert_eq!(profile.instance_role, "owner");
+
+    // UpdateDisplayName changes it and returns the updated profile…
+    let updated = client
+        .update_display_name(authed(
+            &token,
+            UpdateDisplayNameRequest {
+                display_name: "Liv".to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(updated.display_name, "Liv");
+    // …and a re-GetProfile confirms it persisted.
+    let after = client
+        .get_profile(authed(&token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(after.display_name, "Liv");
+
+    // A blank display name is rejected.
+    let err = client
+        .update_display_name(authed(
+            &token,
+            UpdateDisplayNameRequest {
+                display_name: "   ".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // An `display_name_changed` audit event was recorded.
+    let (events,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit.events WHERE event_type = 'display_name_changed'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_email_requires_the_current_password() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let session = client
+        .bootstrap(tonic::Request::new(bootstrap_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    let token = session.token;
+
+    // Wrong current password → unauthenticated (and the email is unchanged).
+    let err = client
+        .update_email(authed(
+            &token,
+            UpdateEmailRequest {
+                new_email: "new@test.local".to_string(),
+                current_password: "wrong".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Right password → the email changes.
+    let updated = client
+        .update_email(authed(
+            &token,
+            UpdateEmailRequest {
+                new_email: "new@test.local".to_string(),
+                current_password: PW.to_string(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(updated.email, "new@test.local");
+    let (email,): (String,) =
+        sqlx::query_as("SELECT email FROM identity.users WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&session.user_id).unwrap())
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(email, "new@test.local");
+
+    // An email already in use by another account → already_exists.
+    app.seed_user("taken@test.local", "Sam", "pw", InstanceRole::Member)
+        .await;
+    let err = client
+        .update_email(authed(
+            &token,
+            UpdateEmailRequest {
+                new_email: "taken@test.local".to_string(),
+                current_password: PW.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_password_updates_verifier_and_key_wrap() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let session = client
+        .bootstrap(tonic::Request::new(bootstrap_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    let token = session.token;
+    let user_id = uuid::Uuid::parse_str(&session.user_id).unwrap();
+
+    // Wrong current password → unauthenticated.
+    let err = client
+        .change_password(authed(
+            &token,
+            ChangePasswordRequest {
+                current_password: "wrong".to_string(),
+                new_password: "new-secret".to_string(),
+                new_master_key_wrapped: vec![9u8; 72],
+                new_kdf_salt: vec![8u8; 16],
+                new_kdf_params: r#"{"m":65536,"t":3,"p":4}"#.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // The original verifier still verifies the old password (the failed attempt
+    // changed nothing).
+    let (hash_before,): (String,) =
+        sqlx::query_as("SELECT password_hash FROM auth.credentials WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(auth::verify_user_password(&app.pool, identity::UserId::new(user_id), PW)
+        .await
+        .unwrap());
+
+    // Right current password → the verifier is recomputed and the key wrap rotates.
+    client
+        .change_password(authed(
+            &token,
+            ChangePasswordRequest {
+                current_password: PW.to_string(),
+                new_password: "new-secret".to_string(),
+                new_master_key_wrapped: vec![9u8; 72],
+                new_kdf_salt: vec![8u8; 16],
+                new_kdf_params: r#"{"m":1,"t":1,"p":1}"#.to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    // The server-side verifier now accepts the new password, not the old one.
+    assert!(auth::verify_user_password(&app.pool, identity::UserId::new(user_id), "new-secret")
+        .await
+        .unwrap());
+    assert!(!auth::verify_user_password(&app.pool, identity::UserId::new(user_id), PW)
+        .await
+        .unwrap());
+    let (hash_after,): (String,) =
+        sqlx::query_as("SELECT password_hash FROM auth.credentials WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_ne!(hash_before, hash_after, "the verifier was recomputed");
+
+    // The re-wrapped master key + salt + params landed in user_keys.
+    let (wrapped, salt, params): (Vec<u8>, Vec<u8>, String) = sqlx::query_as(
+        "SELECT master_key_wrapped, kdf_salt, kdf_params FROM identity.user_keys WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(wrapped, vec![9u8; 72]);
+    assert_eq!(salt, vec![8u8; 16]);
+    assert_eq!(params, r#"{"m":1,"t":1,"p":1}"#);
+    // The private-key wraps are untouched (only the master-key wrap rotates).
+    let (x_priv,): (Vec<u8>,) =
+        sqlx::query_as("SELECT x25519_private_wrapped FROM identity.user_keys WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(x_priv, vec![3u8; 48], "private-key wrap unchanged");
+
+    // The new password now logs in (end-to-end verifier swap).
+    let resp = client
+        .login(tonic::Request::new(LoginRequest {
+            email: "owner@test.local".to_string(),
+            password: "new-secret".to_string(),
+            mfa_challenge_token: String::new(),
+            mfa_response: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(resp.outcome, Some(Outcome::Session(_))));
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_service_rpcs_require_auth() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let codes = [
+        client
+            .get_profile(tonic::Request::new(Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .update_display_name(tonic::Request::new(UpdateDisplayNameRequest {
+                display_name: "X".to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .update_email(tonic::Request::new(UpdateEmailRequest {
+                new_email: "x@test.local".to_string(),
+                current_password: PW.to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .change_password(tonic::Request::new(ChangePasswordRequest {
+                current_password: PW.to_string(),
+                new_password: "y".to_string(),
+                new_master_key_wrapped: vec![1u8; 8],
+                new_kdf_salt: vec![2u8; 8],
+                new_kdf_params: "{}".to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+    ];
+    for code in codes {
+        assert_eq!(code, tonic::Code::Unauthenticated);
+    }
 
     let _ = shutdown.send(true);
 }

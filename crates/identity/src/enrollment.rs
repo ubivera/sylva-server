@@ -114,6 +114,32 @@ impl UserKeyRepository {
         Ok(())
     }
 
+    /// Re-wrap a user's master key within the caller's transaction (password
+    /// change): the client re-derives `KEK = KDF(new_password, secret_key)` over
+    /// a fresh salt and hands back the new `master_key_wrapped` + salt + params.
+    /// The master-key-wrapped *private* keys don't change (the master key is
+    /// unchanged), so only these three columns rotate.
+    pub async fn update(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: UserId,
+        master_key_wrapped: &[u8],
+        kdf_salt: &[u8],
+        kdf_params: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE identity.user_keys
+             SET master_key_wrapped = $2, kdf_salt = $3, kdf_params = $4
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .bind(master_key_wrapped)
+        .bind(kdf_salt)
+        .bind(kdf_params)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Fetch a user's key bundle (for `GetKeyMaterial`). `None` if the user has
     /// no provisioned crypto yet.
     pub async fn get(&self, user_id: UserId) -> Result<Option<UserKeyMaterial>> {
