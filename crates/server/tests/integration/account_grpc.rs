@@ -77,6 +77,7 @@ async fn spawn_grpc_with_limiter(
         resources: platform::resources::ResourceRepository::new(app.pool.clone()),
         user_keys: identity::UserKeyRepository::new(app.pool.clone()),
         devices: identity::DeviceRepository::new(app.pool.clone()),
+        user_avatars: identity::UserAvatarRepository::new(app.pool.clone()),
         pool: app.pool.clone(),
         secret_key: std::sync::Arc::new([0u8; 32]),
         auth_rate_limiter,

@@ -39,6 +39,8 @@ pub struct PlatformContext {
     pub resources: resources::ResourceRepository,
     pub user_keys: identity::UserKeyRepository,
     pub devices: identity::DeviceRepository,
+    /// The account avatar store (client-sealed blob; server stores opaque bytes).
+    pub user_avatars: identity::UserAvatarRepository,
     /// Pool for registry queries + audit transactions (app registration, enrollment).
     pub pool: sqlx::PgPool,
     pub secret_key: Arc<[u8; 32]>,

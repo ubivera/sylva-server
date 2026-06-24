@@ -156,6 +156,7 @@ async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyho
         resources: platform::resources::ResourceRepository::new(pool.clone()),
         user_keys: identity::UserKeyRepository::new(pool.clone()),
         devices: identity::DeviceRepository::new(pool.clone()),
+        user_avatars: identity::UserAvatarRepository::new(pool.clone()),
         pool: pool.clone(),
         secret_key: secret_key.clone(),
         auth_rate_limiter,

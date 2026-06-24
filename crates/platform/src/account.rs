@@ -14,16 +14,20 @@ use identity::{
 };
 use proto::account::v1::{
     BootstrapRequest, ChangePasswordRequest, Device as ProtoDevice, DeviceEnrollment,
-    DeviceId as ProtoDeviceId, Empty, GetKeyMaterialResponse, KeyMaterial as ProtoKeyMaterial,
-    ListMyDevicesResponse, LoginRequest, LoginResponse, MfaRequired, Profile as ProtoProfile,
-    RegisterDeviceRequest, Session as ProtoSession, UpdateDisplayNameRequest, UpdateEmailRequest,
-    VerifyMfaRequest,
+    DeviceId as ProtoDeviceId, Empty, GetAvatarResponse, GetKeyMaterialResponse,
+    KeyMaterial as ProtoKeyMaterial, ListMyDevicesResponse, LoginRequest, LoginResponse,
+    MfaRequired, Profile as ProtoProfile, RegisterDeviceRequest, Session as ProtoSession,
+    SetAvatarRequest, UpdateDisplayNameRequest, UpdateEmailRequest, VerifyMfaRequest,
     account_server::{Account, AccountServer},
     login_response,
 };
 use tonic::{Request, Response, Status};
 
 use crate::{PlatformContext, authenticate, internal, parse_uuid, rate_key};
+
+/// Hard ceiling on the opaque (client-sealed) avatar blob the server will store.
+/// The server never sees plaintext, so this is the only avatar policy it enforces.
+const MAX_AVATAR_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// The `Account` gRPC service implementation.
 pub struct AccountService {
@@ -402,6 +406,37 @@ impl Account for AccountService {
         // Deferred hardening: other live sessions are NOT revoked here — a
         // password change should eventually invalidate sibling sessions.
         Ok(Response::new(Empty {}))
+    }
+
+    // ── Avatar (E2E; opaque to the server) ─────────────────────────────────────
+
+    async fn get_avatar(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<GetAvatarResponse>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        match self.ctx.user_avatars.get(user.id).await {
+            // No avatar set → empty bytes (the contract's "unset" signal).
+            Ok(avatar) => Ok(Response::new(GetAvatarResponse {
+                avatar: avatar.unwrap_or_default(),
+            })),
+            Err(err) => Err(internal(&err, "get_avatar")),
+        }
+    }
+
+    async fn set_avatar(
+        &self,
+        request: Request<SetAvatarRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let req = request.into_inner();
+        if req.avatar.len() > MAX_AVATAR_BYTES {
+            return Err(Status::invalid_argument("avatar too large"));
+        }
+        match self.ctx.user_avatars.upsert(user.id, &req.avatar).await {
+            Ok(()) => Ok(Response::new(Empty {})),
+            Err(err) => Err(internal(&err, "set_avatar")),
+        }
     }
 }
 

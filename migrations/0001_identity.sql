@@ -78,6 +78,15 @@ CREATE TABLE identity.user_keys (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- The account avatar, sealed CLIENT-SIDE under the user's master key (symmetric
+-- E2E). 1:1 with users (one avatar, overwritten on change). The server stores
+-- the opaque blob ONLY — never plaintext; it just enforces a byte cap.
+CREATE TABLE identity.user_avatars (
+    user_id    UUID PRIMARY KEY REFERENCES identity.users(id) ON DELETE CASCADE,
+    avatar     BYTEA NOT NULL,                                  -- client-sealed blob
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- The machine plane (thin in slice 1; the always-on agent + management plane is
 -- slice 2 — see docs/design/agent.md). One machine hosts many per-OS-user
 -- enrollments. `claimed_by_user_id` is the slice-1 single-claim reference; the

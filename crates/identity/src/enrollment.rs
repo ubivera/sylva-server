@@ -152,6 +152,50 @@ impl UserKeyRepository {
     }
 }
 
+// ── user_avatars (E2E avatar) ──────────────────────────────────────────────────
+
+/// The account avatar, sealed client-side under the user's master key. 1:1 with
+/// users; the server stores the opaque blob ONLY (never plaintext). `user_id` is
+/// the query key, so it isn't a field here.
+#[derive(Clone)]
+pub struct UserAvatarRepository {
+    pool: PgPool,
+}
+
+impl UserAvatarRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Fetch the user's sealed avatar blob (for `GetAvatar`). `None` if the user
+    /// has not set one.
+    pub async fn get(&self, user_id: UserId) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT avatar FROM identity.user_avatars WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(avatar,)| avatar))
+    }
+
+    /// Store the user's sealed avatar blob, overwriting any prior one (`SetAvatar`).
+    /// Pool-based (single statement) — the blob is opaque, so there's nothing else
+    /// to write atomically with it.
+    pub async fn upsert(&self, user_id: UserId, avatar: &[u8]) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO identity.user_avatars (user_id, avatar)
+             VALUES ($1, $2)
+             ON CONFLICT (user_id) DO UPDATE
+                 SET avatar = EXCLUDED.avatar, updated_at = now()",
+        )
+        .bind(user_id)
+        .bind(avatar)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 // ── machines (thin; full plane is slice 2) ─────────────────────────────────────
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
