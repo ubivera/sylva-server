@@ -25,7 +25,7 @@ use axum::{
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 
-use crate::app::AppState;
+use crate::DiscoveryState;
 
 /// Bumped whenever the signed-payload layout changes, so clients can refuse a
 /// layout they don't understand rather than silently mis-verify.
@@ -60,22 +60,22 @@ struct DiscoveryResponse {
 }
 
 /// The discovery sub-router, mounted at the server root (alongside `/health`)
-/// so it bypasses the API prefix, auth, and the closed-instance page.
-pub fn router(state: AppState) -> Router {
+/// so it bypasses auth and any prefix.
+pub fn router(state: DiscoveryState) -> Router {
     Router::new()
         .route("/.well-known/sylva-discovery", get(handler))
         .with_state(state)
 }
 
 async fn handler(
-    State(state): State<AppState>,
+    State(state): State<DiscoveryState>,
     Query(query): Query<DiscoveryQuery>,
 ) -> Result<Json<DiscoveryResponse>, StatusCode> {
     if query.nonce.len() > MAX_NONCE_LEN {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let name = state.instance_name.load_full().as_ref().clone();
-    let grpc_port = state.env_config.grpc_listen_addr.port();
+    let name = state.instance_name.clone();
+    let grpc_port = state.grpc_port;
     let identity = &state.server_identity;
 
     let payload = canonical_bytes(&query.nonce, &identity.public, grpc_port, &name);

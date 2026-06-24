@@ -1,46 +1,63 @@
-pub mod account_logic;
-pub mod account_routes;
-pub mod admin_logic;
-pub mod admin_routes;
-pub mod app;
-pub mod auth_routes;
 pub mod config;
-pub mod csrf;
 pub mod db;
 pub mod discovery;
 pub mod health;
 pub mod instance;
 #[cfg(windows)]
 pub mod job_object;
-pub mod mfa;
 pub mod postgres;
-pub mod rate_limit;
-pub mod settings_logic;
 pub mod shutdown;
-pub mod signed_token;
-pub mod webauthn;
 pub mod telemetry;
-pub mod views;
+
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
+use auth::SessionRepository;
+use identity::{InvitationRepository, UserRepository};
+use sqlx::PgPool;
 
-/// Type of the UI-router builder passed in by the bin crate. Given the
-/// composed [`app::AppState`], returns an `axum::Router` to be merged
-/// alongside the JSON API at server boot.
-pub type UiRouterFn = fn(app::AppState) -> axum::Router;
+/// Minimal state for the public discovery endpoint (`/.well-known/sylva-discovery`).
+/// Holds only what the signed payload needs: the instance display name, the
+/// advertised gRPC port, and the server identity keypair to sign with. Cloning
+/// is cheap (every field is a handle or `Copy`).
+#[derive(Clone)]
+pub struct DiscoveryState {
+    /// Operator-chosen display name for this instance, advertised in discovery.
+    /// Seeded at startup from the DB override or `SYLVA_INSTANCE_NAME`.
+    pub instance_name: String,
+    /// The gRPC port clients dial after discovery.
+    pub grpc_port: u16,
+    /// The server's Ed25519 identity keypair — the trust anchor native clients
+    /// (Sylva Hub) TOFU-pin; used to sign the discovery response. See
+    /// [`crate::instance::ServerIdentity`] + [`crate::discovery`].
+    pub server_identity: Arc<crate::instance::ServerIdentity>,
+}
 
-/// Entry point used by `sylva-server`'s `main`. The `ui_router` parameter
-/// lets the binary plug in the [`web`](https://docs.rs/web) crate's HTML
-/// router without `server` having a circular dependency on it.
-pub fn run(ui_router: UiRouterFn) -> anyhow::Result<()> {
+/// Minimal state for the `/health` ops endpoint. Holds the pool plus the
+/// repositories whose counts the health body reports, and the process start
+/// instant for uptime.
+#[derive(Clone)]
+pub struct HealthState {
+    pub started_at: Instant,
+    pub db: PgPool,
+    pub users: UserRepository,
+    pub sessions: SessionRepository,
+    pub invitations: InvitationRepository,
+}
+
+/// Entry point used by `sylva-server`'s `main`. The server exposes only the
+/// gRPC platform API plus the public discovery + `/health` endpoints on the
+/// HTTP listener; there is no web/REST surface.
+pub fn run() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build Tokio runtime")?;
-    runtime.block_on(run_async(ui_router))
+    runtime.block_on(run_async())
 }
 
-async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
+async fn run_async() -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
     telemetry::init(&config)?;
 
@@ -85,7 +102,7 @@ async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
         .context("waiting for postgres SQL layer to come up")?;
     tracing::info!("bundled postgres SQL layer ready");
 
-    let serve_result = serve(&config, started_at, ui_router).await;
+    let serve_result = serve(&config, started_at).await;
 
     if let Err(err) = postgres.stop().await {
         tracing::warn!(?err, "error stopping postgres");
@@ -94,11 +111,7 @@ async fn run_async(ui_router: UiRouterFn) -> anyhow::Result<()> {
     serve_result
 }
 
-async fn serve(
-    config: &config::Config,
-    started_at: std::time::Instant,
-    ui_router: UiRouterFn,
-) -> anyhow::Result<()> {
+async fn serve(config: &config::Config, started_at: std::time::Instant) -> anyhow::Result<()> {
     let pool = db::connect(&config.postgres_url).await?;
     db::run_migrations(&pool).await?;
     tracing::info!("migrations up to date");
@@ -107,21 +120,14 @@ async fn serve(
     let sessions = auth::SessionRepository::new(pool.clone());
     let invitations = identity::InvitationRepository::new(pool.clone());
 
-    // Effective config = DB overrides (Owner Settings page) layered over the
-    // env defaults. Seeds the hot-swappable `instance_name` + `notifier` cells;
-    // the notifier cell is shared with the worker so a live SMTP change applies
-    // on the next send.
+    // Instance display name = DB override (if set) layered over the env default.
+    // Advertised in the discovery payload.
     let secret_key = std::sync::Arc::new(config.load_secret_key()?);
-    let effective = instance::effective(&pool, config, &secret_key).await?;
-    let notifier = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(build_notifier(
-        &effective.notifications,
-    )?));
-    let instance_name =
-        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(effective.instance_name));
-    let notif_worker = notifications::Worker::new(pool.clone(), notifier.clone());
-    // One shutdown signal fans out to both servers (HTTP + gRPC) and both
-    // background workers. `shutdown::signal()` can only be awaited once, so a
-    // bridge task awaits it and flips this watch; everyone else observes it.
+    let instance_name = instance::server_name(&pool, config).await?;
+
+    // One shutdown signal fans out to both servers (HTTP + gRPC).
+    // `shutdown::signal()` can only be awaited once, so a bridge task awaits it
+    // and flips this watch; everyone else observes it.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
     {
         let shutdown_tx = shutdown_tx.clone();
@@ -130,25 +136,6 @@ async fn serve(
             let _ = shutdown_tx.send(true);
         });
     }
-    let notif_handle = tokio::spawn(
-        notif_worker.run_forever(std::time::Duration::from_secs(5), shutdown_rx.clone()),
-    );
-    tracing::info!(
-        mode = ?notifications_mode_label(&effective.notifications),
-        "notification worker started"
-    );
-
-    let pending_worker = pending::Worker::new(pool.clone());
-    let pending_handle = tokio::spawn(
-        pending_worker.run_forever(std::time::Duration::from_secs(30), shutdown_rx.clone()),
-    );
-    tracing::info!("pending-transition worker started");
-
-    // Seed the cached closed flag from the persistent singleton so a restart
-    // of an already-closed instance keeps serving the closed page.
-    let instance_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        instance::load_closed(&pool).await.unwrap_or(false),
-    ));
 
     // Load (or, on first run, generate + persist) the server identity keypair —
     // the trust anchor native clients pin and the key the discovery endpoint
@@ -156,55 +143,47 @@ async fn serve(
     let server_identity =
         std::sync::Arc::new(instance::ensure_server_identity(&pool, &secret_key).await?);
 
-    // One auth limiter, shared by the REST auth endpoints and the gRPC
-    // `Account.Bootstrap`/`Login` RPCs — so a brute-forcer hitting the same IP
-    // across both surfaces is bounded by a single per-IP bucket.
-    let auth_rate_limiter = std::sync::Arc::new(rate_limit::RateLimiter::auth_default());
+    // Auth limiter for the gRPC `Account.Bootstrap`/`Login` RPCs — a single
+    // per-IP bucket bounding brute-force attempts.
+    let auth_rate_limiter =
+        std::sync::Arc::new(auth::ratelimit::RateLimiter::auth_default());
 
     // Context for the gRPC platform services — clones of the same repositories
-    // the REST layer uses (cheap; each just wraps the pool). Built before the
-    // AppState literal below moves the originals.
+    // (cheap; each just wraps the pool).
     let platform_ctx = platform::PlatformContext {
         sessions: sessions.clone(),
         users: users.clone(),
         resources: platform::resources::ResourceRepository::new(pool.clone()),
         user_keys: identity::UserKeyRepository::new(pool.clone()),
         devices: identity::DeviceRepository::new(pool.clone()),
+        user_avatars: identity::UserAvatarRepository::new(pool.clone()),
         pool: pool.clone(),
         secret_key: secret_key.clone(),
-        auth_rate_limiter: auth_rate_limiter.clone(),
+        auth_rate_limiter,
         trust_proxy: config.trust_proxy,
     };
 
-    let state = app::AppState {
+    let health_state = HealthState {
         started_at,
         db: pool.clone(),
         users,
         sessions,
         invitations,
-        public_base_url: config.public_base_url.clone(),
-        instance_name,
-        notifier,
-        env_config: std::sync::Arc::new(config.clone()),
-        csrf_secret: std::sync::Arc::new(csrf::generate_secret()),
-        rate_limiter: auth_rate_limiter,
-        secret_key,
-        trust_proxy: config.trust_proxy,
-        instance_closed,
-        server_identity,
     };
-
     let health = axum::Router::new()
         .route("/health", axum::routing::get(health::handler))
-        .with_state(state.clone());
+        .with_state(health_state);
 
     // Public, unauthenticated discovery — mounted at the root (like /health) so
-    // it bypasses the API prefix, auth, and the closed-instance page.
-    let discovery = discovery::router(state.clone());
+    // it bypasses any prefix and auth.
+    let discovery_state = DiscoveryState {
+        instance_name,
+        grpc_port: config.grpc_listen_addr.port(),
+        server_identity,
+    };
+    let discovery = discovery::router(discovery_state);
 
     let router = axum::Router::new()
-        .nest("/api", app::api_router(state.clone()))
-        .merge(ui_router(state))
         .merge(health)
         .merge(discovery)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -228,9 +207,9 @@ async fn serve(
         }))
     };
 
-    // `into_make_service_with_connect_info` surfaces the socket peer
-    // address to handlers (via `ConnectInfo`), which the `ClientIp`
-    // extractor uses for rate-limit keying when no trusted proxy is set.
+    // `into_make_service_with_connect_info` surfaces the socket peer address to
+    // handlers (via `ConnectInfo`); kept for parity with the gRPC rate-limit
+    // keying path.
     let mut axum_shutdown_rx = shutdown_rx.clone();
     let serve_outcome = axum::serve(
         listener,
@@ -251,47 +230,8 @@ async fn serve(
         Ok(Err(err)) => tracing::warn!(?err, "grpc server error"),
         Err(err) => tracing::warn!(?err, "grpc server join failed"),
     }
-    if let Err(err) = notif_handle.await {
-        tracing::warn!(?err, "notification worker join failed");
-    }
-    if let Err(err) = pending_handle.await {
-        tracing::warn!(?err, "pending-transition worker join failed");
-    }
 
     pool.close().await;
     tracing::info!("server http server stopped");
     serve_outcome
-}
-
-fn build_notifier(cfg: &config::NotificationsConfig) -> anyhow::Result<notifications::NotifierImpl> {
-    match cfg {
-        config::NotificationsConfig::Disabled => Ok(notifications::NotifierImpl::Disabled),
-        config::NotificationsConfig::Log => Ok(notifications::NotifierImpl::Log),
-        config::NotificationsConfig::Smtp(s) => {
-            let smtp = notifications::SmtpNotifier::build(notifications::SmtpConfig {
-                host: s.host.clone(),
-                port: s.port,
-                tls: match s.tls {
-                    config::SmtpTls::Starttls => notifications::SmtpTls::Starttls,
-                    config::SmtpTls::Implicit => notifications::SmtpTls::Implicit,
-                    config::SmtpTls::None => notifications::SmtpTls::None,
-                },
-                username: s.username.clone(),
-                password: s.password.clone(),
-                from: notifications::FromAddress {
-                    email: s.from_email.clone(),
-                    name: s.from_name.clone(),
-                },
-            })?;
-            Ok(notifications::NotifierImpl::Smtp(std::sync::Arc::new(smtp)))
-        }
-    }
-}
-
-fn notifications_mode_label(cfg: &config::NotificationsConfig) -> &'static str {
-    match cfg {
-        config::NotificationsConfig::Disabled => "disabled",
-        config::NotificationsConfig::Log => "log",
-        config::NotificationsConfig::Smtp(_) => "smtp",
-    }
 }

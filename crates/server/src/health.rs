@@ -1,7 +1,7 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 
-use crate::app::AppState;
+use crate::HealthState;
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -23,7 +23,7 @@ pub struct HealthResponse {
     pub pending_invitations_count: Option<i64>,
 }
 
-pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handler(State(state): State<HealthState>) -> impl IntoResponse {
     let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db)
         .await

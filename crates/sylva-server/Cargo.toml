@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sylva Server binary: composes the API and web routers"
+description = "Sylva Server binary: composes the gRPC + discovery + health surface"
 
 [[bin]]
 name = "sylva-server"
@@ -16,7 +16,6 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 
 server = { path = "../server" }
-web = { path = "../web" }
 
 [lints]
 workspace = true

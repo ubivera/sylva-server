@@ -6,7 +6,8 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use proto::machine::v1::{
-    CheckInRequest, Empty, RegisterMachineRequest, machine_client::MachineClient, server_push,
+    CheckInRequest, Empty, RegisterMachineRequest, ReportTelemetryRequest, TelemetryBlob,
+    machine_client::MachineClient, server_push,
 };
 
 use crate::common::TestApp;
@@ -65,6 +66,7 @@ async fn spawn_grpc(app: &TestApp) -> (std::net::SocketAddr, tokio::sync::watch:
         resources: platform::resources::ResourceRepository::new(app.pool.clone()),
         user_keys: identity::UserKeyRepository::new(app.pool.clone()),
         devices: identity::DeviceRepository::new(app.pool.clone()),
+        user_avatars: identity::UserAvatarRepository::new(app.pool.clone()),
         pool: app.pool.clone(),
         secret_key: std::sync::Arc::new([0u8; 32]),
         auth_rate_limiter: std::sync::Arc::new(auth::ratelimit::RateLimiter::auth_default()),
@@ -238,6 +240,96 @@ async fn machine_rpcs_require_auth() {
         .unwrap_err()
         .code();
     assert_eq!(subscribe, tonic::Code::Unauthenticated);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_telemetry_stores_an_opaque_blob() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let (sk, pk) = machine_keypair(13);
+    let session = client
+        .register_machine(tonic::Request::new(register_request(&sk, &pk, "windows", "PC")))
+        .await
+        .unwrap()
+        .into_inner();
+    let machine_id = uuid::Uuid::parse_str(&session.machine_id).unwrap();
+
+    client
+        .report_telemetry(authed(
+            &session.token,
+            ReportTelemetryRequest {
+                blobs: vec![TelemetryBlob {
+                    kind: "location".to_string(),
+                    recipient_key_id: vec![1u8; 16],
+                    seq: 1,
+                    ciphertext: b"sealed-location-blob".to_vec(),
+                    signature: Vec::new(),
+                }],
+            },
+        ))
+        .await
+        .unwrap();
+
+    // Stored verbatim — the server never decrypts it.
+    let (kind, ciphertext): (String, Vec<u8>) = sqlx::query_as(
+        "SELECT kind, ciphertext FROM identity.machine_telemetry WHERE machine_id = $1",
+    )
+    .bind(machine_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "location");
+    assert_eq!(ciphertext, b"sealed-location-blob");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_reflects_location_toggle_and_group() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let (sk, pk) = machine_keypair(17);
+    let session = client
+        .register_machine(tonic::Request::new(register_request(&sk, &pk, "windows", "PC")))
+        .await
+        .unwrap()
+        .into_inner();
+    let machine_id = uuid::Uuid::parse_str(&session.machine_id).unwrap();
+
+    // Admin policy (dev SQL until the client-app panel exists): enable location +
+    // provision a device-admin group key.
+    sqlx::query("UPDATE identity.machines SET location_enabled = true WHERE id = $1")
+        .bind(machine_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let group_public = vec![9u8; 32];
+    sqlx::query("INSERT INTO identity.device_admin_group (group_public) VALUES ($1)")
+        .bind(&group_public)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .subscribe(authed(&session.token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = stream.message().await.unwrap().expect("a server push");
+    match first.payload {
+        Some(server_push::Payload::Config(cfg)) => {
+            assert!(cfg.location_enabled, "toggle reflected");
+            assert_eq!(cfg.device_admin_group_public, group_public, "group pubkey pushed");
+            assert!(!cfg.group_key_id.is_empty(), "group key id pushed");
+        }
+        other => panic!("expected a config push, got {other:?}"),
+    }
 
     let _ = shutdown.send(true);
 }

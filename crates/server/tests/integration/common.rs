@@ -9,8 +9,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header::AUTHORIZATION},
 };
-use chrono::{DateTime, Utc};
-use server::{app, db, postgres::PostgresProcess};
+use server::{DiscoveryState, HealthState, db, postgres::PostgresProcess};
 use identity::{InstanceRole, InvitationRepository, UserId, UserRepository};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -175,27 +174,13 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// One end-to-end fixture: a fresh database, all migrations applied, and a
-/// fully wired `Router` ready to receive requests via `oneshot`.
+/// One end-to-end fixture: a fresh database, all migrations applied, and the
+/// HTTP `Router` (just `/health` + discovery — the only HTTP surface) ready to
+/// receive requests via `oneshot`. The gRPC tests build their own
+/// `PlatformContext` directly from [`Self::pool`].
 pub struct TestApp {
     pub router: Router,
     pub pool: PgPool,
-    /// Test-side notification worker, sharing the [`Self::notifier`] cell with
-    /// `AppState` (defaults to [`notifications::NotifierImpl::Log`]). Tests that
-    /// observe failure paths swap the notifier via [`TestApp::set_notifier`].
-    pub notification_worker: notifications::Worker,
-    /// Shared, hot-swappable notifier cell — the same `Arc` wired into
-    /// `AppState::notifier` and the worker, mirroring production. Flipping it
-    /// via [`TestApp::set_notifier`] is observed by the worker's next drain and
-    /// by any handler reading `AppState::notifier`.
-    pub notifier: std::sync::Arc<arc_swap::ArcSwap<notifications::NotifierImpl>>,
-    /// The CSRF secret used by this app's `AppState`. Held here so tests
-    /// can compute valid tokens via [`TestApp::csrf_for`] without scraping
-    /// rendered HTML.
-    csrf_secret: std::sync::Arc<[u8; server::csrf::SECRET_LEN]>,
-    /// The instance secret key used by this app's `AppState`. Held here so
-    /// TOTP tests can seed encrypted secrets the same way the server does.
-    pub secret_key: std::sync::Arc<[u8; 32]>,
     /// Name of this test's database. The `Drop` impl drops it so the
     /// shared cluster's data dir doesn't accumulate hundreds of leftover
     /// databases across runs (which slows crash-recovery startup).
@@ -252,212 +237,105 @@ impl TestApp {
         let sessions = SessionRepository::new(pool.clone());
         let invitations = InvitationRepository::new(pool.clone());
 
-        // Compose the same shape as production: API under `/api`, the web
-        // UI at root, plus `/health`. Mirrors the composition in
-        // `server::serve` and `web::ui_router`.
-        let csrf_secret = std::sync::Arc::new(server::csrf::generate_secret());
-        let secret_key = std::sync::Arc::new(server::csrf::generate_secret());
-        // Shared notifier cell: production wires the same `Arc` into both
-        // `AppState` and the worker so an Owner's live SMTP change is picked up
-        // on the next drain. Tests flip it via `set_notifier`.
-        let notifier = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
-            notifications::NotifierImpl::Log,
-        ));
         // Generate this test instance's server identity (same path production
         // uses), so the discovery endpoint signs with a real key.
+        let secret_key = std::sync::Arc::new([0u8; 32]);
         let server_identity = std::sync::Arc::new(
             server::instance::ensure_server_identity(&pool, &secret_key)
                 .await
                 .expect("generating test server identity"),
         );
-        let app_state = app::AppState {
+
+        // Compose the same HTTP shape production serves: `/health` + discovery.
+        let health_state = HealthState {
             started_at: Instant::now(),
             db: pool.clone(),
             users,
             sessions,
             invitations,
-            public_base_url: "http://localhost:8443".to_string(),
-            instance_name: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
-                "test-instance".to_string(),
-            )),
-            notifier: notifier.clone(),
-            // Env baseline for the effective-config model — kept consistent
-            // with the seeded cells above (name "test-instance", log notifier).
-            env_config: std::sync::Arc::new(
-                server::config::Config::from_env_lookup(|k| match k {
-                    "SYLVA_INSTANCE_NAME" => Some("test-instance".to_string()),
-                    "SYLVA_NOTIFICATIONS_MODE" => Some("log".to_string()),
-                    _ => None,
-                })
-                .expect("default test config parses"),
-            ),
-            csrf_secret: csrf_secret.clone(),
-            rate_limiter: std::sync::Arc::new(server::rate_limit::RateLimiter::auth_default()),
-            secret_key: secret_key.clone(),
-            // Trust forwarding headers in tests: requests via `oneshot`
-            // carry no socket peer, so rate-limit tests simulate distinct
-            // clients through `X-Forwarded-For`.
-            trust_proxy: true,
-            // Fresh per-test DB is never closed at construction; the close
-            // handler flips this when a test empties the instance.
-            instance_closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let discovery_state = DiscoveryState {
+            instance_name: "test-instance".to_string(),
+            grpc_port: 50051,
             server_identity,
         };
         let health = axum::Router::new()
-            .route(
-                "/health",
-                axum::routing::get(server::health::handler),
-            )
-            .with_state(app_state.clone());
-        let discovery = server::discovery::router(app_state.clone());
-        let router = Router::new()
-            .nest("/api", app::api_router(app_state.clone()))
-            .merge(web::ui_router(app_state))
-            .merge(health)
-            .merge(discovery);
-
-        let worker = notifications::Worker::new(pool.clone(), notifier.clone());
+            .route("/health", axum::routing::get(server::health::handler))
+            .with_state(health_state);
+        let discovery = server::discovery::router(discovery_state);
+        let router = Router::new().merge(health).merge(discovery);
 
         TestApp {
             router,
             pool,
-            notification_worker: worker,
-            notifier,
-            csrf_secret,
-            secret_key,
             db_name,
         }
     }
 
-    /// Compute a CSRF token valid for the given session id. Use this to
-    /// build `csrf_token` form values when posting to web endpoints from
-    /// tests; equivalent to scraping the value out of a rendered form.
-    pub fn csrf_for(&self, session_id: Uuid) -> String {
-        server::csrf::compute_token(&self.csrf_secret, session_id)
-    }
-
-    /// Mint a step-up "sudo" grant for `session_cookie` via `POST
-    /// /me/reauth` (the no-2FA password path) and return the
-    /// `sylva_sudo=<token>` cookie pair to attach to the follow-up
-    /// reauth-gated action request. Returns an empty string if the grant
-    /// wasn't issued (e.g. a wrong password). Mirrors what the
-    /// `REAUTH_CHAIN_JS` flow does in the browser.
-    pub async fn sudo_cookie(&self, session_cookie: &str, csrf: &str, password: &str) -> String {
-        let body = format!("csrf_token={csrf}&password={password}");
-        let req = axum::http::Request::builder()
-            .method(axum::http::Method::POST)
-            .uri("/me/reauth")
-            .header(axum::http::header::COOKIE, session_cookie)
-            .header(
-                axum::http::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = tower::ServiceExt::oneshot(self.router.clone(), req)
-            .await
-            .unwrap();
-        for v in resp.headers().get_all(axum::http::header::SET_COOKIE) {
-            if let Ok(s) = v.to_str()
-                && let Some(rest) = s.strip_prefix("sylva_sudo=")
-            {
-                let val = rest.split(';').next().unwrap_or("");
-                return format!("sylva_sudo={val}");
-            }
-        }
-        String::new()
-    }
-
-    /// Like [`TestApp::sudo_cookie`] but mints a *critical* grant by posting
-    /// `critical=1` to `/me/reauth`, returning the `sylva_sudo_critical=<token>`
-    /// cookie pair. This is the always-on gate that irreversible account
-    /// actions (self anonymize / delete) require — an ordinary `sylva_sudo`
-    /// grant does not satisfy it.
-    pub async fn sudo_critical_cookie(
-        &self,
-        session_cookie: &str,
-        csrf: &str,
-        password: &str,
-    ) -> String {
-        let body = format!("csrf_token={csrf}&password={password}&critical=1");
-        let req = axum::http::Request::builder()
-            .method(axum::http::Method::POST)
-            .uri("/me/reauth")
-            .header(axum::http::header::COOKIE, session_cookie)
-            .header(
-                axum::http::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(axum::body::Body::from(body))
-            .unwrap();
-        let resp = tower::ServiceExt::oneshot(self.router.clone(), req)
-            .await
-            .unwrap();
-        for v in resp.headers().get_all(axum::http::header::SET_COOKIE) {
-            if let Ok(s) = v.to_str()
-                && let Some(rest) = s.strip_prefix("sylva_sudo_critical=")
-            {
-                let val = rest.split(';').next().unwrap_or("");
-                return format!("sylva_sudo_critical={val}");
-            }
-        }
-        String::new()
-    }
-
-    /// Look up the `auth.sessions.id` for a session whose token lives in
-    /// the given `sylva_session=<token>` cookie pair. The web login
-    /// helper returns the full `Set-Cookie` header; trim it down to just
-    /// `sylva_session=<token>` (e.g. via `cookie_name_value`) before
-    /// passing in.
-    pub async fn session_id_for_cookie(&self, cookie_value: &str) -> Uuid {
-        let token = cookie_value
-            .strip_prefix("sylva_session=")
-            .expect("cookie value must start with sylva_session=");
-        let token_hash = auth::hash_token(token);
-        sqlx::query_scalar("SELECT id FROM auth.sessions WHERE token_hash = $1")
-            .bind(&token_hash[..])
+    /// Mint a session token for a previously [`seeded`](Self::seed_user) user by
+    /// looking them up by email and creating a session row directly — the same
+    /// `auth::SessionRepository::create` path the gRPC `Account`/`Machine`
+    /// services use. The REST login surface is gone; the gRPC login flow itself
+    /// is covered by `account_grpc`. Panics if no such user exists.
+    pub async fn login(&self, email: &str, _password: &str) -> String {
+        let user_id: Uuid = sqlx::query_scalar("SELECT id FROM identity.users WHERE email = $1")
+            .bind(email)
             .fetch_one(&self.pool)
             .await
-            .expect("looking up session by token hash")
+            .unwrap_or_else(|e| panic!("login({email}): no such seeded user: {e}"));
+        let mut tx = self.pool.begin().await.expect("begin session tx");
+        let (_session, token) = SessionRepository::create(
+            &mut tx,
+            UserId::new(user_id),
+            auth::DEFAULT_SESSION_TTL,
+            None,
+            None,
+        )
+        .await
+        .expect("creating session for seeded user");
+        tx.commit().await.expect("commit session");
+        token
     }
 
-    /// Replace the live notifier (e.g. with `NotifierImpl::AlwaysFail` to drive
-    /// the retry/dead path, or back to `NotifierImpl::Log`). Stores into the
-    /// shared [`Self::notifier`] cell, so the worker picks it up on its next
-    /// drain — the same hot-swap path production uses.
-    pub fn set_notifier(&self, notifier: notifications::NotifierImpl) {
-        self.notifier.store(std::sync::Arc::new(notifier));
+    pub async fn get(&self, path: &str, token: Option<&str>) -> ApiResponse {
+        self.request(Method::GET, path, token, None).await
     }
 
-    /// Run a single drain cycle of the notification worker. Returns the
-    /// number of rows processed.
-    pub async fn run_notifications_once(&self) -> usize {
-        self.notification_worker
-            .process_pending()
+    pub async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> ApiResponse {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(t) = token {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = match body {
+            Some(v) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&v).expect("serialize body")))
+                .expect("building request with body"),
+            None => builder
+                .body(Body::empty())
+                .expect("building request without body"),
+        };
+
+        let resp = self
+            .router
+            .clone()
+            .oneshot(req)
             .await
-            .expect("notification worker cycle failed")
-    }
-
-    /// Run a single cycle of the pending-transitions worker. Tests use this
-    /// instead of waiting for the real 30-second poll interval.
-    pub async fn run_pending_transitions_once(&self) -> usize {
-        let worker = pending::Worker::new(self.pool.clone());
-        worker
-            .process_due()
+            .expect("oneshot failed");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
             .await
-            .expect("pending-transitions worker cycle failed")
-    }
-
-    /// Bootstrap a recovery code as if `provision` had run. Returns the
-    /// raw code so the test can use it for bypass attempts.
-    pub async fn seed_recovery_code(&self) -> String {
-        let raw = auth::recovery_code::generate_code();
-        let mut tx = self.pool.begin().await.expect("begin");
-        auth::recovery_code::bootstrap(&mut tx, &raw, None)
-            .await
-            .expect("bootstrap recovery code");
-        tx.commit().await.expect("commit");
-        raw
+            .expect("reading response body");
+        ApiResponse {
+            status,
+            body: bytes.to_vec(),
+        }
     }
 
     /// Seed a user with the given role + an `active` lifecycle and a real
@@ -514,84 +392,6 @@ impl TestApp {
             display_name: display_name.to_string(),
             password: password.to_string(),
             role,
-        }
-    }
-
-    /// Hit `/api/auth/login` and return the bearer token. Panics on non-200.
-    pub async fn login(&self, email: &str, password: &str) -> String {
-        let resp = self
-            .post(
-                "/api/auth/login",
-                None,
-                Some(serde_json::json!({ "email": email, "password": password })),
-            )
-            .await;
-        if resp.status != StatusCode::OK {
-            panic!(
-                "login({email}) failed: status={} body={}",
-                resp.status,
-                resp.body_as_text()
-            );
-        }
-        resp.json::<LoginBody>().token
-    }
-
-    pub async fn get(&self, path: &str, token: Option<&str>) -> ApiResponse {
-        self.request(Method::GET, path, token, None).await
-    }
-
-    pub async fn post(
-        &self,
-        path: &str,
-        token: Option<&str>,
-        body: Option<Value>,
-    ) -> ApiResponse {
-        self.request(Method::POST, path, token, body).await
-    }
-
-    pub async fn patch(
-        &self,
-        path: &str,
-        token: Option<&str>,
-        body: Option<Value>,
-    ) -> ApiResponse {
-        self.request(Method::PATCH, path, token, body).await
-    }
-
-    pub async fn request(
-        &self,
-        method: Method,
-        path: &str,
-        token: Option<&str>,
-        body: Option<Value>,
-    ) -> ApiResponse {
-        let mut builder = Request::builder().method(method).uri(path);
-        if let Some(t) = token {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-        }
-        let req = match body {
-            Some(v) => builder
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&v).expect("serialize body")))
-                .expect("building request with body"),
-            None => builder
-                .body(Body::empty())
-                .expect("building request without body"),
-        };
-
-        let resp = self
-            .router
-            .clone()
-            .oneshot(req)
-            .await
-            .expect("oneshot failed");
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("reading response body");
-        ApiResponse {
-            status,
-            body: bytes.to_vec(),
         }
     }
 }
@@ -652,6 +452,7 @@ pub struct SeededUser {
     pub email: String,
     #[allow(dead_code)]
     pub display_name: String,
+    #[allow(dead_code)]
     pub password: String,
     #[allow(dead_code)]
     pub role: InstanceRole,
@@ -677,14 +478,6 @@ impl ApiResponse {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
-    pub fn error_code(&self) -> String {
-        let v: Value = serde_json::from_slice(&self.body).unwrap_or(Value::Null);
-        v.get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    }
-
     pub fn assert_status(&self, expected: StatusCode) -> &Self {
         if self.status != expected {
             panic!(
@@ -695,40 +488,4 @@ impl ApiResponse {
         }
         self
     }
-
-    pub fn assert_error(&self, expected_code: &str) -> &Self {
-        let got = self.error_code();
-        if got != expected_code {
-            panic!(
-                "expected error code {expected_code:?}, got {got:?} \
-                 - status {}, body: {}",
-                self.status,
-                self.body_as_text()
-            );
-        }
-        self
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub struct LoginBody {
-    pub token: String,
-    #[allow(dead_code)]
-    pub expires_at: DateTime<Utc>,
-    pub user_id: Uuid,
-}
-
-/// Response body for `POST /api/auth/accept-invite`. Mirrors
-/// `LoginBody` plus the one-time `recovery_code` plaintext stamped
-/// into `auth.user_recovery_codes` inside the same transaction. Used
-/// by tests that need to assert the code's existence + verify it
-/// round-trips through `auth::recovery_code::hash_code`.
-#[derive(serde::Deserialize)]
-pub struct AcceptInviteBody {
-    #[allow(dead_code)]
-    pub token: String,
-    #[allow(dead_code)]
-    pub expires_at: DateTime<Utc>,
-    pub user_id: Uuid,
-    pub recovery_code: String,
 }

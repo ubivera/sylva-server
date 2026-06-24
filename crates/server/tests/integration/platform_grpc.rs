@@ -67,6 +67,7 @@ async fn spawn_grpc(app: &TestApp) -> (std::net::SocketAddr, tokio::sync::watch:
         resources: platform::resources::ResourceRepository::new(app.pool.clone()),
         user_keys: identity::UserKeyRepository::new(app.pool.clone()),
         devices: identity::DeviceRepository::new(app.pool.clone()),
+        user_avatars: identity::UserAvatarRepository::new(app.pool.clone()),
         pool: app.pool.clone(),
         secret_key: std::sync::Arc::new([0u8; 32]),
         auth_rate_limiter: std::sync::Arc::new(auth::ratelimit::RateLimiter::auth_default()),

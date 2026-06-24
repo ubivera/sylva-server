@@ -6,9 +6,12 @@
 //! Gated behind the `e2e` feature so the standard suite never pulls the SDK:
 //!   cargo test -p server --features e2e --test integration sdk_e2e
 
+use ed25519_dalek::{Signer, SigningKey};
 use sylva_sdk::crypto::KdfParams;
 use sylva_sdk::flows::{self, NewOwner};
 use sylva_sdk::proto::account::v1 as pb;
+use sylva_sdk::proto::machine::v1 as mb;
+use sylva_sdk::proto::machine::v1::machine_client::MachineClient;
 use sylva_sdk::transport::{client, discovery};
 
 use super::common::TestApp;
@@ -31,6 +34,7 @@ async fn spawn_grpc(app: &TestApp) -> (String, tokio::sync::watch::Sender<bool>)
         resources: platform::resources::ResourceRepository::new(app.pool.clone()),
         user_keys: identity::UserKeyRepository::new(app.pool.clone()),
         devices: identity::DeviceRepository::new(app.pool.clone()),
+        user_avatars: identity::UserAvatarRepository::new(app.pool.clone()),
         pool: app.pool.clone(),
         secret_key: std::sync::Arc::new([0u8; 32]),
         auth_rate_limiter: std::sync::Arc::new(auth::ratelimit::RateLimiter::auth_default()),
@@ -196,6 +200,202 @@ async fn sdk_login_with_wrong_secret_key_is_rejected_locally() {
     )
     .await;
     assert!(matches!(result, Err(flows::EnrollError::Crypto(_))));
+
+    let _ = shutdown.send(true);
+}
+
+// ── Machine agent (slice 2, CP1 spine) ──────────────────────────────────────
+
+/// The bytes the agent signs at registration (must match the server's
+/// `canonical_machine_bytes`).
+fn canonical_machine_bytes(public: &[u8], platform: &str, label: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"sylva-machine-registration:v1\n");
+    v.extend_from_slice(public);
+    v.push(b'\n');
+    v.extend_from_slice(platform.as_bytes());
+    v.push(b'\n');
+    v.extend_from_slice(label.as_bytes());
+    v
+}
+
+fn machine_authed<T>(token: &str, msg: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    req
+}
+
+/// The full agent spine against a real server: discover + TOFU-pin over real
+/// HTTP, then register (with Ed25519 proof-of-possession) + check in + consume
+/// the push stream over real gRPC — driving the **SDK's** Machine client + the
+/// SDK's discovery, the exact code paths `sylva-agent` runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_agent_registers_checks_in_and_subscribes_end_to_end() {
+    let app = TestApp::new().await;
+    let (base_url, http) = spawn_http(&app).await;
+    let (grpc_addr, shutdown) = spawn_grpc(&app).await;
+
+    // 1. Discovery + TOFU (the agent's first step): the SDK fetches + verifies the
+    //    real signed discovery response, and first contact pins / a match verifies.
+    let verified = discovery::fetch_and_verify(&base_url).await.unwrap();
+    assert_eq!(
+        discovery::check_pin(&verified, None),
+        discovery::TrustDecision::FirstContact
+    );
+    assert_eq!(
+        discovery::check_pin(&verified, Some(&verified.identity_public)),
+        discovery::TrustDecision::Matches
+    );
+
+    // 2. Register the machine over gRPC with a real Ed25519 proof-of-possession.
+    let channel = client::connect(&[grpc_addr]).await.unwrap();
+    let mut machine = MachineClient::new(channel);
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let public = signing_key.verifying_key().to_bytes();
+    let signature = signing_key
+        .sign(&canonical_machine_bytes(&public, "windows", "Family-PC"))
+        .to_bytes()
+        .to_vec();
+    let session = machine
+        .register_machine(tonic::Request::new(mb::RegisterMachineRequest {
+            machine_identity_public: public.to_vec(),
+            platform: "windows".to_string(),
+            label: "Family-PC".to_string(),
+            signature,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!session.token.is_empty());
+
+    // 3. Check in (authed) + 4. subscribe (authed) — the first push is the config.
+    machine
+        .check_in(machine_authed(
+            &session.token,
+            mb::CheckInRequest {
+                agent_version: "0.0.1".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    let mut stream = machine
+        .subscribe(machine_authed(&session.token, mb::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = stream.message().await.unwrap().expect("a server push");
+    assert!(matches!(
+        first.payload,
+        Some(mb::server_push::Payload::Config(_))
+    ));
+
+    // The server persisted the machine (identity key + a recorded check-in).
+    let (machines,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM identity.machines \
+         WHERE machine_identity_public IS NOT NULL AND last_seen_at IS NOT NULL",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(machines, 1);
+
+    let _ = shutdown.send(true);
+    http.abort();
+}
+
+/// The full telemetry path (CP3): an admin enables location + provisions a
+/// device-admin group key; the agent reads that from `Subscribe`, seals a
+/// location fix to the group key, and reports it; the server stores only
+/// ciphertext; an admin holding the group secret decrypts it. Exercises the
+/// SDK's sealed-box crypto + the server's zero-knowledge storage end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn machine_telemetry_seals_to_group_and_admin_decrypts_end_to_end() {
+    let app = TestApp::new().await;
+    let (grpc_addr, shutdown) = spawn_grpc(&app).await;
+    let channel = client::connect(&[grpc_addr]).await.unwrap();
+    let mut machine = MachineClient::new(channel);
+
+    // Register the machine.
+    let signing_key = SigningKey::from_bytes(&[6u8; 32]);
+    let public = signing_key.verifying_key().to_bytes();
+    let signature = signing_key
+        .sign(&canonical_machine_bytes(&public, "windows", "Family-PC"))
+        .to_bytes()
+        .to_vec();
+    let session = machine
+        .register_machine(tonic::Request::new(mb::RegisterMachineRequest {
+            machine_identity_public: public.to_vec(),
+            platform: "windows".to_string(),
+            label: "Family-PC".to_string(),
+            signature,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let machine_id = uuid::Uuid::parse_str(&session.machine_id).unwrap();
+
+    // Admin policy (dev SQL until the client-app panel exists): provision a
+    // device-admin group key + enable location for this machine.
+    let group = sylva_sdk::crypto::generate_group_keypair();
+    sqlx::query("INSERT INTO identity.device_admin_group (group_public) VALUES ($1)")
+        .bind(group.public.as_slice())
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE identity.machines SET location_enabled = true WHERE id = $1")
+        .bind(machine_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    // The agent reads its effective config from the push stream.
+    let mut stream = machine
+        .subscribe(machine_authed(&session.token, mb::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let config = loop {
+        match stream.message().await.unwrap().expect("a push").payload {
+            Some(mb::server_push::Payload::Config(cfg)) => break cfg,
+            _ => continue,
+        }
+    };
+    assert!(config.location_enabled);
+    let group_public: [u8; 32] = config.device_admin_group_public.as_slice().try_into().unwrap();
+    assert_eq!(group_public, group.public);
+
+    // The agent seals a location fix to the group key and reports it.
+    let location = br#"{"lat":35.594566,"lon":-77.408395,"accuracy_m":27.0}"#;
+    let ciphertext = sylva_sdk::crypto::seal_to(&group_public, location).unwrap();
+    machine
+        .report_telemetry(machine_authed(
+            &session.token,
+            mb::ReportTelemetryRequest {
+                blobs: vec![mb::TelemetryBlob {
+                    kind: "location".to_string(),
+                    recipient_key_id: config.group_key_id.clone(),
+                    seq: 1,
+                    ciphertext,
+                    signature: Vec::new(),
+                }],
+            },
+        ))
+        .await
+        .unwrap();
+
+    // The server stored only ciphertext; an admin with the group secret decrypts it.
+    let (kind, stored): (String, Vec<u8>) = sqlx::query_as(
+        "SELECT kind, ciphertext FROM identity.machine_telemetry WHERE machine_id = $1",
+    )
+    .bind(machine_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "location");
+    assert_ne!(stored, location, "server stores ciphertext, not plaintext");
+    let decrypted = sylva_sdk::crypto::open_sealed(&group.secret, &stored).unwrap();
+    assert_eq!(decrypted, location);
 
     let _ = shutdown.send(true);
 }

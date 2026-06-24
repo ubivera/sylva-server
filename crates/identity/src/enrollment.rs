@@ -114,6 +114,32 @@ impl UserKeyRepository {
         Ok(())
     }
 
+    /// Re-wrap a user's master key within the caller's transaction (password
+    /// change): the client re-derives `KEK = KDF(new_password, secret_key)` over
+    /// a fresh salt and hands back the new `master_key_wrapped` + salt + params.
+    /// The master-key-wrapped *private* keys don't change (the master key is
+    /// unchanged), so only these three columns rotate.
+    pub async fn update(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: UserId,
+        master_key_wrapped: &[u8],
+        kdf_salt: &[u8],
+        kdf_params: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE identity.user_keys
+             SET master_key_wrapped = $2, kdf_salt = $3, kdf_params = $4
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .bind(master_key_wrapped)
+        .bind(kdf_salt)
+        .bind(kdf_params)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Fetch a user's key bundle (for `GetKeyMaterial`). `None` if the user has
     /// no provisioned crypto yet.
     pub async fn get(&self, user_id: UserId) -> Result<Option<UserKeyMaterial>> {
@@ -123,6 +149,50 @@ impl UserKeyRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(km)
+    }
+}
+
+// ── user_avatars (E2E avatar) ──────────────────────────────────────────────────
+
+/// The account avatar, sealed client-side under the user's master key. 1:1 with
+/// users; the server stores the opaque blob ONLY (never plaintext). `user_id` is
+/// the query key, so it isn't a field here.
+#[derive(Clone)]
+pub struct UserAvatarRepository {
+    pool: PgPool,
+}
+
+impl UserAvatarRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Fetch the user's sealed avatar blob (for `GetAvatar`). `None` if the user
+    /// has not set one.
+    pub async fn get(&self, user_id: UserId) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT avatar FROM identity.user_avatars WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(avatar,)| avatar))
+    }
+
+    /// Store the user's sealed avatar blob, overwriting any prior one (`SetAvatar`).
+    /// Pool-based (single statement) — the blob is opaque, so there's nothing else
+    /// to write atomically with it.
+    pub async fn upsert(&self, user_id: UserId, avatar: &[u8]) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO identity.user_avatars (user_id, avatar)
+             VALUES ($1, $2)
+             ON CONFLICT (user_id) DO UPDATE
+                 SET avatar = EXCLUDED.avatar, updated_at = now()",
+        )
+        .bind(user_id)
+        .bind(avatar)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -211,6 +281,28 @@ impl MachineRepository {
         .bind(agent_version)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Whether location reporting is enabled for this machine (admin policy,
+    /// pushed to the agent in `MachineConfig`).
+    pub async fn location_enabled(&self, machine_id: MachineId) -> Result<bool> {
+        let (enabled,): (bool,) =
+            sqlx::query_as("SELECT location_enabled FROM identity.machines WHERE id = $1")
+                .bind(machine_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(enabled)
+    }
+
+    /// Set the per-machine location toggle. The real surface is the client-app
+    /// devices panel; dev/test uses this directly until that exists.
+    pub async fn set_location_enabled(&self, machine_id: MachineId, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE identity.machines SET location_enabled = $2 WHERE id = $1")
+            .bind(machine_id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

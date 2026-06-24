@@ -17,7 +17,12 @@ pub type Result<T> = std::result::Result<T, IdentityError>;
 pub mod enrollment;
 pub use enrollment::{
     Device, DeviceId, DeviceRepository, Machine, MachineId, MachineRepository, MachineSession,
-    MachineSessionRepository, NewDevice, UserKeyMaterial, UserKeyRepository,
+    MachineSessionRepository, NewDevice, UserAvatarRepository, UserKeyMaterial, UserKeyRepository,
+};
+
+pub mod machine_telemetry;
+pub use machine_telemetry::{
+    DeviceAdminGroup, DeviceAdminGroupRepository, MachineTelemetryRepository, NewTelemetry,
 };
 
 /// Strongly-typed user identifier. Distinct nominal type prevents accidental
