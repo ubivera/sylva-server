@@ -136,9 +136,19 @@ async fn sdk_enrolls_logs_in_and_manages_devices_end_to_end() {
     assert_eq!(key_rows, 1);
 
     // ── Log in fresh: fetch the wrapped material + unlock with password + Secret Key ──
-    let mut session = flows::login(channel.clone(), "owner@e2e.local", "pw-e2e", &enrolled.secret_key)
-        .await
-        .unwrap();
+    // No second factor enrolled → the password leg authenticates directly.
+    let mut session = match flows::login(
+        channel.clone(),
+        "owner@e2e.local",
+        "pw-e2e",
+        &enrolled.secret_key,
+    )
+    .await
+    .unwrap()
+    {
+        flows::LoginOutcome::Authenticated(l) => l,
+        flows::LoginOutcome::MfaRequired { .. } => panic!("did not expect MFA"),
+    };
     // THE round-trip proof: the master key unlocked from the server's stored
     // ciphertext is byte-identical to the one generated client-side at enroll.
     assert_eq!(

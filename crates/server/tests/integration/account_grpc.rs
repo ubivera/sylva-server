@@ -6,9 +6,9 @@
 
 use identity::InstanceRole;
 use proto::account::v1::{
-    BootstrapRequest, ChangePasswordRequest, DeviceEnrollment, DeviceId, Empty, KeyMaterial,
-    LoginRequest, RegisterDeviceRequest, UpdateDisplayNameRequest, UpdateEmailRequest,
-    account_client::AccountClient, login_response::Outcome,
+    BootstrapRequest, ChangePasswordRequest, ConfirmTotpRequest, DeviceEnrollment, DeviceId, Empty,
+    KeyMaterial, LoginRequest, RegisterDeviceRequest, RemoveTotpRequest, UpdateDisplayNameRequest,
+    UpdateEmailRequest, VerifyMfaRequest, account_client::AccountClient, login_response::Outcome,
 };
 
 use crate::common::TestApp;
@@ -741,10 +741,300 @@ async fn self_service_rpcs_require_auth() {
             .await
             .unwrap_err()
             .code(),
+        client
+            .enroll_totp(tonic::Request::new(Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .confirm_totp(tonic::Request::new(ConfirmTotpRequest {
+                totp_id: uuid::Uuid::new_v4().to_string(),
+                code: "000000".to_string(),
+                label: String::new(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .list_totp(tonic::Request::new(Empty {}))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .remove_totp(tonic::Request::new(RemoveTotpRequest {
+                totp_id: uuid::Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
     ];
     for code in codes {
         assert_eq!(code, tonic::Code::Unauthenticated);
     }
+
+    let _ = shutdown.send(true);
+}
+
+// ── TOTP MFA (SEC-CP1) ──────────────────────────────────────────────────────────
+
+/// Enroll + confirm a TOTP authenticator, then drive a full MFA login: the
+/// password leg returns `MfaRequired` with a challenge token; the code leg
+/// (`VerifyMfa`) exchanges a valid TOTP code for a session.
+#[tokio::test(flavor = "multi_thread")]
+async fn totp_enroll_confirm_and_mfa_login_end_to_end() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let session = client
+        .bootstrap(tonic::Request::new(bootstrap_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    let token = session.token;
+
+    // Before enrollment, login issues a session directly (no second factor).
+    let resp = client
+        .login(tonic::Request::new(LoginRequest {
+            email: "owner@test.local".to_string(),
+            password: PW.to_string(),
+            mfa_challenge_token: String::new(),
+            mfa_response: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(resp.outcome, Some(Outcome::Session(_))));
+
+    // Enroll: the server returns a base32 secret + an otpauth URI.
+    let enroll = client
+        .enroll_totp(authed(&token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!enroll.totp_id.is_empty());
+    assert!(!enroll.secret_base32.is_empty());
+    assert!(enroll.otpauth_uri.starts_with("otpauth://totp/"));
+
+    let secret =
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &enroll.secret_base32).unwrap();
+    let now = chrono::Utc::now().timestamp();
+
+    // A wrong code does not confirm the enrollment.
+    let err = client
+        .confirm_totp(authed(
+            &token,
+            ConfirmTotpRequest {
+                totp_id: enroll.totp_id.clone(),
+                code: "000000".to_string(),
+                label: "My phone".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // The correct current code confirms it.
+    client
+        .confirm_totp(authed(
+            &token,
+            ConfirmTotpRequest {
+                totp_id: enroll.totp_id.clone(),
+                code: auth::totp::code_at(&secret, now),
+                label: "My phone".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    // It now shows up as a verified factor.
+    let factors = client
+        .list_totp(authed(&token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .factors;
+    assert_eq!(factors.len(), 1);
+    assert_eq!(factors[0].label, "My phone");
+    assert_eq!(factors[0].last_used_at, "");
+
+    // A `totp_enrolled` audit event was recorded.
+    let (events,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audit.events WHERE event_type = 'totp_enrolled'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 1);
+
+    // ── MFA login: password leg now demands a second factor ──
+    let resp = client
+        .login(tonic::Request::new(LoginRequest {
+            email: "owner@test.local".to_string(),
+            password: PW.to_string(),
+            mfa_challenge_token: String::new(),
+            mfa_response: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let challenge = match resp.outcome {
+        Some(Outcome::MfaRequired(m)) => {
+            assert_eq!(m.methods, vec!["totp".to_string()]);
+            assert!(!m.mfa_challenge_token.is_empty());
+            m.mfa_challenge_token
+        }
+        other => panic!("expected MfaRequired, got {other:?}"),
+    };
+
+    // A wrong code → unauthenticated. Use a fresh time-step so it isn't the
+    // (already-consumed) confirm code and isn't a neighbour of the real one.
+    let err = client
+        .verify_mfa(tonic::Request::new(VerifyMfaRequest {
+            mfa_challenge_token: challenge.clone(),
+            mfa_response: b"000000".to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // The correct code (a step past the confirm code, so single-use doesn't
+    // reject it) → a session.
+    let code = auth::totp::code_at(&secret, now + 30);
+    let mfa_session = client
+        .verify_mfa(tonic::Request::new(VerifyMfaRequest {
+            mfa_challenge_token: challenge,
+            mfa_response: code.clone().into_bytes(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!mfa_session.token.is_empty());
+    // The minted token authenticates a real RPC.
+    client
+        .list_my_devices(authed(&mfa_session.token, Empty {}))
+        .await
+        .unwrap();
+
+    // A garbage challenge token → unauthenticated (forgery / expiry path).
+    let err = client
+        .verify_mfa(tonic::Request::new(VerifyMfaRequest {
+            mfa_challenge_token: "deadbeef".to_string(),
+            mfa_response: code.into_bytes(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    let _ = shutdown.send(true);
+}
+
+/// Confirming with no pending enrollment, and removing an authenticator (which
+/// turns MFA back off so a plain login issues a session again).
+#[tokio::test(flavor = "multi_thread")]
+async fn totp_confirm_without_enrollment_and_remove() {
+    let app = TestApp::new().await;
+    let (addr, shutdown) = spawn_grpc(&app).await;
+    let mut client = connect(addr).await;
+
+    let session = client
+        .bootstrap(tonic::Request::new(bootstrap_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    let token = session.token;
+
+    // Confirm against an id that was never enrolled → failed_precondition.
+    let err = client
+        .confirm_totp(authed(
+            &token,
+            ConfirmTotpRequest {
+                totp_id: uuid::Uuid::new_v4().to_string(),
+                code: "000000".to_string(),
+                label: String::new(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    // Enroll + confirm (empty label defaults to "Authenticator").
+    let enroll = client
+        .enroll_totp(authed(&token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let secret =
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &enroll.secret_base32).unwrap();
+    client
+        .confirm_totp(authed(
+            &token,
+            ConfirmTotpRequest {
+                totp_id: enroll.totp_id.clone(),
+                code: auth::totp::code_at(&secret, chrono::Utc::now().timestamp()),
+                label: "   ".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    let factors = client
+        .list_totp(authed(&token, Empty {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .factors;
+    assert_eq!(factors.len(), 1);
+    assert_eq!(factors[0].label, "Authenticator");
+
+    // Removing an unknown id → not_found.
+    let err = client
+        .remove_totp(authed(
+            &token,
+            RemoveTotpRequest {
+                totp_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Remove the real one → MFA turns back off.
+    client
+        .remove_totp(authed(
+            &token,
+            RemoveTotpRequest {
+                totp_id: enroll.totp_id.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        client
+            .list_totp(authed(&token, Empty {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .factors
+            .is_empty()
+    );
+    let (events,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audit.events WHERE event_type = 'totp_removed'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, 1);
+
+    // With the only factor gone, a plain login issues a session directly again.
+    let resp = client
+        .login(tonic::Request::new(LoginRequest {
+            email: "owner@test.local".to_string(),
+            password: PW.to_string(),
+            mfa_challenge_token: String::new(),
+            mfa_response: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(resp.outcome, Some(Outcome::Session(_))));
 
     let _ = shutdown.send(true);
 }

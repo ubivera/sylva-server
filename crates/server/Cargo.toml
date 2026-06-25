@@ -52,6 +52,9 @@ uuid = { workspace = true, features = ["v4"] }
 proto = { path = "../proto" }
 platform = { path = "../platform" }
 tonic = { workspace = true }
+# Decodes the base32 TOTP secret in the MFA integration test back to raw bytes
+# so the test can compute a valid code via `auth::totp::code_at`.
+base32 = { workspace = true }
 
 [[test]]
 name = "integration"

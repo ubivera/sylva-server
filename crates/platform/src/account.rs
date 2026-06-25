@@ -12,12 +12,14 @@ use identity::{
     Device, DeviceId, DeviceRepository, InstanceRole, MachineRepository, NewDevice, User, UserId,
     UserKeyMaterial, UserKeyRepository, UserLifecycle, UserRepository,
 };
+use chrono::Utc;
 use proto::account::v1::{
-    BootstrapRequest, ChangePasswordRequest, Device as ProtoDevice, DeviceEnrollment,
-    DeviceId as ProtoDeviceId, Empty, GetAvatarResponse, GetKeyMaterialResponse,
-    KeyMaterial as ProtoKeyMaterial, ListMyDevicesResponse, LoginRequest, LoginResponse,
-    MfaRequired, Profile as ProtoProfile, RegisterDeviceRequest, Session as ProtoSession,
-    SetAvatarRequest, UpdateDisplayNameRequest, UpdateEmailRequest, VerifyMfaRequest,
+    BootstrapRequest, ChangePasswordRequest, ConfirmTotpRequest, Device as ProtoDevice,
+    DeviceEnrollment, DeviceId as ProtoDeviceId, Empty, EnrollTotpResponse, GetAvatarResponse,
+    GetKeyMaterialResponse, KeyMaterial as ProtoKeyMaterial, ListMyDevicesResponse, ListTotpResponse,
+    LoginRequest, LoginResponse, MfaRequired, Profile as ProtoProfile, RegisterDeviceRequest,
+    RemoveTotpRequest, Session as ProtoSession, SetAvatarRequest, TotpFactor,
+    UpdateDisplayNameRequest, UpdateEmailRequest, VerifyMfaRequest,
     account_server::{Account, AccountServer},
     login_response,
 };
@@ -28,6 +30,74 @@ use crate::{PlatformContext, authenticate, internal, parse_uuid, rate_key};
 /// Hard ceiling on the opaque (client-sealed) avatar blob the server will store.
 /// The server never sees plaintext, so this is the only avatar policy it enforces.
 const MAX_AVATAR_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// How long an MFA challenge token is valid between the password leg (`Login`
+/// returning `MfaRequired`) and the code leg (`VerifyMfa`). Short enough that a
+/// leaked token is near-useless, generous enough to type a code.
+const MFA_CHALLENGE_TTL_SECS: i64 = 300;
+
+/// Issuer label embedded in the `otpauth://` URI (shown in the authenticator
+/// app). A fixed literal for now; becomes the instance display name when `ctx`
+/// exposes it.
+const TOTP_ISSUER: &str = "Sylva";
+
+/// Mint a stateless MFA challenge token: `user_id(16) || expiry_be(8)` sealed
+/// under the instance key, hex-encoded. `VerifyMfa` recovers the
+/// password-verified user from it without re-running Argon2 — the seal's AEAD
+/// tag is what makes it unforgeable.
+fn mint_mfa_challenge(key: &[u8; 32], user_id: UserId) -> Result<String, Status> {
+    let expiry = (Utc::now() + chrono::Duration::seconds(MFA_CHALLENGE_TTL_SECS)).timestamp();
+    let mut plain = Vec::with_capacity(24);
+    plain.extend_from_slice(user_id.0.as_bytes()); // 16
+    plain.extend_from_slice(&expiry.to_be_bytes()); // 8
+    let sealed = auth::secretbox::seal(key, &plain).map_err(|e| internal(&e, "mfa:seal"))?;
+    Ok(hex_encode(&sealed))
+}
+
+/// Recover the user id from a challenge token, or `None` if it is malformed,
+/// forged (AEAD tag fails), or expired.
+fn open_mfa_challenge(key: &[u8; 32], token: &str) -> Option<UserId> {
+    let blob = hex_decode(token)?;
+    let plain = auth::secretbox::open(key, &blob).ok()?;
+    if plain.len() != 24 {
+        return None;
+    }
+    let (id, exp) = plain.split_at(16);
+    if Utc::now().timestamp() > i64::from_be_bytes(exp.try_into().ok()?) {
+        return None;
+    }
+    Some(UserId::new(uuid::Uuid::from_slice(id).ok()?))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
 
 /// The `Account` gRPC service implementation.
 pub struct AccountService {
@@ -146,9 +216,10 @@ impl Account for AccountService {
                     .await
                     .map_err(|err| internal(&err, "login:mfa"))?
                 {
+                    let token = mint_mfa_challenge(self.ctx.secret_key.as_ref(), user.id)?;
                     return Ok(Response::new(LoginResponse {
                         outcome: Some(login_response::Outcome::MfaRequired(MfaRequired {
-                            mfa_challenge_token: String::new(),
+                            mfa_challenge_token: token,
                             methods: vec!["totp".to_string()],
                         })),
                     }));
@@ -168,11 +239,38 @@ impl Account for AccountService {
 
     async fn verify_mfa(
         &self,
-        _request: Request<VerifyMfaRequest>,
+        request: Request<VerifyMfaRequest>,
     ) -> Result<Response<ProtoSession>, Status> {
-        Err(Status::unimplemented(
-            "MFA verification over the hub is not yet supported",
-        ))
+        // Peer-IP throttle like `login` — this is an unauthenticated brute-force
+        // surface (the challenge token stands in for a verified password).
+        let client_key = rate_key(&request, self.ctx.trust_proxy);
+        if !self.ctx.auth_rate_limiter.allowed(&client_key) {
+            return Err(Status::resource_exhausted(
+                "too many attempts; try again later",
+            ));
+        }
+        let req = request.into_inner();
+        let key = self.ctx.secret_key.as_ref();
+        let user_id = open_mfa_challenge(key, &req.mfa_challenge_token)
+            .ok_or_else(|| Status::unauthenticated("invalid or expired challenge"))?;
+        let code = std::str::from_utf8(&req.mfa_response)
+            .map_err(|_| Status::invalid_argument("bad code"))?;
+        match auth::user_totp::verify_and_consume(
+            &self.ctx.pool,
+            key,
+            user_id,
+            code.trim(),
+            Utc::now().timestamp(),
+        )
+        .await
+        .map_err(|err| internal(&err, "verify_mfa:totp"))?
+        {
+            Some(_) => Ok(Response::new(self.new_session(user_id).await?)),
+            None => {
+                self.ctx.auth_rate_limiter.record_failure(&client_key);
+                Err(Status::unauthenticated("incorrect code"))
+            }
+        }
     }
 
     async fn get_key_material(
@@ -437,6 +535,148 @@ impl Account for AccountService {
             Ok(()) => Ok(Response::new(Empty {})),
             Err(err) => Err(internal(&err, "set_avatar")),
         }
+    }
+
+    // ── TOTP authenticator management (authenticated) ──────────────────────────
+
+    async fn enroll_totp(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<EnrollTotpResponse>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let key = self.ctx.secret_key.as_ref();
+        if auth::user_totp::count_verified(&self.ctx.pool, user.id)
+            .await
+            .map_err(|err| internal(&err, "enroll_totp:count"))?
+            >= auth::user_totp::MAX_AUTHENTICATORS
+        {
+            return Err(Status::failed_precondition(
+                "the maximum number of authenticators is already enrolled",
+            ));
+        }
+        let raw = auth::totp::generate_secret();
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .map_err(|err| internal(&err, "enroll_totp:begin"))?;
+        let totp_id = auth::user_totp::start_enrollment(&mut tx, key, user.id, &raw)
+            .await
+            .map_err(|err| internal(&err, "enroll_totp:start"))?;
+        tx.commit()
+            .await
+            .map_err(|err| internal(&err, "enroll_totp:commit"))?;
+
+        let secret_base32 = auth::totp::base32_encode(&raw);
+        let otpauth_uri = auth::totp::otpauth_uri(TOTP_ISSUER, &user.email, &secret_base32);
+        Ok(Response::new(EnrollTotpResponse {
+            totp_id: totp_id.to_string(),
+            secret_base32,
+            otpauth_uri,
+        }))
+    }
+
+    async fn confirm_totp(
+        &self,
+        request: Request<ConfirmTotpRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let key = self.ctx.secret_key.as_ref();
+        let req = request.into_inner();
+        let cred_id = parse_uuid(&req.totp_id, "totp_id")?;
+        let secret = auth::user_totp::load_pending_secret(&self.ctx.pool, key, user.id, cred_id)
+            .await
+            .map_err(|err| internal(&err, "confirm_totp:load"))?
+            .ok_or_else(|| Status::failed_precondition("no pending enrollment"))?;
+        if !auth::totp::verify_code(&secret, req.code.trim(), Utc::now().timestamp()) {
+            return Err(Status::unauthenticated("incorrect code"));
+        }
+        let label = match req.label.trim() {
+            "" => "Authenticator",
+            other => other,
+        };
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .map_err(|err| internal(&err, "confirm_totp:begin"))?;
+        let confirmed = auth::user_totp::confirm(&mut tx, user.id, cred_id, label)
+            .await
+            .map_err(|err| internal(&err, "confirm_totp:confirm"))?;
+        if !confirmed {
+            return Err(Status::failed_precondition("no pending enrollment"));
+        }
+        let actor = actor_of(&user);
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "totp_enrolled",
+            serde_json::json!({ "totp_id": cred_id.to_string() }),
+        )
+        .await
+        .map_err(|err| internal(&err, "confirm_totp:audit"))?;
+        tx.commit()
+            .await
+            .map_err(|err| internal(&err, "confirm_totp:commit"))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn list_totp(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<ListTotpResponse>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        match auth::user_totp::list_verified(&self.ctx.pool, user.id).await {
+            Ok(creds) => Ok(Response::new(ListTotpResponse {
+                factors: creds
+                    .into_iter()
+                    .map(|c| TotpFactor {
+                        totp_id: c.id.to_string(),
+                        label: c.label,
+                        created_at: c.created_at.to_rfc3339(),
+                        last_used_at: c.last_used_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                    })
+                    .collect(),
+            })),
+            Err(err) => Err(internal(&err, "list_totp")),
+        }
+    }
+
+    async fn remove_totp(
+        &self,
+        request: Request<RemoveTotpRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let user = authenticate(&self.ctx, request.metadata()).await?.user;
+        let cred_id = parse_uuid(&request.into_inner().totp_id, "totp_id")?;
+        let mut tx = self
+            .ctx
+            .pool
+            .begin()
+            .await
+            .map_err(|err| internal(&err, "remove_totp:begin"))?;
+        let removed = auth::user_totp::delete(&mut tx, user.id, cred_id)
+            .await
+            .map_err(|err| internal(&err, "remove_totp:delete"))?;
+        if !removed {
+            return Err(Status::not_found("authenticator not found"));
+        }
+        let actor = actor_of(&user);
+        audit::append(
+            &mut tx,
+            Some(&actor),
+            None,
+            "totp_removed",
+            serde_json::json!({ "totp_id": cred_id.to_string() }),
+        )
+        .await
+        .map_err(|err| internal(&err, "remove_totp:audit"))?;
+        tx.commit()
+            .await
+            .map_err(|err| internal(&err, "remove_totp:commit"))?;
+        Ok(Response::new(Empty {}))
     }
 }
 

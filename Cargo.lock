@@ -2014,6 +2014,7 @@ dependencies = [
  "audit",
  "auth",
  "axum",
+ "base32",
  "chrono",
  "ed25519-dalek",
  "identity",
